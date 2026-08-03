@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use caseless::Caseless;
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
@@ -40,7 +41,8 @@ pub fn jaccard_overlap(left: &BTreeSet<String>, right: &BTreeSet<String>) -> f64
 
 pub(crate) fn normalize_text(text: &str) -> String {
     text.nfkc()
-        .flat_map(char::to_lowercase)
+        .default_case_fold()
+        .nfkc()
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
