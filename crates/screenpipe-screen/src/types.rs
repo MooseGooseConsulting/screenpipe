@@ -1,5 +1,8 @@
+use std::fmt;
+
 use anyhow::{Result, bail};
 use image::{DynamicImage, RgbaImage};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForegroundMetadata {
@@ -8,6 +11,18 @@ pub struct ForegroundMetadata {
     pub app_title: String,
     pub window_title: String,
     pub browser_url: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FrameFingerprint([u8; 32]);
+
+impl fmt::Debug for FrameFingerprint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("FrameFingerprint")
+            .field(&"<redacted>")
+            .finish()
+    }
 }
 
 pub struct TransientFrame {
@@ -55,6 +70,23 @@ impl TransientFrame {
         self.height
     }
 
+    pub fn fingerprint(&self) -> FrameFingerprint {
+        let mut digest = Sha256::new();
+        digest.update(b"screenpipe-frame-fingerprint-v1\0");
+        digest.update(self.width.to_le_bytes());
+        digest.update(self.height.to_le_bytes());
+
+        let packed_stride = usize::try_from(self.width * 4)
+            .expect("validated transient frame row width must fit usize");
+        let stride =
+            usize::try_from(self.stride).expect("validated transient frame stride must fit usize");
+        for row in self.pixels.chunks_exact(stride) {
+            digest.update(&row[..packed_stride]);
+        }
+
+        FrameFingerprint(digest.finalize().into())
+    }
+
     pub(crate) fn to_opaque_rgba_image(&self) -> Result<DynamicImage> {
         let capacity = self
             .width
@@ -79,5 +111,36 @@ impl TransientFrame {
 impl Drop for TransientFrame {
     fn drop(&mut self) {
         self.pixels.fill(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TransientFrame;
+
+    #[test]
+    fn fingerprint_is_stable_for_identical_visual_bgra_rows() {
+        let packed = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let padded =
+            TransientFrame::from_bgra(2, 1, 12, vec![1, 2, 3, 4, 5, 6, 7, 8, 91, 92, 93, 94])
+                .unwrap();
+
+        assert_eq!(packed.fingerprint(), padded.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_a_visual_pixel_changes() {
+        let before = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let after = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 7, 9]).unwrap();
+
+        assert_ne!(before.fingerprint(), after.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_includes_frame_dimensions() {
+        let wide = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let tall = TransientFrame::from_bgra(1, 2, 4, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+
+        assert_ne!(wide.fingerprint(), tall.fingerprint());
     }
 }

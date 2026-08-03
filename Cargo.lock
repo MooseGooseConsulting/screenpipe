@@ -1913,6 +1913,7 @@ dependencies = [
  "anyhow",
  "image",
  "serde",
+ "sha2",
  "tokio",
  "tracing",
  "uiautomation",
