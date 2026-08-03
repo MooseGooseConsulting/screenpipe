@@ -1,0 +1,8 @@
+setup:
+  project: screen-memory
+  config: dev
+
+flags:
+  analytics: false
+  env-warning: false
+  update-check: false

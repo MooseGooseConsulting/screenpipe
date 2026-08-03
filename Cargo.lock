@@ -1905,6 +1905,7 @@ dependencies = [
  "predicates",
  "screenpipe-memory",
  "screenpipe-screen",
+ "tempfile",
  "tokio",
 ]
 

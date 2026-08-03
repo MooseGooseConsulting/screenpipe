@@ -1,4 +1,10 @@
+use std::fmt;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
@@ -92,14 +98,419 @@ while ($true) {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TaskState {
+    Absent,
+    Ready,
+    Running,
+    Other(String),
+}
+
+impl fmt::Display for TaskState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("absent"),
+            Self::Ready => formatter.write_str("ready"),
+            Self::Running => formatter.write_str("running"),
+            Self::Other(state) => write!(formatter, "{}", state.to_ascii_lowercase()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ServiceStatus {
+    pub(crate) task_state: TaskState,
+    pub(crate) process_running: bool,
+}
+
+pub(crate) trait TaskScheduler {
+    fn stop(&mut self, spec: &ServiceSpec) -> Result<()>;
+    fn install(&mut self, spec: &ServiceSpec) -> Result<()>;
+    fn uninstall(&mut self, task_name: &str) -> Result<()>;
+    fn status(&mut self, task_name: &str, binary_path: &Path) -> Result<ServiceStatus>;
+}
+
+pub(crate) struct WindowsTaskScheduler;
+
+impl TaskScheduler for WindowsTaskScheduler {
+    fn stop(&mut self, spec: &ServiceSpec) -> Result<()> {
+        run_powershell(
+            stop_task_script(),
+            &[
+                ("SCREENPIPE_TASK_NAME", spec.task_name.to_owned()),
+                (
+                    "SCREENPIPE_SERVICE_BINARY",
+                    spec.binary_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn install(&mut self, spec: &ServiceSpec) -> Result<()> {
+        run_powershell(
+            install_task_script(),
+            &[
+                ("SCREENPIPE_TASK_NAME", spec.task_name.to_owned()),
+                (
+                    "SCREENPIPE_TASK_EXECUTABLE",
+                    spec.action.executable.to_owned(),
+                ),
+                (
+                    "SCREENPIPE_TASK_ARGUMENTS",
+                    spec.action.arguments.to_owned(),
+                ),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn uninstall(&mut self, task_name: &str) -> Result<()> {
+        run_powershell(
+            uninstall_task_script(),
+            &[("SCREENPIPE_TASK_NAME", task_name.to_owned())],
+        )?;
+        Ok(())
+    }
+
+    fn status(&mut self, task_name: &str, binary_path: &Path) -> Result<ServiceStatus> {
+        let output = run_powershell(
+            status_task_script(),
+            &[
+                ("SCREENPIPE_TASK_NAME", task_name.to_owned()),
+                (
+                    "SCREENPIPE_SERVICE_BINARY",
+                    binary_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        )?;
+        parse_status_output(&output)
+    }
+}
+
+pub(crate) struct ServiceManager<S> {
+    scheduler: S,
+}
+
+impl<S: TaskScheduler> ServiceManager<S> {
+    pub(crate) fn new(scheduler: S) -> Self {
+        Self { scheduler }
+    }
+
+    pub(crate) fn install(
+        &mut self,
+        local_app_data: &Path,
+        current_exe: &Path,
+    ) -> Result<ServiceStatus> {
+        let spec = ServiceSpec::for_current_user(local_app_data);
+        assert_owned_artifact(&spec, &spec.binary_path)?;
+        assert_owned_artifact(&spec, &spec.wrapper_path)?;
+        if !current_exe.is_file() {
+            bail!("running screenpipe executable is not a file");
+        }
+
+        self.scheduler
+            .stop(&spec)
+            .context("stop existing service task and process tree")?;
+        fs::create_dir_all(
+            spec.binary_path
+                .parent()
+                .context("service binary path has no parent")?,
+        )
+        .context("create service binary directory")?;
+        if current_exe != spec.binary_path {
+            replace_file_from(current_exe, &spec.binary_path).context("copy service executable")?;
+        }
+        replace_file_contents(&spec.wrapper_path, spec.wrapper_contents.as_bytes())
+            .context("write service wrapper")?;
+        self.scheduler
+            .install(&spec)
+            .context("register per-user service task")?;
+        self.scheduler
+            .status(spec.task_name, &spec.binary_path)
+            .context("query installed service status")
+    }
+
+    pub(crate) fn uninstall(&mut self, local_app_data: &Path) -> Result<ServiceStatus> {
+        let spec = ServiceSpec::for_current_user(local_app_data);
+        assert_owned_artifact(&spec, &spec.binary_path)?;
+        assert_owned_artifact(&spec, &spec.wrapper_path)?;
+        self.scheduler
+            .stop(&spec)
+            .context("stop service task and process tree")?;
+        self.scheduler
+            .uninstall(spec.task_name)
+            .context("unregister per-user service task")?;
+        remove_owned_file(&spec.binary_path).context("remove copied service executable")?;
+        remove_owned_file(&spec.wrapper_path).context("remove service wrapper")?;
+        self.scheduler
+            .status(spec.task_name, &spec.binary_path)
+            .context("query uninstalled service status")
+    }
+
+    pub(crate) fn status(&mut self, local_app_data: &Path) -> Result<ServiceStatus> {
+        let spec = ServiceSpec::for_current_user(local_app_data);
+        self.scheduler
+            .status(spec.task_name, &spec.binary_path)
+            .context("query service status")
+    }
+}
+
+fn assert_owned_artifact(spec: &ServiceSpec, path: &Path) -> Result<()> {
+    if !path.starts_with(&spec.root_path) || path == spec.root_path {
+        bail!("service artifact escapes the screen-memory root");
+    }
+    Ok(())
+}
+
+fn replace_file_from(source: &Path, destination: &Path) -> Result<()> {
+    let temporary = destination.with_extension("exe.installing");
+    remove_owned_file(&temporary)?;
+    fs::copy(source, &temporary)?;
+    replace_temporary_file(&temporary, destination)
+}
+
+fn replace_file_contents(destination: &Path, contents: &[u8]) -> Result<()> {
+    let temporary = destination.with_extension("ps1.installing");
+    remove_owned_file(&temporary)?;
+    fs::write(&temporary, contents)?;
+    replace_temporary_file(&temporary, destination)
+}
+
+fn replace_temporary_file(temporary: &Path, destination: &Path) -> Result<()> {
+    remove_owned_file(destination)?;
+    fs::rename(temporary, destination)?;
+    Ok(())
+}
+
+fn remove_owned_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn install_task_script() -> &'static str {
+    r#"$ErrorActionPreference = 'Stop'
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$action = New-ScheduledTaskAction -Execute $env:SCREENPIPE_TASK_EXECUTABLE -Argument $env:SCREENPIPE_TASK_ARGUMENTS
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+$principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName $env:SCREENPIPE_TASK_NAME -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+"#
+}
+
+fn stop_task_script() -> &'static str {
+    r#"$ErrorActionPreference = 'Stop'
+$task = Get-ScheduledTask -TaskName $env:SCREENPIPE_TASK_NAME -ErrorAction SilentlyContinue
+if ($null -ne $task) {
+    Stop-ScheduledTask -TaskName $env:SCREENPIPE_TASK_NAME -ErrorAction Stop
+    $taskDeadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+        $task = Get-ScheduledTask -TaskName $env:SCREENPIPE_TASK_NAME -ErrorAction Stop
+        if ($task.State -ne 'Running') { break }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $taskDeadline)
+    if ($task.State -eq 'Running') {
+        throw "Exact screenpipe scheduled task did not leave Running within five seconds."
+    }
+}
+function Get-ScreenpipeOwnedProcess {
+    @(
+        Get-CimInstance Win32_Process |
+            Where-Object {
+                [string]::Equals(
+                    $_.ExecutablePath,
+                    $env:SCREENPIPE_SERVICE_BINARY,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+    )
+}
+$deadline = [DateTime]::UtcNow.AddSeconds(5)
+do {
+    $owned = @(Get-ScreenpipeOwnedProcess)
+    foreach ($process in $owned) {
+        $process | Invoke-CimMethod -MethodName Terminate -ErrorAction SilentlyContinue | Out-Null
+    }
+    if ($owned.Count -gt 0) { Start-Sleep -Milliseconds 100 }
+} while ($owned.Count -gt 0 -and [DateTime]::UtcNow -lt $deadline)
+$remaining = @(Get-ScreenpipeOwnedProcess)
+if ($remaining.Count -gt 0) {
+    throw "Exact screenpipe service process tree did not stop within five seconds."
+}
+"#
+}
+
+fn uninstall_task_script() -> &'static str {
+    r#"$ErrorActionPreference = 'Stop'
+$task = Get-ScheduledTask -TaskName $env:SCREENPIPE_TASK_NAME -ErrorAction SilentlyContinue
+if ($null -ne $task) {
+    Unregister-ScheduledTask -TaskName $env:SCREENPIPE_TASK_NAME -Confirm:$false
+}
+"#
+}
+
+fn status_task_script() -> &'static str {
+    r#"$ErrorActionPreference = 'Stop'
+$task = Get-ScheduledTask -TaskName $env:SCREENPIPE_TASK_NAME -ErrorAction SilentlyContinue
+$taskState = if ($null -eq $task) { 'Absent' } else { $task.State.ToString() }
+$processRunning = @(
+    Get-CimInstance Win32_Process -Filter "Name = 'screenpipe.exe'" |
+        Where-Object {
+            [string]::Equals(
+                $_.ExecutablePath,
+                $env:SCREENPIPE_SERVICE_BINARY,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )
+        }
+).Count -gt 0
+[Console]::Out.Write("$taskState|$processRunning")
+"#
+}
+
+fn parse_status_output(output: &str) -> Result<ServiceStatus> {
+    let mut fields = output.trim().split('|');
+    let state = fields.next().context("task status output has no state")?;
+    let process = fields
+        .next()
+        .context("task status output has no process state")?;
+    if state.is_empty() || fields.next().is_some() {
+        bail!("task status output has an invalid field count");
+    }
+    let process_running = if process.eq_ignore_ascii_case("true") {
+        true
+    } else if process.eq_ignore_ascii_case("false") {
+        false
+    } else {
+        bail!("task status output has an invalid process state");
+    };
+    let task_state = if state.eq_ignore_ascii_case("absent") {
+        TaskState::Absent
+    } else if state.eq_ignore_ascii_case("ready") {
+        TaskState::Ready
+    } else if state.eq_ignore_ascii_case("running") {
+        TaskState::Running
+    } else {
+        TaskState::Other(state.to_owned())
+    };
+    Ok(ServiceStatus {
+        task_state,
+        process_running,
+    })
+}
+
+fn run_powershell(script: &str, environment: &[(&str, String)]) -> Result<String> {
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env_clear();
+    for name in [
+        "SystemRoot",
+        "WINDIR",
+        "PATH",
+        "PATHEXT",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.envs(environment.iter().map(|(name, value)| (*name, value)));
+    let output = command.output().context("launch Windows PowerShell")?;
+    if !output.status.success() {
+        bail!(
+            "Windows Task Scheduler command failed with exit code {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("Windows Task Scheduler output is not UTF-8")
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
     use std::process::Command;
 
+    use anyhow::{Result, bail};
+    use tempfile::TempDir;
+
     use super::{
-        ServiceSpec, TaskAction, TaskLogonType, TaskPrincipal, TaskRunLevel, TaskTrigger, TaskUser,
+        ServiceManager, ServiceSpec, ServiceStatus, TaskAction, TaskLogonType, TaskPrincipal,
+        TaskRunLevel, TaskScheduler, TaskState, TaskTrigger, TaskUser, install_task_script,
+        parse_status_output, status_task_script, stop_task_script, uninstall_task_script,
     };
+
+    #[derive(Default)]
+    struct FakeTaskScheduler {
+        status: Option<ServiceStatus>,
+        reject_install: bool,
+        reject_stop: bool,
+    }
+
+    impl TaskScheduler for FakeTaskScheduler {
+        fn stop(&mut self, _spec: &ServiceSpec) -> Result<()> {
+            if self.reject_stop {
+                bail!("injected task stop failure");
+            }
+            if let Some(status) = &mut self.status {
+                status.task_state = TaskState::Ready;
+                status.process_running = false;
+            }
+            Ok(())
+        }
+
+        fn install(&mut self, _spec: &ServiceSpec) -> Result<()> {
+            if self.reject_install {
+                bail!("injected task registration failure");
+            }
+            if self
+                .status
+                .as_ref()
+                .is_some_and(|status| status.process_running)
+            {
+                bail!("cannot register while installed process is running");
+            }
+            self.status = Some(ServiceStatus {
+                task_state: TaskState::Ready,
+                process_running: false,
+            });
+            Ok(())
+        }
+
+        fn uninstall(&mut self, _task_name: &str) -> Result<()> {
+            if self
+                .status
+                .as_ref()
+                .is_some_and(|status| status.process_running)
+            {
+                bail!("cannot unregister while installed process is running");
+            }
+            self.status = None;
+            Ok(())
+        }
+
+        fn status(&mut self, _task_name: &str, _binary_path: &Path) -> Result<ServiceStatus> {
+            Ok(self.status.clone().unwrap_or(ServiceStatus {
+                task_state: TaskState::Absent,
+                process_running: false,
+            }))
+        }
+    }
+
+    fn service_fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let local_app_data = temp.path().join("LocalAppData");
+        let source = temp.path().join("source-screenpipe.exe");
+        fs::write(&source, b"screenpipe-test-binary").unwrap();
+        (temp, local_app_data, source)
+    }
 
     #[test]
     fn service_spec_targets_the_interactive_user_task() {
@@ -183,5 +594,318 @@ if ($parseErrors.Count -ne 0) {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "0");
+    }
+
+    #[test]
+    fn install_materializes_the_exact_service_and_returns_scheduler_status() {
+        let (_temp, local_app_data, source) = service_fixture();
+        let mut manager = ServiceManager::new(FakeTaskScheduler::default());
+
+        let status = manager.install(&local_app_data, &source).unwrap();
+        let spec = ServiceSpec::for_current_user(&local_app_data);
+
+        assert_eq!(
+            fs::read(&spec.binary_path).unwrap(),
+            b"screenpipe-test-binary"
+        );
+        assert_eq!(
+            fs::read_to_string(&spec.wrapper_path).unwrap(),
+            spec.wrapper_contents
+        );
+        assert_eq!(
+            status,
+            ServiceStatus {
+                task_state: TaskState::Ready,
+                process_running: false,
+            }
+        );
+        assert_eq!(manager.status(&local_app_data).unwrap(), status);
+    }
+
+    #[test]
+    fn reinstall_repairs_owned_artifacts_without_touching_siblings() {
+        let (_temp, local_app_data, source) = service_fixture();
+        let spec = ServiceSpec::for_current_user(&local_app_data);
+        fs::create_dir_all(spec.binary_path.parent().unwrap()).unwrap();
+        fs::write(&spec.binary_path, b"stale-binary").unwrap();
+        fs::write(&spec.wrapper_path, "stale-wrapper").unwrap();
+        let sibling = spec.root_path.join("preserve-me.txt");
+        fs::write(&sibling, "owned by another checkpoint").unwrap();
+        let mut manager = ServiceManager::new(FakeTaskScheduler::default());
+
+        manager.install(&local_app_data, &source).unwrap();
+        manager.install(&local_app_data, &source).unwrap();
+
+        assert_eq!(
+            fs::read(&spec.binary_path).unwrap(),
+            b"screenpipe-test-binary"
+        );
+        assert_eq!(
+            fs::read_to_string(&spec.wrapper_path).unwrap(),
+            spec.wrapper_contents
+        );
+        assert_eq!(
+            fs::read_to_string(sibling).unwrap(),
+            "owned by another checkpoint"
+        );
+    }
+
+    #[test]
+    fn install_from_the_already_copied_binary_does_not_truncate_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_app_data = temp.path().join("LocalAppData");
+        let spec = ServiceSpec::for_current_user(&local_app_data);
+        fs::create_dir_all(spec.binary_path.parent().unwrap()).unwrap();
+        fs::write(&spec.binary_path, b"running-installed-binary").unwrap();
+        let mut manager = ServiceManager::new(FakeTaskScheduler::default());
+
+        manager.install(&local_app_data, &spec.binary_path).unwrap();
+
+        assert_eq!(
+            fs::read(&spec.binary_path).unwrap(),
+            b"running-installed-binary"
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_only_the_exact_task_binary_and_wrapper() {
+        let (_temp, local_app_data, source) = service_fixture();
+        let spec = ServiceSpec::for_current_user(&local_app_data);
+        let mut manager = ServiceManager::new(FakeTaskScheduler::default());
+        manager.install(&local_app_data, &source).unwrap();
+        let sibling = spec.root_path.join("preserve-me.txt");
+        let log = spec.root_path.join(r"logs\postgresql.log");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&sibling, "preserve").unwrap();
+        fs::write(&log, "preserve").unwrap();
+
+        let status = manager.uninstall(&local_app_data).unwrap();
+
+        assert!(!spec.binary_path.exists());
+        assert!(!spec.wrapper_path.exists());
+        assert_eq!(fs::read_to_string(sibling).unwrap(), "preserve");
+        assert_eq!(fs::read_to_string(log).unwrap(), "preserve");
+        assert_eq!(
+            status,
+            ServiceStatus {
+                task_state: TaskState::Absent,
+                process_running: false,
+            }
+        );
+    }
+
+    #[test]
+    fn task_registration_failure_is_returned_and_never_fabricates_ready_status() {
+        let (_temp, local_app_data, source) = service_fixture();
+        let scheduler = FakeTaskScheduler {
+            reject_install: true,
+            ..FakeTaskScheduler::default()
+        };
+        let mut manager = ServiceManager::new(scheduler);
+
+        let error = manager.install(&local_app_data, &source).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("injected task registration failure"),
+            "scheduler cause must remain available through service context"
+        );
+        assert_eq!(
+            manager.status(&local_app_data).unwrap().task_state,
+            TaskState::Absent
+        );
+    }
+
+    #[test]
+    fn stop_failure_prevents_reinstall_from_mutating_the_installed_binary() {
+        let (_temp, local_app_data, source) = service_fixture();
+        let spec = ServiceSpec::for_current_user(&local_app_data);
+        fs::create_dir_all(spec.binary_path.parent().unwrap()).unwrap();
+        fs::write(&spec.binary_path, b"still-running-binary").unwrap();
+        let scheduler = FakeTaskScheduler {
+            status: Some(ServiceStatus {
+                task_state: TaskState::Running,
+                process_running: true,
+            }),
+            reject_stop: true,
+            ..FakeTaskScheduler::default()
+        };
+        let mut manager = ServiceManager::new(scheduler);
+
+        let error = manager.install(&local_app_data, &source).unwrap_err();
+
+        assert!(format!("{error:#}").contains("injected task stop failure"));
+        assert_eq!(
+            fs::read(&spec.binary_path).unwrap(),
+            b"still-running-binary"
+        );
+    }
+
+    #[test]
+    fn reinstall_stops_an_active_installation_before_replacing_artifacts() {
+        let (_temp, local_app_data, source) = service_fixture();
+        let scheduler = FakeTaskScheduler {
+            status: Some(ServiceStatus {
+                task_state: TaskState::Running,
+                process_running: true,
+            }),
+            ..FakeTaskScheduler::default()
+        };
+        let mut manager = ServiceManager::new(scheduler);
+
+        let status = manager.install(&local_app_data, &source).unwrap();
+
+        assert_eq!(status.task_state, TaskState::Ready);
+        assert!(!status.process_running);
+    }
+
+    #[test]
+    fn uninstall_stops_an_active_installation_before_deleting_artifacts() {
+        let (_temp, local_app_data, _source) = service_fixture();
+        let spec = ServiceSpec::for_current_user(&local_app_data);
+        fs::create_dir_all(spec.binary_path.parent().unwrap()).unwrap();
+        fs::write(&spec.binary_path, b"running-installed-binary").unwrap();
+        fs::write(&spec.wrapper_path, &spec.wrapper_contents).unwrap();
+        let scheduler = FakeTaskScheduler {
+            status: Some(ServiceStatus {
+                task_state: TaskState::Running,
+                process_running: true,
+            }),
+            ..FakeTaskScheduler::default()
+        };
+        let mut manager = ServiceManager::new(scheduler);
+
+        let status = manager.uninstall(&local_app_data).unwrap();
+
+        assert_eq!(status.task_state, TaskState::Absent);
+        assert!(!status.process_running);
+        assert!(!spec.binary_path.exists());
+        assert!(!spec.wrapper_path.exists());
+    }
+
+    #[test]
+    fn scheduler_status_parser_preserves_ready_running_and_absent_states() {
+        assert_eq!(
+            parse_status_output("Ready|False\r\n").unwrap(),
+            ServiceStatus {
+                task_state: TaskState::Ready,
+                process_running: false,
+            }
+        );
+        assert_eq!(
+            parse_status_output("Running|True\n").unwrap(),
+            ServiceStatus {
+                task_state: TaskState::Running,
+                process_running: true,
+            }
+        );
+        assert_eq!(
+            parse_status_output("Absent|False").unwrap(),
+            ServiceStatus {
+                task_state: TaskState::Absent,
+                process_running: false,
+            }
+        );
+        assert_eq!(
+            parse_status_output("Disabled|False").unwrap(),
+            ServiceStatus {
+                task_state: TaskState::Other("Disabled".to_owned()),
+                process_running: false,
+            }
+        );
+    }
+
+    #[test]
+    fn scheduler_status_parser_rejects_ambiguous_or_malformed_output() {
+        for invalid in ["", "Ready", "Ready|maybe", "Ready|False|extra"] {
+            assert!(
+                parse_status_output(invalid).is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn task_scheduler_scripts_have_no_powershell_parse_errors() {
+        let scripts = [
+            install_task_script(),
+            stop_task_script(),
+            uninstall_task_script(),
+            status_task_script(),
+        ];
+        let parser_script = r#"
+$tokens = $null
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseInput(
+    $env:SCREENPIPE_TASK_SCRIPT_TO_PARSE,
+    [ref]$tokens,
+    [ref]$parseErrors
+) | Out-Null
+if ($parseErrors.Count -ne 0) {
+    [Console]::Error.Write(($parseErrors | ForEach-Object Message) -join [Environment]::NewLine)
+    exit 1
+}
+"#;
+
+        for script in scripts {
+            let output = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", parser_script])
+                .env("SCREENPIPE_TASK_SCRIPT_TO_PARSE", script)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "PowerShell parser failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn stop_script_does_not_terminate_a_decoy_that_only_mentions_the_wrapper_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let wrapper = temp.path().join("run-screenpipe.ps1");
+        let binary = temp.path().join(r"bin\screenpipe.exe");
+        let mut decoy = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &format!("Start-Sleep -Seconds 30 # {}", wrapper.display()),
+            ])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let result = super::run_powershell(
+            stop_task_script(),
+            &[
+                (
+                    "SCREENPIPE_TASK_NAME",
+                    "MooseGoose Goal 1 Missing Negative Control".to_owned(),
+                ),
+                (
+                    "SCREENPIPE_SERVICE_BINARY",
+                    binary.to_string_lossy().into_owned(),
+                ),
+                (
+                    "SCREENPIPE_SERVICE_WRAPPER",
+                    wrapper.to_string_lossy().into_owned(),
+                ),
+            ],
+        );
+        let decoy_state = decoy.try_wait().unwrap();
+        if decoy_state.is_none() {
+            decoy.kill().unwrap();
+            decoy.wait().unwrap();
+        }
+
+        result.unwrap();
+        assert!(
+            decoy_state.is_none(),
+            "stop script terminated an unrelated process"
+        );
     }
 }
