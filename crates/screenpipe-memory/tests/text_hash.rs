@@ -62,6 +62,30 @@ fn identity_recomposes_case_fold_output_before_hashing() {
 }
 
 #[test]
+fn identity_uses_coherent_unicode_16_normalization_and_case_fold_tables() {
+    assert_eq!(caseless::UNICODE_VERSION, (16, 0, 0));
+    assert_eq!(unicode_normalization::UNICODE_VERSION, (16, 0, 0));
+}
+
+#[test]
+fn unicode_17_case_pair_remains_distinct_under_unicode_16_hash_contract() {
+    let capital = TextIdentity::from_ocr("꟎");
+    let lowercase = TextIdentity::from_ocr("꟏");
+
+    assert_eq!(capital.normalized, "꟎");
+    assert_eq!(lowercase.normalized, "꟏");
+    assert_eq!(
+        capital.exact_hash,
+        "5897d4855f31f3e72451c44841be0d851cdd878ca3d374e91d79aa3b31568b6f"
+    );
+    assert_eq!(
+        lowercase.exact_hash,
+        "49bb0fc473f6abfe144e78e5c8ab69a965907232cd80d3cf341c2e972d5c2946"
+    );
+    assert_ne!(capital.exact_hash, lowercase.exact_hash);
+}
+
+#[test]
 fn identity_uses_literal_word_five_grams() {
     let identity = TextIdentity::from_ocr("one two three four five six");
 
