@@ -13,7 +13,7 @@ pub struct ForegroundMetadata {
     pub browser_url: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FrameFingerprint([u8; 32]);
 
 impl fmt::Debug for FrameFingerprint {
@@ -132,6 +132,55 @@ mod tests {
     fn fingerprint_changes_when_a_visual_pixel_changes() {
         let before = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         let after = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 7, 9]).unwrap();
+
+        assert_ne!(before.fingerprint(), after.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_ignores_padding_between_multiple_visual_rows() {
+        let packed = TransientFrame::from_bgra(
+            2,
+            2,
+            8,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18],
+        )
+        .unwrap();
+        let padded = TransientFrame::from_bgra(
+            2,
+            2,
+            12,
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 91, 92, 93, 94, 11, 12, 13, 14, 15, 16, 17, 18, 95, 96, 97,
+                98,
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(packed.fingerprint(), padded.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_observes_a_second_row_pixel_after_interrow_padding() {
+        let before = TransientFrame::from_bgra(
+            2,
+            2,
+            12,
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 91, 92, 93, 94, 11, 12, 13, 14, 15, 16, 17, 18, 95, 96, 97,
+                98,
+            ],
+        )
+        .unwrap();
+        let after = TransientFrame::from_bgra(
+            2,
+            2,
+            12,
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 91, 92, 93, 94, 11, 12, 13, 14, 15, 16, 19, 18, 95, 96, 97,
+                98,
+            ],
+        )
+        .unwrap();
 
         assert_ne!(before.fingerprint(), after.fingerprint());
     }
