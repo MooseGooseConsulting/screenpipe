@@ -9,6 +9,10 @@ use crate::{ForegroundMetadata, TransientFrame};
 pub struct WindowsCapture;
 
 impl WindowsCapture {
+    pub fn foreground_window_handle(&self) -> Result<isize> {
+        foreground_window_handle()
+    }
+
     pub async fn capture_foreground(&self) -> Result<(TransientFrame, ForegroundMetadata)> {
         tokio::task::spawn_blocking(capture_foreground_blocking)
             .await
