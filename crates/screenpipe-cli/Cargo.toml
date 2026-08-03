@@ -17,6 +17,7 @@ clap = { version = "4.5.51", features = ["derive"] }
 screenpipe-memory = { path = "../screenpipe-memory" }
 screenpipe-screen = { path = "../screenpipe-screen" }
 tokio = { version = "1", features = ["macros", "rt", "time"] }
+windows = { version = "0.58", features = ["Win32_System_Com", "Win32_UI_Shell"] }
 
 [dev-dependencies]
 assert_cmd = "2.1.1"

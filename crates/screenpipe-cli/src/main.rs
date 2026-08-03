@@ -1,9 +1,7 @@
-use std::path::PathBuf;
-
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 
-use crate::service::{ServiceManager, ServiceStatus, WindowsTaskScheduler};
+use crate::service::{ServiceManager, ServiceRoot, ServiceStatus, WindowsTaskScheduler};
 
 mod service;
 mod windows_source;
@@ -47,20 +45,15 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_service_action(action: ServiceAction) -> anyhow::Result<()> {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .context("LOCALAPPDATA is required for per-user service management")?;
-    if !local_app_data.is_absolute() {
-        bail!("LOCALAPPDATA must be an absolute path");
-    }
+    let service_root = ServiceRoot::current_user()?;
     let mut manager = ServiceManager::new(WindowsTaskScheduler);
     let status = match action {
         ServiceAction::Install => {
             let current_exe = std::env::current_exe().context("resolve running executable")?;
-            manager.install(&local_app_data, &current_exe)?
+            manager.install(&service_root, &current_exe)?
         }
-        ServiceAction::Uninstall => manager.uninstall(&local_app_data)?,
-        ServiceAction::Status => manager.status(&local_app_data)?,
+        ServiceAction::Uninstall => manager.uninstall(&service_root)?,
+        ServiceAction::Status => manager.status(&service_root)?,
     };
     print_service_status(&status);
     Ok(())

@@ -6,6 +6,45 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+pub(crate) struct ServiceRoot {
+    local_app_data: PathBuf,
+}
+
+impl ServiceRoot {
+    pub(crate) fn current_user() -> Result<Self> {
+        let local_app_data = windows_local_app_data()?;
+        if !local_app_data.is_absolute() {
+            bail!("Windows LocalAppData known folder must be absolute");
+        }
+        Ok(Self { local_app_data })
+    }
+
+    #[cfg(test)]
+    fn for_test(local_app_data: PathBuf) -> Self {
+        assert!(local_app_data.is_absolute());
+        Self { local_app_data }
+    }
+}
+
+#[cfg(windows)]
+fn windows_local_app_data() -> Result<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+
+    let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None) }
+        .context("resolve Windows LocalAppData known folder")?;
+    let value = unsafe { raw.to_string() };
+    unsafe { CoTaskMemFree(Some(raw.0.cast())) };
+    Ok(PathBuf::from(
+        value.context("decode Windows LocalAppData known folder")?,
+    ))
+}
+
+#[cfg(not(windows))]
+fn windows_local_app_data() -> Result<PathBuf> {
+    bail!("per-user service management requires Windows")
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TaskAction {
@@ -59,8 +98,8 @@ pub(crate) struct ServiceSpec {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl ServiceSpec {
-    pub(crate) fn for_current_user(local_app_data: &Path) -> Self {
-        let root_path = local_app_data.join("screen-memory");
+    pub(crate) fn for_current_user(root: &ServiceRoot) -> Self {
+        let root_path = root.local_app_data.join("screen-memory");
         let binary_path = root_path.join(r"bin\screenpipe.exe");
         let wrapper_path = root_path.join("run-screenpipe.ps1");
         let action = TaskAction {
@@ -76,14 +115,16 @@ impl ServiceSpec {
             logon_type: TaskLogonType::InteractiveToken,
             run_level: TaskRunLevel::Limited,
         };
-        let wrapper_contents = r#"$ErrorActionPreference = 'Continue'
-$agent = Join-Path $env:LOCALAPPDATA 'screen-memory\bin\screenpipe.exe'
-while ($true) {
+        let escaped_agent = binary_path.to_string_lossy().replace('\'', "''");
+        let wrapper_contents = format!(
+            r#"$ErrorActionPreference = 'Continue'
+$agent = '{escaped_agent}'
+while ($true) {{
     doppler run -p screen-memory -c dev -- $agent run --machine-slug icarus --display-name Icarus-Laptop
     Start-Sleep -Seconds 10
-}
+}}
 "#
-        .to_owned();
+        );
 
         Self {
             task_name: "MooseGoose Screen Memory",
@@ -199,10 +240,10 @@ impl<S: TaskScheduler> ServiceManager<S> {
 
     pub(crate) fn install(
         &mut self,
-        local_app_data: &Path,
+        root: &ServiceRoot,
         current_exe: &Path,
     ) -> Result<ServiceStatus> {
-        let spec = ServiceSpec::for_current_user(local_app_data);
+        let spec = ServiceSpec::for_current_user(root);
         assert_owned_artifact(&spec, &spec.binary_path)?;
         assert_owned_artifact(&spec, &spec.wrapper_path)?;
         if !current_exe.is_file() {
@@ -218,10 +259,13 @@ impl<S: TaskScheduler> ServiceManager<S> {
                 .context("service binary path has no parent")?,
         )
         .context("create service binary directory")?;
+        assert_owned_artifact(&spec, &spec.binary_path)?;
+        assert_owned_artifact(&spec, &spec.wrapper_path)?;
         if current_exe != spec.binary_path {
-            replace_file_from(current_exe, &spec.binary_path).context("copy service executable")?;
+            replace_file_from(&spec, current_exe, &spec.binary_path)
+                .context("copy service executable")?;
         }
-        replace_file_contents(&spec.wrapper_path, spec.wrapper_contents.as_bytes())
+        replace_file_contents(&spec, &spec.wrapper_path, spec.wrapper_contents.as_bytes())
             .context("write service wrapper")?;
         self.scheduler
             .install(&spec)
@@ -231,8 +275,8 @@ impl<S: TaskScheduler> ServiceManager<S> {
             .context("query installed service status")
     }
 
-    pub(crate) fn uninstall(&mut self, local_app_data: &Path) -> Result<ServiceStatus> {
-        let spec = ServiceSpec::for_current_user(local_app_data);
+    pub(crate) fn uninstall(&mut self, root: &ServiceRoot) -> Result<ServiceStatus> {
+        let spec = ServiceSpec::for_current_user(root);
         assert_owned_artifact(&spec, &spec.binary_path)?;
         assert_owned_artifact(&spec, &spec.wrapper_path)?;
         self.scheduler
@@ -241,15 +285,17 @@ impl<S: TaskScheduler> ServiceManager<S> {
         self.scheduler
             .uninstall(spec.task_name)
             .context("unregister per-user service task")?;
+        assert_owned_artifact(&spec, &spec.binary_path)?;
         remove_owned_file(&spec.binary_path).context("remove copied service executable")?;
+        assert_owned_artifact(&spec, &spec.wrapper_path)?;
         remove_owned_file(&spec.wrapper_path).context("remove service wrapper")?;
         self.scheduler
             .status(spec.task_name, &spec.binary_path)
             .context("query uninstalled service status")
     }
 
-    pub(crate) fn status(&mut self, local_app_data: &Path) -> Result<ServiceStatus> {
-        let spec = ServiceSpec::for_current_user(local_app_data);
+    pub(crate) fn status(&mut self, root: &ServiceRoot) -> Result<ServiceStatus> {
+        let spec = ServiceSpec::for_current_user(root);
         self.scheduler
             .status(spec.task_name, &spec.binary_path)
             .context("query service status")
@@ -260,24 +306,75 @@ fn assert_owned_artifact(spec: &ServiceSpec, path: &Path) -> Result<()> {
     if !path.starts_with(&spec.root_path) || path == spec.root_path {
         bail!("service artifact escapes the screen-memory root");
     }
+    assert_no_reparse_components(&spec.root_path, path)?;
     Ok(())
 }
 
-fn replace_file_from(source: &Path, destination: &Path) -> Result<()> {
+fn assert_no_reparse_components(root: &Path, path: &Path) -> Result<()> {
+    let relative = path
+        .strip_prefix(root)
+        .context("service artifact escapes the screen-memory root")?;
+    let mut component_path = root.to_path_buf();
+    assert_not_reparse_point(&component_path)?;
+    for component in relative.components() {
+        let std::path::Component::Normal(component) = component else {
+            bail!("service artifact contains an unsafe path component");
+        };
+        component_path.push(component);
+        assert_not_reparse_point(&component_path)?;
+    }
+    Ok(())
+}
+
+fn assert_not_reparse_point(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    };
+    if metadata_is_reparse_point(&metadata) {
+        bail!(
+            "service artifact path contains a reparse point: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn replace_file_from(spec: &ServiceSpec, source: &Path, destination: &Path) -> Result<()> {
     let temporary = destination.with_extension("exe.installing");
+    assert_owned_artifact(spec, &temporary)?;
+    assert_owned_artifact(spec, destination)?;
     remove_owned_file(&temporary)?;
     fs::copy(source, &temporary)?;
-    replace_temporary_file(&temporary, destination)
+    replace_temporary_file(spec, &temporary, destination)
 }
 
-fn replace_file_contents(destination: &Path, contents: &[u8]) -> Result<()> {
+fn replace_file_contents(spec: &ServiceSpec, destination: &Path, contents: &[u8]) -> Result<()> {
     let temporary = destination.with_extension("ps1.installing");
+    assert_owned_artifact(spec, &temporary)?;
+    assert_owned_artifact(spec, destination)?;
     remove_owned_file(&temporary)?;
     fs::write(&temporary, contents)?;
-    replace_temporary_file(&temporary, destination)
+    replace_temporary_file(spec, &temporary, destination)
 }
 
-fn replace_temporary_file(temporary: &Path, destination: &Path) -> Result<()> {
+fn replace_temporary_file(spec: &ServiceSpec, temporary: &Path, destination: &Path) -> Result<()> {
+    assert_owned_artifact(spec, temporary)?;
+    assert_owned_artifact(spec, destination)?;
     remove_owned_file(destination)?;
     fs::rename(temporary, destination)?;
     Ok(())
@@ -437,14 +534,16 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::Mutex;
 
     use anyhow::{Result, bail};
     use tempfile::TempDir;
 
     use super::{
-        ServiceManager, ServiceSpec, ServiceStatus, TaskAction, TaskLogonType, TaskPrincipal,
-        TaskRunLevel, TaskScheduler, TaskState, TaskTrigger, TaskUser, install_task_script,
-        parse_status_output, status_task_script, stop_task_script, uninstall_task_script,
+        ServiceManager, ServiceRoot, ServiceSpec, ServiceStatus, TaskAction, TaskLogonType,
+        TaskPrincipal, TaskRunLevel, TaskScheduler, TaskState, TaskTrigger, TaskUser,
+        install_task_script, parse_status_output, status_task_script, stop_task_script,
+        uninstall_task_script,
     };
 
     #[derive(Default)]
@@ -504,17 +603,103 @@ mod tests {
         }
     }
 
-    fn service_fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    fn service_fixture() -> (TempDir, ServiceRoot, std::path::PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let local_app_data = temp.path().join("LocalAppData");
         let source = temp.path().join("source-screenpipe.exe");
         fs::write(&source, b"screenpipe-test-binary").unwrap();
-        (temp, local_app_data, source)
+        (temp, ServiceRoot::for_test(local_app_data), source)
+    }
+
+    #[cfg(windows)]
+    fn create_junction(link: &Path, target: &Path) {
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:SCREENPIPE_TEST_LINK -Target $env:SCREENPIPE_TEST_TARGET | Out-Null",
+            ])
+            .env("SCREENPIPE_TEST_LINK", link)
+            .env("SCREENPIPE_TEST_TARGET", target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "junction setup failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(windows)]
+    static LOCAL_APP_DATA_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    #[cfg(windows)]
+    fn current_user_service_root_ignores_localappdata_environment_override() {
+        let _lock = LOCAL_APP_DATA_ENV_LOCK.lock().unwrap();
+        let override_root = tempfile::tempdir().unwrap();
+        let original = std::env::var_os("LOCALAPPDATA");
+        unsafe { std::env::set_var("LOCALAPPDATA", override_root.path()) };
+
+        let actual = ServiceRoot::current_user().unwrap();
+
+        match original {
+            Some(value) => unsafe { std::env::set_var("LOCALAPPDATA", value) },
+            None => unsafe { std::env::remove_var("LOCALAPPDATA") },
+        }
+        assert!(!actual.local_app_data.starts_with(override_root.path()));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn install_rejects_a_junction_component_without_writing_through_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_app_data = temp.path().join("LocalAppData");
+        let service_root = local_app_data.join("screen-memory");
+        let junction_target = temp.path().join("junction-target");
+        fs::create_dir_all(&service_root).unwrap();
+        fs::create_dir_all(&junction_target).unwrap();
+        create_junction(&service_root.join("bin"), &junction_target);
+        let source = temp.path().join("source-screenpipe.exe");
+        fs::write(&source, b"screenpipe-test-binary").unwrap();
+        let root = ServiceRoot::for_test(local_app_data);
+        let mut manager = ServiceManager::new(FakeTaskScheduler::default());
+
+        let error = manager.install(&root, &source).unwrap_err();
+
+        assert!(format!("{error:#}").contains("reparse point"));
+        assert!(!junction_target.join("screenpipe.exe").exists());
+        assert!(!service_root.join("run-screenpipe.ps1").exists());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn uninstall_rejects_a_junction_root_without_removing_target_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_app_data = temp.path().join("LocalAppData");
+        let junction_target = temp.path().join("junction-target");
+        let binary = junction_target.join(r"bin\screenpipe.exe");
+        let wrapper = junction_target.join("run-screenpipe.ps1");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"preserve-binary").unwrap();
+        fs::write(&wrapper, b"preserve-wrapper").unwrap();
+        fs::create_dir_all(&local_app_data).unwrap();
+        create_junction(&local_app_data.join("screen-memory"), &junction_target);
+        let root = ServiceRoot::for_test(local_app_data);
+        let mut manager = ServiceManager::new(FakeTaskScheduler::default());
+
+        let error = manager.uninstall(&root).unwrap_err();
+
+        assert!(format!("{error:#}").contains("reparse point"));
+        assert_eq!(fs::read(binary).unwrap(), b"preserve-binary");
+        assert_eq!(fs::read(wrapper).unwrap(), b"preserve-wrapper");
     }
 
     #[test]
     fn service_spec_targets_the_interactive_user_task() {
-        let spec = ServiceSpec::for_current_user(Path::new(r"C:\Users\pmacl\AppData\Local"));
+        let root = ServiceRoot::for_test(Path::new(r"C:\Users\pmacl\AppData\Local").to_owned());
+        let spec = ServiceSpec::for_current_user(&root);
         assert_eq!(spec.task_name, "MooseGoose Screen Memory");
         assert_eq!(
             spec.action,
@@ -538,7 +723,8 @@ mod tests {
     #[test]
     fn service_spec_keeps_artifacts_and_launch_settings_safe() {
         let local_app_data = Path::new(r"C:\Users\pmacl\AppData\Local");
-        let spec = ServiceSpec::for_current_user(local_app_data);
+        let root = ServiceRoot::for_test(local_app_data.to_owned());
+        let spec = ServiceSpec::for_current_user(&root);
         let expected_root = local_app_data.join("screen-memory");
 
         assert_eq!(spec.root_path, expected_root);
@@ -550,7 +736,7 @@ mod tests {
             spec.wrapper_contents,
             concat!(
                 "$ErrorActionPreference = 'Continue'\n",
-                "$agent = Join-Path $env:LOCALAPPDATA 'screen-memory\\bin\\screenpipe.exe'\n",
+                "$agent = 'C:\\Users\\pmacl\\AppData\\Local\\screen-memory\\bin\\screenpipe.exe'\n",
                 "while ($true) {\n",
                 "    doppler run -p screen-memory -c dev -- $agent run --machine-slug icarus --display-name Icarus-Laptop\n",
                 "    Start-Sleep -Seconds 10\n",
@@ -566,7 +752,8 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn generated_wrapper_has_no_powershell_parse_errors() {
-        let spec = ServiceSpec::for_current_user(Path::new(r"C:\Users\pmacl\AppData\Local"));
+        let root = ServiceRoot::for_test(Path::new(r"C:\Users\pmacl\AppData\Local").to_owned());
+        let spec = ServiceSpec::for_current_user(&root);
         let parser_script = r#"
 $tokens = $null
 $parseErrors = $null
@@ -653,13 +840,13 @@ if ($parseErrors.Count -ne 0) {
     #[test]
     fn install_from_the_already_copied_binary_does_not_truncate_it() {
         let temp = tempfile::tempdir().unwrap();
-        let local_app_data = temp.path().join("LocalAppData");
-        let spec = ServiceSpec::for_current_user(&local_app_data);
+        let root = ServiceRoot::for_test(temp.path().join("LocalAppData"));
+        let spec = ServiceSpec::for_current_user(&root);
         fs::create_dir_all(spec.binary_path.parent().unwrap()).unwrap();
         fs::write(&spec.binary_path, b"running-installed-binary").unwrap();
         let mut manager = ServiceManager::new(FakeTaskScheduler::default());
 
-        manager.install(&local_app_data, &spec.binary_path).unwrap();
+        manager.install(&root, &spec.binary_path).unwrap();
 
         assert_eq!(
             fs::read(&spec.binary_path).unwrap(),

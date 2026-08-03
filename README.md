@@ -32,7 +32,7 @@ cargo check --workspace
 powershell -NoProfile -File .\scripts\verify-pruned.ps1
 ```
 
-The two interactive Windows tests remain ignored by default. They require an
+The three interactive Windows tests remain ignored by default. They require an
 unlocked desktop with a controlled foreground window and must not be treated as
 live proof merely because the normal workspace tests pass.
 
