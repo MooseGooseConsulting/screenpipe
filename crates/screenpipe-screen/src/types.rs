@@ -4,13 +4,29 @@ use anyhow::{Result, bail};
 use image::{DynamicImage, RgbaImage};
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ForegroundMetadata {
     pub window_handle: isize,
     pub app_key: String,
     pub app_title: String,
     pub window_title: String,
     pub browser_url: Option<String>,
+}
+
+impl fmt::Debug for ForegroundMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ForegroundMetadata")
+            .field("window_handle", &self.window_handle)
+            .field("app_key", &self.app_key)
+            .field("app_title", &self.app_title)
+            .field("window_title", &self.window_title)
+            .field(
+                "browser_url",
+                &self.browser_url.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

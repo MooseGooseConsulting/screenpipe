@@ -214,11 +214,33 @@ fn reader_treats_a_stale_browser_window_as_optional_metadata() {
 
 #[test]
 fn snapshot_debug_output_redacts_the_uia_value() {
-    let snapshot = page_input(
-        "Email address",
-        "email-address",
-        "https://accounts.example.test/private-profile",
-    );
+    let page_value =
+        "https://accounts.example.test/UIA_PAGE_VALUE_SECRET_66d9?token=UIA_QUERY_SECRET_a4e1";
+    let snapshot = page_input("Email address", "email-address", page_value);
+    let debug = format!("{snapshot:?}");
 
-    assert!(!format!("{snapshot:?}").contains("private-profile"));
+    assert!(!debug.contains(page_value));
+    assert!(!debug.contains("UIA_PAGE_VALUE_SECRET_66d9"));
+    assert!(!debug.contains("UIA_QUERY_SECRET_a4e1"));
+    assert!(debug.contains("<redacted>"));
+}
+
+#[test]
+fn foreground_metadata_debug_redacts_browser_url_path_and_query() {
+    let browser_url = "https://browser.example.test/FOREGROUND_PATH_SECRET_b82c?token=FOREGROUND_QUERY_SECRET_517a";
+    let metadata = ForegroundMetadata {
+        window_handle: 42,
+        app_key: "chrome.exe".to_owned(),
+        app_title: "Google Chrome".to_owned(),
+        window_title: "Project notes".to_owned(),
+        browser_url: Some(browser_url.to_owned()),
+    };
+    let debug = format!("{metadata:?}");
+
+    assert!(!debug.contains(browser_url));
+    assert!(!debug.contains("FOREGROUND_PATH_SECRET_b82c"));
+    assert!(!debug.contains("FOREGROUND_QUERY_SECRET_517a"));
+    assert!(debug.contains("chrome.exe"));
+    assert!(debug.contains("Project notes"));
+    assert!(debug.contains("<redacted>"));
 }
