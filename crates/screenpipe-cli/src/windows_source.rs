@@ -13,6 +13,22 @@ use screenpipe_screen::{
 
 const RETRY_CADENCE: Duration = Duration::from_secs(2);
 
+fn cadence_record(
+    input_idle: Duration,
+    frame_stable_for: Duration,
+    foreground_changed: bool,
+    frame_changed: bool,
+) -> Result<CadenceRecord> {
+    Ok(CadenceRecord::from_input(CadenceInput {
+        input_idle: chrono::Duration::from_std(input_idle)
+            .context("input-idle duration exceeds chrono range")?,
+        frame_stable_for: chrono::Duration::from_std(frame_stable_for)
+            .context("frame-stability duration exceeds chrono range")?,
+        foreground_changed,
+        frame_changed,
+    }))
+}
+
 #[async_trait]
 trait WindowsSampleOps: Send {
     async fn sleep(&mut self, duration: Duration);
@@ -159,14 +175,12 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
         let frame_stable_for = monotonic_now
             .checked_duration_since(stable_since)
             .context("monotonic clock moved backwards")?;
-        let cadence = CadenceRecord::from_input(CadenceInput {
-            input_idle: chrono::Duration::from_std(input_idle)
-                .context("input-idle duration exceeds chrono range")?,
-            frame_stable_for: chrono::Duration::from_std(frame_stable_for)
-                .context("frame-stability duration exceeds chrono range")?,
+        let cadence = cadence_record(
+            input_idle,
+            frame_stable_for,
             foreground_changed,
             frame_changed,
-        });
+        )?;
         let next_sleep = cadence
             .next_interval
             .to_std()
@@ -209,11 +223,13 @@ impl<Ops: WindowsSampleOps> SampleSource for Source<Ops> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct WindowsSampleSource {
     inner: Source<LiveWindowsOps>,
 }
 
 impl WindowsSampleSource {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new() -> Self {
         Self {
             inner: Source::new(LiveWindowsOps),
@@ -240,7 +256,7 @@ mod tests {
     use screenpipe_memory::{CaptureGap, SampleRead, SampleSource};
     use screenpipe_screen::{ForegroundMetadata, TransientFrame};
 
-    use super::{Source, WindowsSampleOps, WindowsSampleSource};
+    use super::{Source, WindowsSampleOps, WindowsSampleSource, cadence_record};
 
     type CaptureResult = Result<(TransientFrame, ForegroundMetadata)>;
 
@@ -586,48 +602,133 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ocr_error_and_empty_text_retry_same_changed_frame_without_stale_reuse() {
+    async fn ocr_gaps_override_long_cadence_and_retry_changed_frame_without_stale_reuse() {
+        for (name, failing_ocr, expected_gap) in [
+            (
+                "OCR error",
+                Err(anyhow!("OCR unavailable")),
+                CaptureGap::OcrUnavailable,
+            ),
+            ("empty OCR", Ok(" \r\n\t ".to_owned()), CaptureGap::EmptyOcr),
+        ] {
+            let harness = Harness::new();
+            let mut source = harness.source(
+                [
+                    Ok((frame(1), metadata(10, "notepad.exe", "notes"))),
+                    Ok((frame(1), metadata(10, "notepad.exe", "notes"))),
+                    Ok((frame(2), metadata(10, "notepad.exe", "notes"))),
+                    Ok((frame(2), metadata(10, "notepad.exe", "notes"))),
+                ],
+                [Ok("old".to_owned()), failing_ocr, Ok("fresh".to_owned())],
+                [
+                    Ok(Duration::ZERO),
+                    Ok(Duration::from_secs(30)),
+                    Ok(Duration::from_secs(37)),
+                ],
+                [],
+            );
+
+            source.next_sample().await.unwrap();
+            harness.at(30);
+            let (_, stable) = sample(source.next_sample().await.unwrap());
+            assert_eq!(
+                stable.next_interval,
+                chrono::Duration::seconds(5),
+                "{name} precondition"
+            );
+            harness.at(35);
+            assert_eq!(
+                source.next_sample().await.unwrap(),
+                SampleRead::Gap(expected_gap),
+                "{name}"
+            );
+            harness.at(37);
+            let (actual, cadence) = sample(source.next_sample().await.unwrap());
+
+            assert_eq!(actual.ocr_text, "fresh", "{name}");
+            assert!(cadence.input.frame_changed, "{name}");
+            assert_eq!(
+                cadence.input.frame_stable_for,
+                chrono::Duration::zero(),
+                "{name}"
+            );
+            let calls = harness.calls.lock().unwrap();
+            assert_eq!(
+                calls.sleeps,
+                [
+                    Duration::from_secs(2),
+                    Duration::from_secs(5),
+                    Duration::from_secs(2),
+                ],
+                "{name}"
+            );
+            assert_eq!(calls.ocr, 3, "{name}");
+        }
+    }
+
+    #[test]
+    fn cadence_conversion_rejects_each_out_of_range_standard_duration() {
+        let input_error = cadence_record(Duration::MAX, Duration::ZERO, false, false).unwrap_err();
+        assert_eq!(
+            input_error.to_string(),
+            "input-idle duration exceeds chrono range"
+        );
+
+        let stability_error =
+            cadence_record(Duration::ZERO, Duration::MAX, false, false).unwrap_err();
+        assert_eq!(
+            stability_error.to_string(),
+            "frame-stability duration exceeds chrono range"
+        );
+    }
+
+    #[tokio::test]
+    async fn backwards_monotonic_clock_errors_without_committing_cache_or_reusing_stale_ocr() {
         let harness = Harness::new();
         let mut source = harness.source(
             [
                 Ok((frame(1), metadata(10, "notepad.exe", "notes"))),
-                Ok((frame(2), metadata(10, "notepad.exe", "notes"))),
-                Ok((frame(2), metadata(10, "notepad.exe", "notes"))),
+                Ok((frame(1), metadata(10, "notepad.exe", "notes"))),
+                Ok((frame(1), metadata(10, "notepad.exe", "notes"))),
                 Ok((frame(2), metadata(10, "notepad.exe", "notes"))),
             ],
-            [
-                Ok("old".to_owned()),
-                Err(anyhow!("OCR unavailable")),
-                Ok(" \r\n\t ".to_owned()),
-                Ok("fresh".to_owned()),
-            ],
+            [Ok("old".to_owned()), Ok("fresh".to_owned())],
             [
                 Ok(Duration::ZERO),
-                Ok(Duration::from_secs(2)),
-                Ok(Duration::from_secs(4)),
-                Ok(Duration::from_secs(6)),
+                Ok(Duration::ZERO),
+                Ok(Duration::from_secs(30)),
+                Ok(Duration::from_secs(32)),
             ],
             [],
         );
 
+        harness.at(30);
         source.next_sample().await.unwrap();
-        harness.at(2);
-        assert_eq!(
-            source.next_sample().await.unwrap(),
-            SampleRead::Gap(CaptureGap::OcrUnavailable)
-        );
-        harness.at(4);
-        assert_eq!(
-            source.next_sample().await.unwrap(),
-            SampleRead::Gap(CaptureGap::EmptyOcr)
-        );
-        harness.at(6);
-        let (actual, cadence) = sample(source.next_sample().await.unwrap());
+        harness.at(20);
+        let error = source.next_sample().await.unwrap_err();
+        assert_eq!(error.to_string(), "monotonic clock moved backwards");
 
-        assert_eq!(actual.ocr_text, "fresh");
-        assert!(cadence.input.frame_changed);
-        assert_eq!(cadence.input.frame_stable_for, chrono::Duration::zero());
-        assert_eq!(harness.calls.lock().unwrap().ocr, 4);
+        harness.at(60);
+        let (recovered, cadence) = sample(source.next_sample().await.unwrap());
+        assert_eq!(recovered.ocr_text, "old");
+        assert_eq!(
+            cadence.input.frame_stable_for,
+            chrono::Duration::seconds(30)
+        );
+        harness.at(62);
+        let (changed, _) = sample(source.next_sample().await.unwrap());
+        assert_eq!(changed.ocr_text, "fresh");
+
+        let calls = harness.calls.lock().unwrap();
+        assert_eq!(calls.ocr, 2);
+        assert_eq!(
+            calls.sleeps,
+            [
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -739,9 +840,11 @@ mod tests {
     fn windows_source_and_source_future_satisfy_send_contract() {
         fn assert_send<T: Send>() {}
         fn assert_source<T: SampleSource + Send>() {}
+        fn assert_send_value<T: Send>(_value: T) {}
 
         assert_send::<WindowsSampleSource>();
         assert_source::<WindowsSampleSource>();
+        assert_send_value(WindowsSampleSource::new());
         assert_send::<Source<TestOps>>();
         assert_source::<Source<TestOps>>();
     }

@@ -2,7 +2,6 @@ use anyhow::bail;
 use clap::{Parser, Subcommand};
 
 mod service;
-#[allow(dead_code)]
 mod windows_source;
 
 #[derive(Debug, Parser)]
