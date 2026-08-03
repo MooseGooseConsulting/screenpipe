@@ -1,6 +1,6 @@
 use chrono::Duration;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CadenceInput {
     pub input_idle: Duration,
     pub frame_stable_for: Duration,
@@ -20,12 +20,6 @@ impl CadenceRecord {
             input,
             next_interval: CadencePolicy::next_interval(input),
         }
-    }
-}
-
-impl Default for CadenceRecord {
-    fn default() -> Self {
-        Self::from_input(CadenceInput::default())
     }
 }
 

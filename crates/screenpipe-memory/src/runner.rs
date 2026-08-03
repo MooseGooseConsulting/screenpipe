@@ -15,14 +15,40 @@ pub enum SampleRead {
     Gap(CaptureGap),
 }
 
+/// Capture boundary. Implementations must be movable to the runner task.
 #[async_trait]
-pub trait SampleSource {
+pub trait SampleSource: Send {
     async fn next_sample(&mut self) -> Result<SampleRead>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventId(String);
+
+impl EventId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for EventId {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self> {
+        if value.trim().is_empty() {
+            bail!("event sink returned a blank start id");
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Durable event boundary. Implementations must be safe to share with the
+/// runner task. Both operations must be atomic so retrying an error is safe.
+/// `start` must allocate and insert in one transaction, return only a validated
+/// ID for the durably inserted row, and leave no durable insert visible on
+/// error.
 #[async_trait]
-pub trait EventSink {
-    async fn start(&self, event: &OpenEvent, reason: SplitReason) -> Result<String>;
+pub trait EventSink: Send + Sync {
+    async fn start(&self, event: &OpenEvent, reason: SplitReason) -> Result<EventId>;
     async fn merge(&self, event_id: &str, event: &OpenEvent) -> Result<()>;
 }
 
@@ -42,21 +68,23 @@ pub enum RunOutcome {
 
 pub struct Runner {
     merger: Merger,
-    current_event_id: Option<String>,
+    current_event_id: Option<EventId>,
     pending_gaps: CaptureGapSummary,
+    pending_sample: Option<(ObservationSample, CadenceRecord)>,
 }
 
 impl Runner {
-    pub fn new(merger: Merger) -> Self {
+    pub fn new(config: crate::MergeConfig) -> Self {
         Self {
-            merger,
+            merger: Merger::new(config),
             current_event_id: None,
             pending_gaps: CaptureGapSummary::default(),
+            pending_sample: None,
         }
     }
 
     pub fn current_event_id(&self) -> Option<&str> {
-        self.current_event_id.as_deref()
+        self.current_event_id.as_ref().map(EventId::as_str)
     }
 
     pub fn pending_gaps(&self) -> CaptureGapSummary {
@@ -68,41 +96,52 @@ impl Runner {
         source: &mut dyn SampleSource,
         sink: &dyn EventSink,
     ) -> Result<RunOutcome> {
-        let read = source.next_sample().await?;
-        let (sample, cadence) = match read {
-            SampleRead::Gap(gap) => return Ok(self.record_gap(gap)),
-            SampleRead::Sample { sample, cadence } => (sample, cadence),
-        };
+        let (sample, cadence) = if let Some(pending) = self.pending_sample.clone() {
+            pending
+        } else {
+            let read = source.next_sample().await?;
+            let pending = match read {
+                SampleRead::Gap(gap) => return Ok(self.record_gap(gap)),
+                SampleRead::Sample { sample, cadence } => (sample, cadence),
+            };
 
-        if TextIdentity::from_ocr(&sample.ocr_text)
-            .normalized
-            .is_empty()
-        {
-            return Ok(self.record_gap(CaptureGap::EmptyOcr));
-        }
+            if TextIdentity::from_ocr(&pending.0.ocr_text)
+                .normalized
+                .is_empty()
+            {
+                return Ok(self.record_gap(CaptureGap::EmptyOcr));
+            }
+
+            self.pending_sample = Some(pending.clone());
+            pending
+        };
 
         let mut staged_merger = self.merger.clone();
         let decision = staged_merger.ingest_with_metadata(sample, cadence, self.pending_gaps);
         match decision {
             MergeDecision::Start { reason, event } => {
                 let event_id = sink.start(&event, reason).await?;
-                if event_id.trim().is_empty() {
-                    bail!("event sink returned a blank start id");
-                }
                 self.merger = staged_merger;
                 self.current_event_id = Some(event_id.clone());
                 self.pending_gaps = CaptureGapSummary::default();
-                Ok(RunOutcome::Started { event_id, reason })
+                self.pending_sample = None;
+                Ok(RunOutcome::Started {
+                    event_id: event_id.as_str().to_owned(),
+                    reason,
+                })
             }
             MergeDecision::Merge { event } => {
                 let event_id = self
                     .current_event_id
                     .clone()
                     .context("merger produced merge without a durable event id")?;
-                sink.merge(&event_id, &event).await?;
+                sink.merge(event_id.as_str(), &event).await?;
                 self.merger = staged_merger;
                 self.pending_gaps = CaptureGapSummary::default();
-                Ok(RunOutcome::Merged { event_id })
+                self.pending_sample = None;
+                Ok(RunOutcome::Merged {
+                    event_id: event_id.as_str().to_owned(),
+                })
             }
         }
     }
@@ -123,9 +162,9 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use crate::{
-        CadenceInput, CadenceRecord, CaptureGap, CaptureGapSummary, EventSink,
-        MERGE_CONTRACT_VERSION, MergeConfig, MergeDecisionKind, Merger, ObservationSample,
-        OpenEvent, RunOutcome, Runner, SampleRead, SampleSource, SplitReason, TextIdentity,
+        CadenceInput, CadenceRecord, CaptureGap, CaptureGapSummary, EventId, EventSink,
+        MERGE_CONTRACT_VERSION, MergeConfig, MergeDecisionKind, ObservationSample, OpenEvent,
+        RunOutcome, Runner, SampleRead, SampleSource, SplitReason, TextIdentity,
     };
 
     fn at(second: i64) -> chrono::DateTime<Utc> {
@@ -166,27 +205,38 @@ mod tests {
     }
 
     fn runner() -> Runner {
-        Runner::new(Merger::new(MergeConfig {
+        Runner::new(MergeConfig {
             idle_gap: Duration::seconds(30),
             scroll_overlap: 0.35,
-        }))
+        })
     }
 
     struct MemorySource {
         reads: VecDeque<Result<SampleRead>>,
+        read_count: usize,
     }
 
     impl MemorySource {
         fn new(reads: impl IntoIterator<Item = Result<SampleRead>>) -> Self {
             Self {
                 reads: reads.into_iter().collect(),
+                read_count: 0,
             }
+        }
+
+        fn read_count(&self) -> usize {
+            self.read_count
+        }
+
+        fn remaining(&self) -> usize {
+            self.reads.len()
         }
     }
 
     #[async_trait]
     impl SampleSource for MemorySource {
         async fn next_sample(&mut self) -> Result<SampleRead> {
+            self.read_count += 1;
             self.reads
                 .pop_front()
                 .expect("test source should have another read")
@@ -230,16 +280,18 @@ mod tests {
 
     #[async_trait]
     impl EventSink for RecordingSink {
-        async fn start(&self, event: &OpenEvent, reason: SplitReason) -> Result<String> {
+        async fn start(&self, event: &OpenEvent, reason: SplitReason) -> Result<EventId> {
             self.calls.lock().unwrap().push(SinkCall::Start {
                 event: event.clone(),
                 reason,
             });
-            self.start_results
+            let raw_id = self
+                .start_results
                 .lock()
                 .unwrap()
                 .pop_front()
-                .expect("test sink should have a start result")
+                .expect("test sink should have a start result")?;
+            EventId::try_from(raw_id)
         }
 
         async fn merge(&self, event_id: &str, event: &OpenEvent) -> Result<()> {
@@ -382,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_initial_start_does_not_advance_merger_or_event_id() {
+    async fn failed_initial_start_retries_the_exact_sample_without_reading_the_next_item() {
         let mut source = MemorySource::new([
             Ok(SampleRead::Gap(CaptureGap::CaptureUnavailable)),
             Ok(sample_read(0, "notepad.exe", "notes", "first")),
@@ -394,6 +446,7 @@ mod tests {
         runner.run_once(&mut source, &sink).await.unwrap();
         assert!(runner.run_once(&mut source, &sink).await.is_err());
         assert_eq!(runner.pending_gaps().capture_unavailable, 1);
+        assert_eq!((source.read_count(), source.remaining()), (2, 1));
         let retry = runner.run_once(&mut source, &sink).await.unwrap();
 
         assert_eq!(
@@ -405,6 +458,7 @@ mod tests {
         );
         assert_eq!(runner.current_event_id(), Some("event-2"));
         let calls = sink.calls();
+        assert_eq!(started_event(&calls[0]), started_event(&calls[1]));
         assert_eq!(
             calls
                 .iter()
@@ -416,11 +470,14 @@ mod tests {
             vec![SplitReason::Initial, SplitReason::Initial]
         );
         assert_eq!(started_event(&calls[1]).capture_gaps.capture_unavailable, 1);
+        assert_eq!(started_event(&calls[1]).latest.ocr_text, "first");
+        assert_eq!(started_event(&calls[1]).latest_cadence, cadence(0));
+        assert_eq!((source.read_count(), source.remaining()), (2, 1));
         assert_eq!(runner.pending_gaps(), CaptureGapSummary::default());
     }
 
     #[tokio::test]
-    async fn failed_merge_retains_merger_id_and_pending_gaps_for_retry() {
+    async fn failed_merge_retries_the_exact_sample_without_reading_the_next_item() {
         let mut source = MemorySource::new([
             Ok(sample_read(0, "notepad.exe", "notes", "same text")),
             Ok(SampleRead::Gap(CaptureGap::OcrUnavailable)),
@@ -438,22 +495,27 @@ mod tests {
         assert!(runner.run_once(&mut source, &sink).await.is_err());
         assert_eq!(runner.current_event_id(), Some("event-1"));
         assert_eq!(runner.pending_gaps().ocr_unavailable, 1);
+        assert_eq!((source.read_count(), source.remaining()), (3, 1));
         runner.run_once(&mut source, &sink).await.unwrap();
 
         let calls = sink.calls();
         let (failed_id, failed_event) = merged_event(&calls[1]);
         let (retry_id, retry_event) = merged_event(&calls[2]);
         assert_eq!((failed_id, retry_id), ("event-1", "event-1"));
+        assert_eq!(failed_event, retry_event);
         assert_eq!(
             (failed_event.sample_count, retry_event.sample_count),
             (2, 2)
         );
         assert_eq!(retry_event.capture_gaps.ocr_unavailable, 1);
+        assert_eq!(retry_event.latest.ocr_text, "same text");
+        assert_eq!(retry_event.latest_cadence, cadence(2));
+        assert_eq!((source.read_count(), source.remaining()), (3, 1));
         assert_eq!(runner.pending_gaps(), CaptureGapSummary::default());
     }
 
     #[tokio::test]
-    async fn failed_split_retains_previous_merger_and_id() {
+    async fn failed_split_retries_the_exact_split_without_reading_the_next_item() {
         let mut source = MemorySource::new([
             Ok(sample_read(0, "notepad.exe", "notes", "same text")),
             Ok(SampleRead::Gap(CaptureGap::OcrUnavailable)),
@@ -461,8 +523,12 @@ mod tests {
             Ok(sample_read(2, "notepad.exe", "notes", "same text")),
         ]);
         let sink = RecordingSink::new(
-            [Ok("event-old".to_owned()), Err(anyhow!("split failed"))],
-            [Ok(())],
+            [
+                Ok("event-old".to_owned()),
+                Err(anyhow!("split failed")),
+                Ok("event-new".to_owned()),
+            ],
+            [],
         );
         let mut runner = runner();
 
@@ -470,19 +536,24 @@ mod tests {
         runner.run_once(&mut source, &sink).await.unwrap();
         assert!(runner.run_once(&mut source, &sink).await.is_err());
         assert_eq!(runner.pending_gaps().ocr_unavailable, 1);
+        assert_eq!((source.read_count(), source.remaining()), (3, 1));
         let retry = runner.run_once(&mut source, &sink).await.unwrap();
 
         assert_eq!(
             retry,
-            RunOutcome::Merged {
-                event_id: "event-old".to_owned(),
+            RunOutcome::Started {
+                event_id: "event-new".to_owned(),
+                reason: SplitReason::AppChange,
             }
         );
-        assert_eq!(runner.current_event_id(), Some("event-old"));
+        assert_eq!(runner.current_event_id(), Some("event-new"));
         let calls = sink.calls();
-        assert_eq!(merged_event(&calls[2]).0, "event-old");
-        assert_eq!(merged_event(&calls[2]).1.sample_count, 2);
-        assert_eq!(merged_event(&calls[2]).1.capture_gaps.ocr_unavailable, 1);
+        assert_eq!(calls[1], calls[2]);
+        assert_eq!(started_event(&calls[2]).latest.app_key, "msedge.exe");
+        assert_eq!(started_event(&calls[2]).latest.ocr_text, "web text");
+        assert_eq!(started_event(&calls[2]).latest_cadence, cadence(1));
+        assert_eq!(started_event(&calls[2]).capture_gaps.ocr_unavailable, 1);
+        assert_eq!((source.read_count(), source.remaining()), (3, 1));
         assert_eq!(runner.pending_gaps(), CaptureGapSummary::default());
     }
 
@@ -501,17 +572,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blank_start_id_is_rejected_without_advancing_state() {
+    async fn invalid_start_id_retries_the_exact_sample_without_reading_the_next_item() {
         let mut source = MemorySource::new([
+            Ok(SampleRead::Gap(CaptureGap::CaptureUnavailable)),
             Ok(sample_read(0, "notepad.exe", "notes", "first")),
             Ok(sample_read(1, "notepad.exe", "notes", "second")),
         ]);
         let sink = RecordingSink::new([Ok(" \t".to_owned()), Ok("event-good".to_owned())], []);
         let mut runner = runner();
 
+        runner.run_once(&mut source, &sink).await.unwrap();
         let error = runner.run_once(&mut source, &sink).await.unwrap_err();
         assert_eq!(error.to_string(), "event sink returned a blank start id");
         assert_eq!(runner.current_event_id(), None);
+        assert_eq!(runner.pending_gaps().capture_unavailable, 1);
+        assert_eq!((source.read_count(), source.remaining()), (2, 1));
         let retry = runner.run_once(&mut source, &sink).await.unwrap();
 
         assert_eq!(
@@ -521,6 +596,13 @@ mod tests {
                 reason: SplitReason::Initial,
             }
         );
+        let calls = sink.calls();
+        assert_eq!(started_event(&calls[0]), started_event(&calls[1]));
+        assert_eq!(started_event(&calls[1]).latest.ocr_text, "first");
+        assert_eq!(started_event(&calls[1]).latest_cadence, cadence(0));
+        assert_eq!(started_event(&calls[1]).capture_gaps.capture_unavailable, 1);
+        assert_eq!(runner.pending_gaps(), CaptureGapSummary::default());
+        assert_eq!((source.read_count(), source.remaining()), (2, 1));
     }
 
     #[tokio::test]

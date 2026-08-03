@@ -12,7 +12,12 @@ impl TestIngest for Merger {
     fn ingest(&mut self, sample: ObservationSample) -> MergeDecision {
         self.ingest_with_metadata(
             sample,
-            CadenceRecord::from_input(CadenceInput::default()),
+            CadenceRecord::from_input(CadenceInput {
+                input_idle: Duration::zero(),
+                frame_stable_for: Duration::zero(),
+                foreground_changed: false,
+                frame_changed: false,
+            }),
             CaptureGapSummary::default(),
         )
     }
