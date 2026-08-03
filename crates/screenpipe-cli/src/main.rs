@@ -1,6 +1,9 @@
 use anyhow::bail;
 use clap::{Parser, Subcommand};
 
+#[allow(dead_code)]
+mod service;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "screenpipe",
