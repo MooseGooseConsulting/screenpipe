@@ -2,10 +2,15 @@
 
 mod cadence;
 mod merge;
+mod runner;
 mod sample;
 mod text_hash;
 
-pub use cadence::{CadenceInput, CadencePolicy};
-pub use merge::{MergeConfig, MergeDecision, Merger, OpenEvent, SplitReason};
+pub use cadence::{CadenceInput, CadencePolicy, CadenceRecord};
+pub use merge::{
+    CaptureGap, CaptureGapSummary, MERGE_CONTRACT_VERSION, MergeConfig, MergeDecision,
+    MergeDecisionKind, Merger, OpenEvent, SplitReason,
+};
+pub use runner::{EventSink, RunOutcome, Runner, SampleRead, SampleSource};
 pub use sample::ObservationSample;
 pub use text_hash::{TextIdentity, jaccard_overlap};

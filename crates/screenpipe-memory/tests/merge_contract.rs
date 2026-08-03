@@ -1,7 +1,22 @@
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
-    MergeConfig, MergeDecision, Merger, ObservationSample, SplitReason, TextIdentity,
+    CadenceInput, CadenceRecord, CaptureGapSummary, MergeConfig, MergeDecision, Merger,
+    ObservationSample, SplitReason, TextIdentity,
 };
+
+trait TestIngest {
+    fn ingest(&mut self, sample: ObservationSample) -> MergeDecision;
+}
+
+impl TestIngest for Merger {
+    fn ingest(&mut self, sample: ObservationSample) -> MergeDecision {
+        self.ingest_with_metadata(
+            sample,
+            CadenceRecord::from_input(CadenceInput::default()),
+            CaptureGapSummary::default(),
+        )
+    }
+}
 
 fn at(second: i64) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, second as u32)

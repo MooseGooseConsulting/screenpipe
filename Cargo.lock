@@ -1898,8 +1898,11 @@ dependencies = [
 name = "screenpipe-memory"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "chrono",
  "sha2",
+ "tokio",
  "unicode-normalization",
 ]
 
