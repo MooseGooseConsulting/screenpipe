@@ -28,6 +28,17 @@ fn address_bar(value: Option<&str>) -> UiaElementSnapshot {
     }
 }
 
+fn page_input(name: &str, automation_id: &str, value: &str) -> UiaElementSnapshot {
+    UiaElementSnapshot {
+        control_type: EDIT_CONTROL,
+        name: name.to_owned(),
+        automation_id: automation_id.to_owned(),
+        value: Some(value.to_owned()),
+        is_enabled: true,
+        is_offscreen: false,
+    }
+}
+
 #[test]
 fn selects_the_enabled_visible_chrome_address_bar() {
     let elements = vec![
@@ -59,6 +70,61 @@ fn selects_the_enabled_visible_edge_address_bar() {
         select_address_bar("msedge.exe", &elements),
         Some(Url::parse("https://github.com/MooseGooseConsulting/screenpipe").unwrap())
     );
+}
+
+#[test]
+fn skips_url_looking_page_inputs_before_the_browser_address_bar() {
+    let elements = vec![
+        page_input(
+            "Email address",
+            "email-address",
+            "https://accounts.example.test/private-profile",
+        ),
+        page_input(
+            "Delivery destination",
+            "shipping-address",
+            "https://orders.example.test/private-order",
+        ),
+        page_input(
+            "Address and search bar",
+            "page-location",
+            "https://search.example.test/private-search",
+        ),
+        address_bar(Some("https://example.test/safe-browser-location")),
+    ];
+
+    assert_eq!(
+        select_address_bar("chrome.exe", &elements).map(|url| url.path().to_owned()),
+        Some("/safe-browser-location".to_owned())
+    );
+}
+
+#[test]
+fn rejects_page_inputs_with_address_like_names_and_identifiers() {
+    let elements = vec![
+        page_input(
+            "Email address",
+            "customer-email",
+            "https://accounts.example.test/private-profile",
+        ),
+        page_input(
+            "Shipping destination",
+            "shipping-address",
+            "https://orders.example.test/private-order",
+        ),
+        page_input(
+            "Address and search bar for profile",
+            "profile-location",
+            "https://profile.example.test/private-profile",
+        ),
+        page_input(
+            "Address and search bar",
+            "page-location",
+            "https://search.example.test/private-search",
+        ),
+    ];
+
+    assert!(select_address_bar("msedge.exe", &elements).is_none());
 }
 
 #[test]
@@ -113,4 +179,31 @@ fn reader_never_opens_uia_for_a_non_browser() {
         BrowserUrlReader.read_for_foreground(&metadata).unwrap(),
         None
     );
+}
+
+#[test]
+fn reader_treats_a_stale_browser_window_as_optional_metadata() {
+    let metadata = ForegroundMetadata {
+        window_handle: 0,
+        app_key: "chrome.exe".to_owned(),
+        app_title: "Google Chrome".to_owned(),
+        window_title: "No longer foreground".to_owned(),
+        browser_url: None,
+    };
+
+    assert!(matches!(
+        BrowserUrlReader.read_for_foreground(&metadata),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn snapshot_debug_output_redacts_the_uia_value() {
+    let snapshot = page_input(
+        "Email address",
+        "email-address",
+        "https://accounts.example.test/private-profile",
+    );
+
+    assert!(!format!("{snapshot:?}").contains("private-profile"));
 }

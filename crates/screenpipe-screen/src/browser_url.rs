@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use std::fmt;
+
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use uiautomation::controls::ControlType;
 use uiautomation::patterns::UIValuePattern;
@@ -8,10 +10,11 @@ use uiautomation::{UIAutomation, UIElement};
 use url::Url;
 
 use crate::ForegroundMetadata;
+use crate::windows_metadata::foreground_window_handle;
 
 const UIA_EDIT_CONTROL_TYPE_ID: i32 = 50_004;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiaElementSnapshot {
     pub control_type: i32,
     pub name: String,
@@ -19,6 +22,20 @@ pub struct UiaElementSnapshot {
     pub value: Option<String>,
     pub is_enabled: bool,
     pub is_offscreen: bool,
+}
+
+impl fmt::Debug for UiaElementSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UiaElementSnapshot")
+            .field("control_type", &self.control_type)
+            .field("name", &self.name)
+            .field("automation_id", &self.automation_id)
+            .field("value", &self.value.as_ref().map(|_| "<redacted>"))
+            .field("is_enabled", &self.is_enabled)
+            .field("is_offscreen", &self.is_offscreen)
+            .finish()
+    }
 }
 
 pub fn select_address_bar(app_key: &str, elements: &[UiaElementSnapshot]) -> Option<Url> {
@@ -44,13 +61,11 @@ pub fn select_address_bar(app_key: &str, elements: &[UiaElementSnapshot]) -> Opt
 }
 
 fn looks_like_address_bar(element: &UiaElementSnapshot) -> bool {
-    let name = element.name.to_ascii_lowercase();
-    let automation_id = element.automation_id.to_ascii_lowercase();
-    name.contains("address")
-        || name.contains("omnibox")
-        || automation_id.contains("address")
-        || automation_id.contains("omnibox")
-        || automation_id == "view_1022"
+    element.automation_id.eq_ignore_ascii_case("view_1022")
+        && matches!(
+            element.name.to_ascii_lowercase().as_str(),
+            "address and search bar" | "search or enter web address" | "omnibox"
+        )
 }
 
 pub struct BrowserUrlReader;
@@ -64,26 +79,48 @@ impl BrowserUrlReader {
             return Ok(None);
         }
 
-        let automation = UIAutomation::new().context("create Windows UI Automation client")?;
-        let root = automation
-            .element_from_handle(Handle::from(metadata.window_handle))
-            .context("open foreground browser UI Automation root")?;
-        let edit_condition = automation
-            .create_property_condition(
-                UIProperty::ControlType,
-                Variant::from(ControlType::Edit as i32),
-                None,
-            )
-            .context("create browser Edit-control condition")?;
-        let edits = root
-            .find_all(TreeScope::Subtree, &edit_condition)
-            .context("enumerate foreground browser Edit controls")?;
+        if !is_still_foreground(metadata.window_handle) {
+            return Ok(None);
+        }
+
+        let automation = match UIAutomation::new() {
+            Ok(automation) => automation,
+            Err(_) => return Ok(None),
+        };
+        let root = match automation.element_from_handle(Handle::from(metadata.window_handle)) {
+            Ok(root) => root,
+            Err(_) => return Ok(None),
+        };
+        let edit_condition = match automation.create_property_condition(
+            UIProperty::ControlType,
+            Variant::from(ControlType::Edit as i32),
+            None,
+        ) {
+            Ok(condition) => condition,
+            Err(_) => return Ok(None),
+        };
+        let edits = match root.find_all(TreeScope::Subtree, &edit_condition) {
+            Ok(edits) => edits,
+            Err(_) => return Ok(None),
+        };
+        if !is_still_foreground(metadata.window_handle) {
+            return Ok(None);
+        }
+
         let snapshots = edits
             .iter()
             .filter_map(snapshot_address_bar_candidate)
             .collect::<Vec<_>>();
+        if !is_still_foreground(metadata.window_handle) {
+            return Ok(None);
+        }
+
         Ok(select_address_bar(&metadata.app_key, &snapshots))
     }
+}
+
+fn is_still_foreground(expected_handle: isize) -> bool {
+    foreground_window_handle().ok() == Some(expected_handle)
 }
 
 fn snapshot_address_bar_candidate(element: &UIElement) -> Option<UiaElementSnapshot> {
