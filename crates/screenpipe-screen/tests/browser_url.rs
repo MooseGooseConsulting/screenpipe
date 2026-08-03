@@ -14,6 +14,7 @@ fn button() -> UiaElementSnapshot {
         value: None,
         is_enabled: true,
         is_offscreen: false,
+        has_document_ancestor: false,
     }
 }
 
@@ -25,6 +26,7 @@ fn address_bar(value: Option<&str>) -> UiaElementSnapshot {
         value: value.map(str::to_owned),
         is_enabled: true,
         is_offscreen: false,
+        has_document_ancestor: false,
     }
 }
 
@@ -36,6 +38,7 @@ fn page_input(name: &str, automation_id: &str, value: &str) -> UiaElementSnapsho
         value: Some(value.to_owned()),
         is_enabled: true,
         is_offscreen: false,
+        has_document_ancestor: true,
     }
 }
 
@@ -62,6 +65,7 @@ fn selects_the_enabled_visible_edge_address_bar() {
             value: Some("not a URL".to_owned()),
             is_enabled: true,
             is_offscreen: false,
+            has_document_ancestor: false,
         },
         address_bar(Some("https://github.com/MooseGooseConsulting/screenpipe")),
     ];
@@ -125,6 +129,17 @@ fn rejects_page_inputs_with_address_like_names_and_identifiers() {
     ];
 
     assert!(select_address_bar("msedge.exe", &elements).is_none());
+}
+
+#[test]
+fn rejects_an_exact_address_bar_collision_under_page_document() {
+    let exact_collision = page_input(
+        "Address and search bar",
+        "view_1022",
+        "https://page.example.test/private-page-value",
+    );
+
+    assert!(select_address_bar("chrome.exe", &[exact_collision]).is_none());
 }
 
 #[test]

@@ -13,6 +13,7 @@ anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
 url = "2"
 uiautomation = "=0.16.1"
 xcap = { version = "=0.9.4", features = ["wgc"] }
