@@ -120,7 +120,7 @@ impl ServiceSpec {
             r#"$ErrorActionPreference = 'Continue'
 $agent = '{escaped_agent}'
 while ($true) {{
-    doppler run -p screen-memory -c dev -- $agent run --machine-slug icarus --display-name Icarus-Laptop
+    doppler run -p apps-data -c dev -- $agent run --machine-slug icarus --display-name Icarus-Laptop
     Start-Sleep -Seconds 10
 }}
 "#
@@ -721,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn service_spec_keeps_artifacts_and_launch_settings_safe() {
+    fn service_spec_uses_existing_doppler_namespace_and_keeps_local_artifacts_safe() {
         let local_app_data = Path::new(r"C:\Users\pmacl\AppData\Local");
         let root = ServiceRoot::for_test(local_app_data.to_owned());
         let spec = ServiceSpec::for_current_user(&root);
@@ -738,10 +738,21 @@ mod tests {
                 "$ErrorActionPreference = 'Continue'\n",
                 "$agent = 'C:\\Users\\pmacl\\AppData\\Local\\screen-memory\\bin\\screenpipe.exe'\n",
                 "while ($true) {\n",
-                "    doppler run -p screen-memory -c dev -- $agent run --machine-slug icarus --display-name Icarus-Laptop\n",
+                "    doppler run -p apps-data -c dev -- $agent run --machine-slug icarus --display-name Icarus-Laptop\n",
                 "    Start-Sleep -Seconds 10\n",
                 "}\n",
             )
+        );
+        assert_eq!(
+            spec.wrapper_contents
+                .matches("doppler run -p apps-data -c dev --")
+                .count(),
+            1
+        );
+        assert!(
+            !spec
+                .wrapper_contents
+                .contains("doppler run -p screen-memory")
         );
         assert!(!spec.wrapper_contents.contains("SCREEN_MEMORY_DATABASE_URL"));
         assert!(!spec.wrapper_contents.contains("postgresql://"));

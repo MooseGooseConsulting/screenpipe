@@ -1,5 +1,5 @@
 setup:
-  project: screen-memory
+  project: apps-data
   config: dev
 
 flags:
