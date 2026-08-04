@@ -295,6 +295,20 @@ async fn merge_refreshes_app_title_latest_text_and_domain_metadata() -> Result<(
 }
 
 #[tokio::test]
+async fn preflight_verifies_postgres_schema_and_machine_identity() -> Result<()> {
+    let db = TestDatabase::create().await?;
+    let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+
+    let report = writer.preflight().await?;
+
+    ensure!(report.server_version_num >= 180_000);
+    ensure!(report.schema_present);
+    ensure!(report.machine_slug == "icarus");
+    ensure!(report.display_name == "Icarus-Laptop");
+    db.cleanup().await
+}
+
+#[tokio::test]
 async fn explicit_postgres_writer_creates_no_sqlite_or_file_backend() -> Result<()> {
     let db = TestDatabase::create().await?;
     let temp = tempfile::tempdir()?;

@@ -16,7 +16,7 @@ chrono = "0.4"
 clap = { version = "4.5.51", features = ["derive"] }
 screenpipe-memory = { path = "../screenpipe-memory" }
 screenpipe-screen = { path = "../screenpipe-screen" }
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "signal", "time"] }
 windows = { version = "0.58", features = ["Win32_System_Com", "Win32_UI_Shell"] }
 
 [dev-dependencies]

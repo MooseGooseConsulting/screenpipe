@@ -12,6 +12,15 @@ pub struct PgEventWriter {
     machine_slug: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PgPreflight {
+    pub server_version: String,
+    pub server_version_num: i32,
+    pub schema_present: bool,
+    pub machine_slug: String,
+    pub display_name: String,
+}
+
 impl PgEventWriter {
     pub async fn connect(database_url: &str, slug: &str, display_name: &str) -> Result<Self> {
         if database_url.trim().is_empty() {
@@ -36,6 +45,60 @@ impl PgEventWriter {
             pool,
             machine_id,
             machine_slug: slug.to_owned(),
+        })
+    }
+
+    pub async fn preflight(&self) -> Result<PgPreflight> {
+        let (server_version, server_version_num) = sqlx::query_as::<_, (String, i32)>(
+            "SELECT current_setting('server_version'), \
+                    current_setting('server_version_num')::integer",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("read PostgreSQL server version")?;
+        ensure!(
+            server_version_num >= 180_000,
+            "PostgreSQL 18 or newer is required"
+        );
+
+        let schema_present = sqlx::query_scalar::<_, bool>(
+            "SELECT count(DISTINCT table_name) = 3 \
+             FROM information_schema.tables \
+             WHERE table_schema = current_schema() \
+               AND table_name IN ('machines', 'apps', 'events')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .context("inspect authoritative PostgreSQL schema")?;
+        ensure!(
+            schema_present,
+            "authoritative PostgreSQL schema is incomplete"
+        );
+
+        let (machine_id, machine_slug, display_name, next_event_seq) =
+            sqlx::query_as::<_, (i64, String, String, i64)>(
+                "SELECT id, slug, display_name, next_event_seq \
+                 FROM machines WHERE slug = $1",
+            )
+            .bind(&self.machine_slug)
+            .fetch_one(&self.pool)
+            .await
+            .context("verify PostgreSQL machine identity")?;
+        ensure!(
+            machine_id == self.machine_id,
+            "PostgreSQL machine identity changed"
+        );
+        ensure!(
+            next_event_seq >= 1,
+            "PostgreSQL machine sequence is invalid"
+        );
+
+        Ok(PgPreflight {
+            server_version,
+            server_version_num,
+            schema_present,
+            machine_slug,
+            display_name,
         })
     }
 

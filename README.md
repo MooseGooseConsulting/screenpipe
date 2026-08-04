@@ -5,10 +5,10 @@ MooseGoose screen-memory system. It is an independent MIT repository derived
 from Screenpipe commit `892199f742e46d0c5d9e8c06687b35ca7c2b6547`.
 
 The current development branch is not a completed runtime release. Capture,
-OCR, deterministic merging, adaptive cadence, and per-user service lifecycle
-boundaries are implemented and offline-tested. PostgreSQL writing, `run`, and
-`doctor` still require the dedicated Doppler namespace and native database
-before the service may be installed or considered operational.
+OCR, deterministic merging, adaptive cadence, PostgreSQL writing, the `run`
+loop, `doctor`, and per-user service lifecycle boundaries are implemented and
+tested. Service installation and controlled live capture proof remain separate
+gates before the runtime may be considered operational.
 
 ## Product boundary
 
@@ -48,9 +48,10 @@ doppler run -p homelab -c dev_personal -- .\target\release\screenpipe.exe run --
 ```
 
 The checked-in `doppler.yaml` contains only the safe accessible workstation
-project/config names `homelab/dev_personal`. These runtime commands are
-documented contracts, not a claim that the currently incomplete `run` and
-`doctor` implementations pass.
+project/config names `homelab/dev_personal`. `doctor` verifies the variable is
+present, PostgreSQL is version 18 or newer, the authoritative tables and
+machine identity are ready, and the interactive Windows/OCR prerequisites are
+available without rendering the connection value.
 
 ## Per-user service contract
 

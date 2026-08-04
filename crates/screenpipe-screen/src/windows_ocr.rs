@@ -13,6 +13,12 @@ use crate::TransientFrame;
 pub struct WindowsOcr;
 
 impl WindowsOcr {
+    pub fn preflight(&self) -> Result<()> {
+        OcrEngine::TryCreateFromUserProfileLanguages()
+            .context("create Windows OCR engine from installed user languages")?;
+        Ok(())
+    }
+
     pub async fn recognize(&self, frame: &TransientFrame) -> Result<String> {
         let image = frame.to_opaque_rgba_image()?;
         let mut encoded = Vec::new();

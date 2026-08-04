@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use xcap::Window;
 
 use crate::windows_metadata::{foreground_window_handle, metadata_for_window};
@@ -9,6 +9,18 @@ use crate::{ForegroundMetadata, TransientFrame};
 pub struct WindowsCapture;
 
 impl WindowsCapture {
+    pub fn preflight_interactive(&self) -> Result<()> {
+        let active_session_id = unsafe { wts_get_active_console_session_id() };
+        let process_id = unsafe { get_current_process_id() };
+        let mut process_session_id = 0;
+        let succeeded = unsafe { process_id_to_session_id(process_id, &mut process_session_id) };
+        if succeeded == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("resolve current process Windows session");
+        }
+        validate_interactive_session(active_session_id, process_session_id)
+    }
+
     pub fn foreground_window_handle(&self) -> Result<isize> {
         foreground_window_handle()
     }
@@ -18,6 +30,28 @@ impl WindowsCapture {
             .await
             .context("foreground capture worker failed")?
     }
+}
+
+fn validate_interactive_session(active_session_id: u32, process_session_id: u32) -> Result<()> {
+    ensure!(
+        active_session_id != u32::MAX,
+        "Windows has no active console session"
+    );
+    ensure!(
+        process_session_id == active_session_id,
+        "process is not running in the active interactive Windows session"
+    );
+    Ok(())
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "WTSGetActiveConsoleSessionId"]
+    fn wts_get_active_console_session_id() -> u32;
+    #[link_name = "GetCurrentProcessId"]
+    fn get_current_process_id() -> u32;
+    #[link_name = "ProcessIdToSessionId"]
+    fn process_id_to_session_id(process_id: u32, session_id: *mut u32) -> i32;
 }
 
 fn capture_foreground_blocking() -> Result<(TransientFrame, ForegroundMetadata)> {
@@ -68,4 +102,20 @@ fn capture_foreground_blocking() -> Result<(TransientFrame, ForegroundMetadata)>
     let frame = TransientFrame::from_bgra(width, height, stride, bgra)?;
     let metadata = metadata_for_window(handle, process_id, display_name, window_title)?;
     Ok((frame, metadata))
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::validate_interactive_session;
+
+    #[test]
+    fn active_process_session_is_interactive_without_a_foreground_window() {
+        validate_interactive_session(1, 1).unwrap();
+    }
+
+    #[test]
+    fn missing_or_different_active_console_session_is_rejected() {
+        assert!(validate_interactive_session(u32::MAX, 1).is_err());
+        assert!(validate_interactive_session(2, 1).is_err());
+    }
 }
