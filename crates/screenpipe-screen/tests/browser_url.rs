@@ -56,6 +56,18 @@ fn selects_the_enabled_visible_chrome_address_bar() {
 }
 
 #[test]
+fn selects_the_current_chrome_address_bar_automation_id() {
+    let mut current_chrome_address_bar =
+        address_bar(Some("https://github.com/MooseGooseConsulting/screenpipe"));
+    current_chrome_address_bar.automation_id = "view_1012".to_owned();
+
+    assert_eq!(
+        select_address_bar("chrome.exe", &[current_chrome_address_bar]),
+        Some(Url::parse("https://github.com/MooseGooseConsulting/screenpipe").unwrap())
+    );
+}
+
+#[test]
 fn selects_the_enabled_visible_edge_address_bar() {
     let elements = vec![
         UiaElementSnapshot {

@@ -65,11 +65,13 @@ pub fn select_address_bar(app_key: &str, elements: &[UiaElementSnapshot]) -> Opt
 }
 
 fn looks_like_address_bar(element: &UiaElementSnapshot) -> bool {
-    element.automation_id.eq_ignore_ascii_case("view_1022")
-        && matches!(
-            element.name.to_ascii_lowercase().as_str(),
-            "address and search bar" | "search or enter web address" | "omnibox"
-        )
+    matches!(
+        element.automation_id.to_ascii_lowercase().as_str(),
+        "view_1012" | "view_1022"
+    ) && matches!(
+        element.name.to_ascii_lowercase().as_str(),
+        "address and search bar" | "search or enter web address" | "omnibox"
+    )
 }
 
 pub struct BrowserUrlReader;
@@ -112,6 +114,13 @@ impl BrowserUrlDiagnostic {
 
     fn uia_unavailable(stage: &'static str) -> Self {
         Self::new(stage, "uia_unavailable")
+    }
+
+    fn event_line(self) -> String {
+        format!(
+            "event=browser_url_unavailable stage={} reason={}",
+            self.stage, self.reason
+        )
     }
 }
 
@@ -317,11 +326,7 @@ where
 }
 
 fn emit_diagnostic(diagnostic: BrowserUrlDiagnostic) {
-    tracing::debug!(
-        browser_url_stage = diagnostic.stage,
-        browser_url_reason = diagnostic.reason,
-        "browser URL metadata unavailable"
-    );
+    eprintln!("{}", diagnostic.event_line());
 }
 
 #[cfg(test)]
@@ -329,6 +334,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
+    use uiautomation::patterns::UILegacyIAccessiblePattern;
 
     fn trusted_address_bar() -> UiaElementSnapshot {
         UiaElementSnapshot {
@@ -451,6 +457,84 @@ mod tests {
         assert_eq!(
             diagnostics.into_inner(),
             vec![BrowserUrlDiagnostic::uia_unavailable("setup")]
+        );
+    }
+
+    #[test]
+    fn browser_url_diagnostic_renders_only_fixed_stage_and_reason() {
+        assert_eq!(
+            BrowserUrlDiagnostic::new("selection", "no_trusted_address_bar").event_line(),
+            "event=browser_url_unavailable stage=selection reason=no_trusted_address_bar"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a user-pinned foreground Chrome fixture"]
+    fn live_chrome_fixture_reports_redacted_address_bar_value_capabilities() {
+        let handle = foreground_window_handle().expect("foreground window must be available");
+        let (automation, root, edit_condition, walker, root_runtime_id) =
+            setup_uia_traversal(handle).expect("foreground Chrome UIA tree must be available");
+        let edits = root
+            .find_all(TreeScope::Subtree, &edit_condition)
+            .expect("foreground Chrome edit controls must enumerate");
+
+        let mut non_document_edits = 0;
+        let mut trusted_identity_edits = 0;
+        let mut trusted_url_value_reads = 0;
+        let mut trusted_url_value_edits = 0;
+        let mut trusted_legacy_value_reads = 0;
+        let mut trusted_legacy_non_http_values = 0;
+        let mut trusted_legacy_value_unavailable = 0;
+        let mut trusted_legacy_url_value_edits = 0;
+        for edit in edits {
+            if has_document_ancestor(&edit, &root_runtime_id, &walker)
+                .expect("candidate provenance must be readable")
+            {
+                continue;
+            }
+            non_document_edits += 1;
+            let snapshot =
+                snapshot_candidate_identity(&edit).expect("candidate identity must be readable");
+            if snapshot.control_type == UIA_EDIT_CONTROL_TYPE_ID
+                && snapshot.is_enabled
+                && !snapshot.is_offscreen
+                && looks_like_address_bar(&snapshot)
+            {
+                trusted_identity_edits += 1;
+                if let Some(snapshot) = read_candidate_after_provenance(
+                    || has_document_ancestor(&edit, &root_runtime_id, &walker),
+                    || snapshot_candidate_identity(&edit),
+                    || read_candidate_value(&edit),
+                )
+                .expect("trusted candidate value must be readable")
+                {
+                    trusted_url_value_reads += 1;
+                    if select_address_bar("chrome.exe", &[snapshot]).is_some() {
+                        trusted_url_value_edits += 1;
+                    }
+                }
+                match edit
+                    .get_pattern::<UILegacyIAccessiblePattern>()
+                    .and_then(|pattern| pattern.get_value())
+                {
+                    Ok(value) => {
+                        trusted_legacy_value_reads += 1;
+                        if !matches!(
+                        Url::parse(value.trim()),
+                        Ok(url) if matches!(url.scheme(), "http" | "https")
+                        ) {
+                            trusted_legacy_non_http_values += 1;
+                        } else {
+                            trusted_legacy_url_value_edits += 1;
+                        }
+                    }
+                    Err(_) => trusted_legacy_value_unavailable += 1,
+                }
+            }
+        }
+        drop(automation);
+        println!(
+            "BROWSER_URL_LIVE_PROBE non_document_edits={non_document_edits} trusted_identity_edits={trusted_identity_edits} trusted_url_value_reads={trusted_url_value_reads} trusted_url_value_edits={trusted_url_value_edits} trusted_legacy_value_reads={trusted_legacy_value_reads} trusted_legacy_non_http_values={trusted_legacy_non_http_values} trusted_legacy_value_unavailable={trusted_legacy_value_unavailable} trusted_legacy_url_value_edits={trusted_legacy_url_value_edits}"
         );
     }
 }
