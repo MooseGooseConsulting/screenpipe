@@ -43,13 +43,14 @@ from `SCREEN_MEMORY_DATABASE_URL`, injected by Doppler without putting its value
 in arguments, logs, Git, or this document:
 
 ```powershell
-doppler run -p apps-data -c dev -- .\target\release\screenpipe.exe doctor
-doppler run -p apps-data -c dev -- .\target\release\screenpipe.exe run --machine-slug icarus --display-name Icarus-Laptop
+doppler run -p homelab -c dev_personal -- .\target\release\screenpipe.exe doctor
+doppler run -p homelab -c dev_personal -- .\target\release\screenpipe.exe run --machine-slug icarus --display-name Icarus-Laptop
 ```
 
-The checked-in `doppler.yaml` contains only the safe existing project/config
-names `apps-data/dev`. These runtime commands are documented contracts, not a
-claim that the currently incomplete `run` and `doctor` implementations pass.
+The checked-in `doppler.yaml` contains only the safe accessible workstation
+project/config names `homelab/dev_personal`. These runtime commands are
+documented contracts, not a claim that the currently incomplete `run` and
+`doctor` implementations pass.
 
 ## Per-user service contract
 
@@ -61,9 +62,9 @@ The service lifecycle owns exactly these current-user artifacts:
 
 The task uses the current user's interactive token at limited privilege and
 starts at that user's logon. The wrapper invokes the existing Doppler
-`apps-data/dev` namespace and never contains the database URL. Uninstall removes
-only the exact task, copied binary, and wrapper; it preserves the PostgreSQL
-cluster, logs, and all other files beneath the screen-memory root.
+`homelab/dev_personal` namespace and never contains the database URL. Uninstall
+removes only the exact task, copied binary, and wrapper; it preserves the
+PostgreSQL cluster, logs, and all other files beneath the screen-memory root.
 
 Do not install the service until `screenpipe doctor` passes against native
 PostgreSQL 18+, the authoritative schema, OCR, and controlled foreground WGC.

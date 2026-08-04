@@ -1,6 +1,6 @@
 setup:
-  project: apps-data
-  config: dev
+  project: homelab
+  config: dev_personal
 
 flags:
   analytics: false
