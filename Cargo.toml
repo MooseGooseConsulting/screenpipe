@@ -4,6 +4,7 @@ members = [
     "crates/screenpipe-memory",
     "crates/screenpipe-cli",
 ]
+exclude = ["vendor/xcap"]
 resolver = "2"
 
 [workspace.package]
@@ -16,3 +17,6 @@ repository = "https://github.com/MooseGooseConsulting/screenpipe"
 codegen-units = 1
 lto = true
 strip = true
+
+[patch.crates-io]
+xcap = { path = "vendor/xcap" }
