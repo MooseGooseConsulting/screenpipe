@@ -23,6 +23,11 @@ impl CadenceRecord {
     }
 }
 
+/// The slowest interval `CadencePolicy` will ever select. `MergeConfig.idle_gap`
+/// must stay strictly greater than this, or the idle backoff itself trips the
+/// idle-gap split on every sample.
+pub const MAX_CADENCE_INTERVAL_SECONDS: i64 = 30;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CadencePolicy;
 
@@ -34,7 +39,7 @@ impl CadencePolicy {
 
         let stable_for = input.input_idle.min(input.frame_stable_for);
         if stable_for >= Duration::minutes(10) {
-            Duration::seconds(30)
+            Duration::seconds(MAX_CADENCE_INTERVAL_SECONDS)
         } else if stable_for >= Duration::minutes(2) {
             Duration::seconds(15)
         } else if stable_for >= Duration::seconds(30) {

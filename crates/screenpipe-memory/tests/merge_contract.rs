@@ -23,10 +23,10 @@ impl TestIngest for Merger {
     }
 }
 
+/// Offset in seconds from a fixed base. Adds a duration rather than packing
+/// the value into the seconds field, so callers are not limited to 0..59.
 fn at(second: i64) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, second as u32)
-        .single()
-        .unwrap()
+    Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).single().unwrap() + Duration::seconds(second)
 }
 
 fn sample(second: i64, app_key: &str, window_title: &str, ocr_text: &str) -> ObservationSample {
@@ -41,9 +41,15 @@ fn sample(second: i64, app_key: &str, window_title: &str, ocr_text: &str) -> Obs
     }
 }
 
+/// Threshold used by the boundary tests below, which prove the split semantics
+/// (`> idle_gap` splits, `== idle_gap` merges). This is deliberately not the
+/// production value; `an_idle_window_sampled_at_max_backoff_keeps_merging`
+/// covers the production relationship instead.
+const TEST_IDLE_GAP_SECONDS: i64 = 30;
+
 fn merger() -> Merger {
     Merger::new(MergeConfig {
-        idle_gap: Duration::seconds(30),
+        idle_gap: Duration::seconds(TEST_IDLE_GAP_SECONDS),
         scroll_overlap: 0.35,
     })
 }
@@ -248,4 +254,43 @@ fn a_previously_seen_exact_hash_merges_after_the_viewport_moves_away() {
 
     assert_eq!(event.sample_count, 5);
     assert_eq!(event.hash_counts.get(&revisited_hash), Some(&2));
+}
+
+#[test]
+fn an_idle_window_sampled_at_max_backoff_keeps_merging() {
+    // At max backoff the cadence sleeps MAX_CADENCE_INTERVAL_SECONDS, and real
+    // capture plus OCR overhead pushes the delta between consecutive samples
+    // past it. An idle gap equal to the slowest cadence therefore split on
+    // every idle sample, turning a quiet window into a run of one-sample
+    // events and collapsing the merge ratio Goal 1 measures. The production
+    // idle gap must stay strictly above the slowest cadence.
+    let mut merger = Merger::new(MergeConfig {
+        idle_gap: Duration::seconds(screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS * 2),
+        scroll_overlap: 0.35,
+    });
+    let unchanged = "unchanged idle window contents";
+    let mut second = 0;
+    started(
+        merger.ingest(sample(second, "chrome.exe", "Idle", unchanged)),
+        SplitReason::Initial,
+    );
+
+    // Ten consecutive max-backoff samples, each a second of overhead late.
+    let mut event = None;
+    for _ in 0..10 {
+        second += screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS + 1;
+        event = Some(merged(merger.ingest(sample(
+            second,
+            "chrome.exe",
+            "Idle",
+            unchanged,
+        ))));
+    }
+
+    let event = event.expect("idle window must have merged");
+    assert_eq!(
+        event.sample_count, 11,
+        "an unchanged idle window must merge into one event, not fragment"
+    );
+    assert_eq!(event.started_at, at(0));
 }

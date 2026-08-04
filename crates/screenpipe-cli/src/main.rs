@@ -3,7 +3,10 @@ use std::ffi::OsString;
 use anyhow::{Context, Result, ensure};
 use chrono::Duration;
 use clap::{Parser, Subcommand};
-use screenpipe_memory::{EventSink, MergeConfig, PgEventWriter, RunOutcome, Runner, SampleSource};
+use screenpipe_memory::{
+    EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventWriter, RunOutcome, Runner,
+    SampleSource,
+};
 use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
 use crate::service::{ServiceManager, ServiceRoot, ServiceStatus, WindowsTaskScheduler};
@@ -87,9 +90,15 @@ fn required_database_url(value: Option<OsString>) -> Result<String> {
     Ok(value)
 }
 
+/// Strictly above the slowest cadence. At max backoff the sleep alone is
+/// `MAX_CADENCE_INTERVAL_SECONDS`, so an equal threshold splits on every idle
+/// sample once capture and OCR overhead is added, fragmenting a quiet window
+/// into one-sample events.
+const IDLE_GAP_SECONDS: i64 = MAX_CADENCE_INTERVAL_SECONDS * 2;
+
 fn default_runner() -> Runner {
     Runner::new(MergeConfig {
-        idle_gap: Duration::seconds(30),
+        idle_gap: Duration::seconds(IDLE_GAP_SECONDS),
         scroll_overlap: 0.35,
     })
 }
@@ -209,7 +218,19 @@ mod tests {
         RunOutcome, Runner, SampleRead, SampleSource, SplitReason,
     };
 
-    use super::{Cli, Command, run_iteration};
+    use super::{Cli, Command, IDLE_GAP_SECONDS, run_iteration};
+
+    #[test]
+    fn idle_gap_stays_above_the_slowest_cadence_interval() {
+        // If these are equal, the max-backoff sleep alone reaches the split
+        // threshold and every sample of a long idle window becomes its own
+        // one-sample event - collapsing the merge ratio that Goal 1 measures.
+        assert!(
+            IDLE_GAP_SECONDS > screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS,
+            "idle gap {IDLE_GAP_SECONDS}s must exceed the slowest cadence {}s",
+            screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS
+        );
+    }
 
     struct OneSample(Option<SampleRead>);
 

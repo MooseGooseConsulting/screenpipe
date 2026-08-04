@@ -102,6 +102,12 @@ pub enum MergeDecision {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MergeConfig {
+    /// Must be strictly greater than the maximum cadence interval. The split
+    /// test compares the delta between *consecutive samples*, so if this
+    /// equals the slowest cadence the sleep alone reaches the threshold and
+    /// ordinary capture and OCR overhead pushes every idle sample past it -
+    /// fragmenting a quiet window into one-sample events, which is the exact
+    /// opposite of what an idle gap is for. See `MAX_CADENCE_INTERVAL`.
     pub idle_gap: Duration,
     pub scroll_overlap: f64,
 }

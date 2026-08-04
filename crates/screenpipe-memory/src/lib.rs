@@ -7,7 +7,7 @@ mod runner;
 mod sample;
 mod text_hash;
 
-pub use cadence::{CadenceInput, CadencePolicy, CadenceRecord};
+pub use cadence::{CadenceInput, CadencePolicy, CadenceRecord, MAX_CADENCE_INTERVAL_SECONDS};
 pub use merge::{
     CaptureGap, CaptureGapSummary, MERGE_CONTRACT_VERSION, MergeConfig, MergeDecision,
     MergeDecisionKind, Merger, OpenEvent, SplitReason,
