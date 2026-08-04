@@ -6,6 +6,214 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::{EventId, EventSink, OpenEvent, SplitReason};
 
+const REQUIRED_COLUMNS_SQL: &str = r#"
+WITH expected(table_name, column_name, type_name, not_null, generated) AS (
+    VALUES
+        ('machines', 'id', 'bigint', true, ''),
+        ('machines', 'slug', 'text', true, ''),
+        ('machines', 'display_name', 'text', true, ''),
+        ('machines', 'next_event_seq', 'bigint', true, ''),
+        ('machines', 'created_at', 'timestamp with time zone', true, ''),
+        ('apps', 'id', 'bigint', true, ''),
+        ('apps', 'machine_id', 'bigint', true, ''),
+        ('apps', 'app_key', 'text', true, ''),
+        ('apps', 'app_title', 'text', true, ''),
+        ('apps', 'first_seen_at', 'timestamp with time zone', true, ''),
+        ('apps', 'last_seen_at', 'timestamp with time zone', true, ''),
+        ('events', 'id', 'text', true, ''),
+        ('events', 'machine_id', 'bigint', true, ''),
+        ('events', 'seq', 'bigint', true, ''),
+        ('events', 'kind', 'text', true, ''),
+        ('events', 'started_at', 'timestamp with time zone', true, ''),
+        ('events', 'ended_at', 'timestamp with time zone', true, ''),
+        ('events', 'ingested_at', 'timestamp with time zone', true, ''),
+        ('events', 'app_id', 'bigint', false, ''),
+        ('events', 'window_title', 'text', true, ''),
+        ('events', 'ocr_text', 'text', true, ''),
+        ('events', 'readable_text', 'text', true, ''),
+        ('events', 'caption', 'text', false, ''),
+        ('events', 'title', 'text', false, ''),
+        ('events', 'ocr_text_hash', 'text', true, ''),
+        ('events', 'sample_count', 'integer', true, ''),
+        ('events', 'merge_meta', 'jsonb', true, ''),
+        ('events', 'created_at', 'timestamp with time zone', true, ''),
+        ('events', 'updated_at', 'timestamp with time zone', true, ''),
+        ('events', 'search_tsv', 'tsvector', false, 's')
+),
+actual AS MATERIALIZED (
+    SELECT c.relname::text AS table_name,
+           a.attname::text AS column_name,
+           format_type(a.atttypid, a.atttypmod) AS type_name,
+           a.attnotnull AS not_null,
+           a.attgenerated::text AS generated
+    FROM pg_catalog.pg_attribute a
+    JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = current_schema()
+      AND c.relkind = 'r'
+      AND a.attnum > 0
+      AND NOT a.attisdropped
+)
+SELECT count(*) = (SELECT count(*) FROM expected)
+FROM expected e
+JOIN actual a USING (table_name, column_name)
+WHERE a.type_name = e.type_name
+  AND a.not_null = e.not_null
+  AND a.generated = e.generated
+"#;
+
+const REQUIRED_DEFAULTS_SQL: &str = r#"
+WITH expected(table_name, column_name, expression, exact) AS (
+    VALUES
+        ('machines', 'id', 'nextval', false),
+        ('machines', 'next_event_seq', '1', true),
+        ('machines', 'created_at', 'now()', true),
+        ('apps', 'id', 'nextval', false),
+        ('events', 'ingested_at', 'now()', true),
+        ('events', 'created_at', 'now()', true),
+        ('events', 'updated_at', 'now()', true)
+),
+actual AS MATERIALIZED (
+    SELECT c.relname::text AS table_name,
+           a.attname::text AS column_name,
+           pg_get_expr(d.adbin, d.adrelid) AS expression
+    FROM pg_catalog.pg_attrdef d
+    JOIN pg_catalog.pg_attribute a
+      ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+    JOIN pg_catalog.pg_class c ON c.oid = d.adrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = current_schema()
+)
+SELECT count(*) = (SELECT count(*) FROM expected)
+FROM expected e
+JOIN actual a USING (table_name, column_name)
+WHERE (e.exact AND a.expression = e.expression)
+   OR (NOT e.exact AND position(e.expression IN a.expression) > 0)
+"#;
+
+const REQUIRED_CONSTRAINTS_SQL: &str = r#"
+WITH expected(constraint_name, table_name, constraint_type, columns, referenced_table, definition_fragment) AS (
+    VALUES
+        ('machines_pkey', 'machines', 'p', ARRAY['id']::text[], '', 'PRIMARY KEY (id)'),
+        ('machines_slug_format', 'machines', 'c', ARRAY['slug']::text[], '', 'slug ~'),
+        ('machines_next_event_seq_positive', 'machines', 'c', ARRAY['next_event_seq']::text[], '', 'next_event_seq >= 1'),
+        ('apps_pkey', 'apps', 'p', ARRAY['id']::text[], '', 'PRIMARY KEY (id)'),
+        ('apps_machine_id_fkey', 'apps', 'f', ARRAY['machine_id']::text[], 'machines', 'FOREIGN KEY (machine_id) REFERENCES machines(id)'),
+        ('apps_machine_app_key_uidx', 'apps', 'u', ARRAY['machine_id', 'app_key']::text[], '', 'UNIQUE (machine_id, app_key)'),
+        ('events_pkey', 'events', 'p', ARRAY['id']::text[], '', 'PRIMARY KEY (id)'),
+        ('events_machine_id_fkey', 'events', 'f', ARRAY['machine_id']::text[], 'machines', 'FOREIGN KEY (machine_id) REFERENCES machines(id)'),
+        ('events_app_id_fkey', 'events', 'f', ARRAY['app_id']::text[], 'apps', 'FOREIGN KEY (app_id) REFERENCES apps(id)'),
+        ('events_machine_seq_uidx', 'events', 'u', ARRAY['machine_id', 'seq']::text[], '', 'UNIQUE (machine_id, seq)'),
+        ('events_seq_positive', 'events', 'c', ARRAY['seq']::text[], '', 'seq >= 1'),
+        ('events_sample_count_positive', 'events', 'c', ARRAY['sample_count']::text[], '', 'sample_count >= 1'),
+        ('events_window_order', 'events', 'c', ARRAY['started_at', 'ended_at']::text[], '', 'ended_at >= started_at'),
+        ('events_kind_nonempty', 'events', 'c', ARRAY['kind']::text[], '', 'kind <>')
+),
+actual AS MATERIALIZED (
+    SELECT con.conname::text AS constraint_name,
+           table_class.relname::text AS table_name,
+           con.contype::text AS constraint_type,
+           ARRAY(
+               SELECT attribute.attname::text
+               FROM unnest(con.conkey) AS key(attnum)
+               JOIN pg_catalog.pg_attribute attribute
+                 ON attribute.attrelid = con.conrelid
+                AND attribute.attnum = key.attnum
+               ORDER BY attribute.attname
+           ) AS columns,
+           coalesce(referenced_class.relname::text, '') AS referenced_table,
+           pg_get_constraintdef(con.oid) AS definition,
+           con.convalidated AS validated
+    FROM pg_catalog.pg_constraint con
+    JOIN pg_catalog.pg_class table_class ON table_class.oid = con.conrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = table_class.relnamespace
+    LEFT JOIN pg_catalog.pg_class referenced_class ON referenced_class.oid = con.confrelid
+    WHERE n.nspname = current_schema()
+)
+SELECT count(*) = (SELECT count(*) FROM expected)
+FROM expected e
+JOIN actual a USING (constraint_name, table_name, constraint_type, referenced_table)
+WHERE a.validated
+  AND a.columns @> e.columns
+  AND e.columns @> a.columns
+  AND position(e.definition_fragment IN a.definition) > 0
+"#;
+
+const REQUIRED_INDEXES_SQL: &str = r#"
+WITH expected(index_name, table_name, method_name, unique_index, columns, partial_index, definition_fragment, predicate_fragment) AS (
+    VALUES
+        ('machines_slug_uidx', 'machines', 'btree', true, ARRAY['slug']::text[], false, 'USING btree (slug)', ''),
+        ('apps_machine_id_idx', 'apps', 'btree', false, ARRAY['machine_id']::text[], false, 'USING btree (machine_id)', ''),
+        ('events_machine_started_idx', 'events', 'btree', false, ARRAY['machine_id', 'started_at']::text[], false, 'USING btree (machine_id, started_at DESC)', ''),
+        ('events_started_at_idx', 'events', 'btree', false, ARRAY['started_at']::text[], false, 'USING btree (started_at DESC)', ''),
+        ('events_ocr_text_hash_idx', 'events', 'btree', false, ARRAY['ocr_text_hash']::text[], true, 'USING btree (ocr_text_hash)', 'ocr_text_hash <>'),
+        ('events_app_id_idx', 'events', 'btree', false, ARRAY['app_id']::text[], true, 'USING btree (app_id)', 'app_id IS NOT NULL'),
+        ('events_search_tsv_gin', 'events', 'gin', false, ARRAY['search_tsv']::text[], false, 'USING gin (search_tsv)', '')
+),
+actual AS MATERIALIZED (
+    SELECT index_class.relname::text AS index_name,
+           table_class.relname::text AS table_name,
+           access_method.amname::text AS method_name,
+           index.indisunique AS unique_index,
+           ARRAY(
+               SELECT attribute.attname::text
+               FROM unnest(index.indkey) WITH ORDINALITY AS key(attnum, position)
+               JOIN pg_catalog.pg_attribute attribute
+                 ON attribute.attrelid = index.indrelid
+                AND attribute.attnum = key.attnum
+               WHERE key.position <= index.indnkeyatts
+               ORDER BY key.position
+           ) AS columns,
+           index.indpred IS NOT NULL AS partial_index,
+           pg_get_indexdef(index.indexrelid) AS definition,
+           coalesce(pg_get_expr(index.indpred, index.indrelid), '') AS predicate,
+           index.indisvalid AS valid,
+           index.indisready AS ready
+    FROM pg_catalog.pg_index index
+    JOIN pg_catalog.pg_class index_class ON index_class.oid = index.indexrelid
+    JOIN pg_catalog.pg_class table_class ON table_class.oid = index.indrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = table_class.relnamespace
+    JOIN pg_catalog.pg_am access_method ON access_method.oid = index_class.relam
+    WHERE n.nspname = current_schema()
+)
+SELECT count(*) = (SELECT count(*) FROM expected)
+FROM expected e
+JOIN actual a USING (index_name, table_name, method_name, unique_index, columns, partial_index)
+WHERE a.valid AND a.ready
+  AND position(e.definition_fragment IN a.definition) > 0
+  AND (e.predicate_fragment = '' OR position(e.predicate_fragment IN a.predicate) > 0)
+"#;
+
+const GENERATED_SEARCH_SQL: &str = r#"
+WITH target AS MATERIALIZED (
+    SELECT a.attgenerated,
+           pg_get_expr(d.adbin, d.adrelid) AS expression
+    FROM pg_catalog.pg_attribute a
+    JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+    WHERE n.nspname = current_schema()
+      AND c.relname = 'events'
+      AND a.attname = 'search_tsv'
+)
+SELECT coalesce(bool_and(
+           attgenerated = 's'
+       AND regexp_count(expression, 'setweight') = 5
+       AND regexp_count(expression, 'to_tsvector') = 5
+       AND position('english' IN expression) > 0
+       AND position('title' IN expression) > 0
+       AND position('caption' IN expression) > 0
+       AND position('readable_text' IN expression) > 0
+       AND position('ocr_text' IN expression) > 0
+       AND position('window_title' IN expression) > 0
+       AND position('''A''' IN expression) > 0
+       AND position('''B''' IN expression) > 0
+       AND position('''C''' IN expression) > 0
+       AND position('''D''' IN expression) > 0
+   ), false) AND count(*) = 1
+FROM target
+"#;
+
 pub struct PgEventWriter {
     pool: PgPool,
     machine_id: i64,
@@ -31,6 +239,7 @@ impl PgEventWriter {
             .connect(database_url)
             .await
             .context("connect PostgreSQL event writer")?;
+        validate_authoritative_schema(&pool).await?;
         let machine_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO machines (slug, display_name) VALUES ($1, $2) \
              ON CONFLICT (slug) DO UPDATE SET display_name = EXCLUDED.display_name \
@@ -49,6 +258,7 @@ impl PgEventWriter {
     }
 
     pub async fn preflight(&self) -> Result<PgPreflight> {
+        validate_authoritative_schema(&self.pool).await?;
         let (server_version, server_version_num) = sqlx::query_as::<_, (String, i32)>(
             "SELECT current_setting('server_version'), \
                     current_setting('server_version_num')::integer",
@@ -61,19 +271,7 @@ impl PgEventWriter {
             "PostgreSQL 18 or newer is required"
         );
 
-        let schema_present = sqlx::query_scalar::<_, bool>(
-            "SELECT count(DISTINCT table_name) = 3 \
-             FROM information_schema.tables \
-             WHERE table_schema = current_schema() \
-               AND table_name IN ('machines', 'apps', 'events')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .context("inspect authoritative PostgreSQL schema")?;
-        ensure!(
-            schema_present,
-            "authoritative PostgreSQL schema is incomplete"
-        );
+        let schema_present = true;
 
         let (machine_id, machine_slug, display_name, next_event_seq) =
             sqlx::query_as::<_, (i64, String, String, i64)>(
@@ -179,6 +377,26 @@ impl PgEventWriter {
         transaction.commit().await.context("commit event merge")?;
         Ok(())
     }
+}
+
+async fn validate_authoritative_schema(pool: &PgPool) -> Result<()> {
+    for (component, statement) in [
+        ("columns", REQUIRED_COLUMNS_SQL),
+        ("defaults", REQUIRED_DEFAULTS_SQL),
+        ("constraints", REQUIRED_CONSTRAINTS_SQL),
+        ("indexes", REQUIRED_INDEXES_SQL),
+        ("generated search", GENERATED_SEARCH_SQL),
+    ] {
+        let compatible = sqlx::query_scalar::<_, bool>(statement)
+            .fetch_one(pool)
+            .await
+            .with_context(|| format!("inspect authoritative PostgreSQL {component}"))?;
+        ensure!(
+            compatible,
+            "authoritative PostgreSQL schema is incompatible: {component}"
+        );
+    }
+    Ok(())
 }
 
 #[async_trait]

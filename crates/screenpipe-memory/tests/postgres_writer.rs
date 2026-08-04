@@ -76,6 +76,23 @@ CREATE INDEX events_search_tsv_gin ON events USING GIN (search_tsv);
 COMMIT;
 "#;
 
+const MALFORMED_WRITER_SCHEMA: &str = r#"
+BEGIN;
+CREATE TABLE machines (
+    id BIGSERIAL PRIMARY KEY,
+    slug TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    next_event_seq BIGINT NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT machines_slug_format CHECK (slug ~ '^[a-z][a-z0-9_]*$'),
+    CONSTRAINT machines_next_event_seq_positive CHECK (next_event_seq >= 1)
+);
+CREATE UNIQUE INDEX machines_slug_uidx ON machines (slug);
+CREATE TABLE apps (id BIGINT PRIMARY KEY);
+CREATE TABLE events (id TEXT PRIMARY KEY);
+COMMIT;
+"#;
+
 struct TestDatabase {
     admin_pool: PgPool,
     pool: PgPool,
@@ -85,6 +102,10 @@ struct TestDatabase {
 
 impl TestDatabase {
     async fn create() -> Result<Self> {
+        Self::create_with_schema(AUTHORITATIVE_SCHEMA).await
+    }
+
+    async fn create_with_schema(schema_sql: &str) -> Result<Self> {
         let database_url = env::var("SCREEN_MEMORY_DATABASE_URL")
             .context("SCREEN_MEMORY_DATABASE_URL must be injected for PostgreSQL tests")?;
         let schema = format!(
@@ -108,7 +129,7 @@ impl TestDatabase {
             .connect(&scoped_url)
             .await
             .context("connect disposable PostgreSQL schema")?;
-        sqlx::raw_sql(AUTHORITATIVE_SCHEMA)
+        sqlx::raw_sql(schema_sql)
             .execute(&pool)
             .await
             .context("apply authoritative schema in disposable search_path")?;
@@ -128,6 +149,17 @@ impl TestDatabase {
             .context("drop disposable PostgreSQL schema")?;
         self.admin_pool.close().await;
         Ok(())
+    }
+
+    async fn finish(self, test_result: Result<()>) -> Result<()> {
+        let cleanup_result = self.cleanup().await;
+        match (test_result, cleanup_result) {
+            (Ok(()), cleanup_result) => cleanup_result,
+            (Err(test_error), Ok(())) => Err(test_error),
+            (Err(test_error), Err(cleanup_error)) => Err(test_error.context(format!(
+                "disposable-schema cleanup also failed: {cleanup_error:#}"
+            ))),
+        }
     }
 }
 
@@ -297,15 +329,85 @@ async fn merge_refreshes_app_title_latest_text_and_domain_metadata() -> Result<(
 #[tokio::test]
 async fn preflight_verifies_postgres_schema_and_machine_identity() -> Result<()> {
     let db = TestDatabase::create().await?;
-    let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let report = writer.preflight().await?;
 
-    let report = writer.preflight().await?;
+        ensure!(report.server_version_num >= 180_000);
+        ensure!(report.schema_present);
+        ensure!(report.machine_slug == "icarus");
+        ensure!(report.display_name == "Icarus-Laptop");
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
 
-    ensure!(report.server_version_num >= 180_000);
-    ensure!(report.schema_present);
-    ensure!(report.machine_slug == "icarus");
-    ensure!(report.display_name == "Icarus-Laptop");
-    db.cleanup().await
+#[tokio::test]
+async fn preflight_rejects_named_tables_without_writer_columns() -> Result<()> {
+    let db = TestDatabase::create_with_schema(MALFORMED_WRITER_SCHEMA).await?;
+    let test_result = async {
+        let accepted = match PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await
+        {
+            Ok(writer) => writer.preflight().await.is_ok(),
+            Err(_) => false,
+        };
+        let machine_count: i64 = sqlx::query_scalar("SELECT count(*) FROM machines")
+            .fetch_one(&db.pool)
+            .await?;
+
+        ensure!(
+            !accepted && machine_count == 0,
+            "preflight accepted malformed tables or wrote machine identity before rejection"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn preflight_rejects_missing_writer_constraints_and_indexes() -> Result<()> {
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        sqlx::raw_sql(
+            "ALTER TABLE apps DROP CONSTRAINT apps_machine_app_key_uidx; \
+             DROP INDEX events_machine_started_idx;",
+        )
+        .execute(&db.pool)
+        .await?;
+
+        ensure!(
+            writer.preflight().await.is_err(),
+            "preflight accepted missing writer constraint and index"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn preflight_rejects_non_generated_search_column_and_missing_gin_index() -> Result<()> {
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        sqlx::raw_sql(
+            "ALTER TABLE events ALTER COLUMN search_tsv DROP EXPRESSION; \
+             DROP INDEX events_search_tsv_gin;",
+        )
+        .execute(&db.pool)
+        .await?;
+
+        ensure!(
+            writer.preflight().await.is_err(),
+            "preflight accepted a non-generated search column without its GIN index"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
 }
 
 #[tokio::test]
