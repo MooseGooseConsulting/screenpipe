@@ -214,6 +214,21 @@ fn event(
     }
 }
 
+async fn assert_preflight_rejects_single_mutation(mutation: &str, invariant: &str) -> Result<()> {
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        sqlx::raw_sql(mutation).execute(&db.pool).await?;
+        ensure!(
+            writer.preflight().await.is_err(),
+            "preflight accepted broken invariant: {invariant}"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
 #[tokio::test]
 async fn starts_allocate_icarus_ids_and_persist_authoritative_event_fields() -> Result<()> {
     let db = TestDatabase::create().await?;
@@ -367,47 +382,168 @@ async fn preflight_rejects_named_tables_without_writer_columns() -> Result<()> {
 }
 
 #[tokio::test]
-async fn preflight_rejects_missing_writer_constraints_and_indexes() -> Result<()> {
-    let db = TestDatabase::create().await?;
-    let test_result = async {
-        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
-        sqlx::raw_sql(
-            "ALTER TABLE apps DROP CONSTRAINT apps_machine_app_key_uidx; \
-             DROP INDEX events_machine_started_idx;",
-        )
-        .execute(&db.pool)
-        .await?;
-
-        ensure!(
-            writer.preflight().await.is_err(),
-            "preflight accepted missing writer constraint and index"
-        );
-        Ok(())
-    }
-    .await;
-    db.finish(test_result).await
+async fn preflight_rejects_missing_app_conflict_constraint() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        "ALTER TABLE apps DROP CONSTRAINT apps_machine_app_key_uidx",
+        "apps machine/app-key uniqueness",
+    )
+    .await
 }
 
 #[tokio::test]
-async fn preflight_rejects_non_generated_search_column_and_missing_gin_index() -> Result<()> {
-    let db = TestDatabase::create().await?;
-    let test_result = async {
-        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
-        sqlx::raw_sql(
-            "ALTER TABLE events ALTER COLUMN search_tsv DROP EXPRESSION; \
-             DROP INDEX events_search_tsv_gin;",
-        )
-        .execute(&db.pool)
-        .await?;
+async fn preflight_rejects_missing_event_machine_started_index() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        "DROP INDEX events_machine_started_idx",
+        "events machine/started index",
+    )
+    .await
+}
 
-        ensure!(
-            writer.preflight().await.is_err(),
-            "preflight accepted a non-generated search column without its GIN index"
-        );
-        Ok(())
+#[tokio::test]
+async fn preflight_rejects_non_generated_search_column() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        "ALTER TABLE events ALTER COLUMN search_tsv DROP EXPRESSION",
+        "generated search column",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn preflight_rejects_missing_search_gin_index() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        "DROP INDEX events_search_tsv_gin",
+        "events search GIN index",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn preflight_rejects_each_authoritative_default_drift() -> Result<()> {
+    for (invariant, mutation) in [
+        (
+            "machines id default",
+            "ALTER TABLE machines ALTER COLUMN id SET DEFAULT 1",
+        ),
+        (
+            "machines sequence default",
+            "ALTER TABLE machines ALTER COLUMN next_event_seq SET DEFAULT 2",
+        ),
+        (
+            "machines creation default",
+            "ALTER TABLE machines ALTER COLUMN created_at SET DEFAULT clock_timestamp()",
+        ),
+        (
+            "apps id default",
+            "ALTER TABLE apps ALTER COLUMN id SET DEFAULT 1",
+        ),
+        (
+            "apps title default",
+            "ALTER TABLE apps ALTER COLUMN app_title SET DEFAULT 'wrong'",
+        ),
+        (
+            "apps first-seen default",
+            "ALTER TABLE apps ALTER COLUMN first_seen_at SET DEFAULT clock_timestamp()",
+        ),
+        (
+            "apps last-seen default",
+            "ALTER TABLE apps ALTER COLUMN last_seen_at SET DEFAULT clock_timestamp()",
+        ),
+        (
+            "events kind default",
+            "ALTER TABLE events ALTER COLUMN kind SET DEFAULT 'other'",
+        ),
+        (
+            "events ingestion default",
+            "ALTER TABLE events ALTER COLUMN ingested_at SET DEFAULT clock_timestamp()",
+        ),
+        (
+            "events window-text default",
+            "ALTER TABLE events ALTER COLUMN window_title SET DEFAULT 'wrong'",
+        ),
+        (
+            "events OCR-text default",
+            "ALTER TABLE events ALTER COLUMN ocr_text SET DEFAULT 'wrong'",
+        ),
+        (
+            "events readable-text default",
+            "ALTER TABLE events ALTER COLUMN readable_text SET DEFAULT 'wrong'",
+        ),
+        (
+            "events caption default absence",
+            "ALTER TABLE events ALTER COLUMN caption SET DEFAULT 'wrong'",
+        ),
+        (
+            "events title default absence",
+            "ALTER TABLE events ALTER COLUMN title SET DEFAULT 'wrong'",
+        ),
+        (
+            "events hash default",
+            "ALTER TABLE events ALTER COLUMN ocr_text_hash SET DEFAULT 'wrong'",
+        ),
+        (
+            "events sample-count default",
+            "ALTER TABLE events ALTER COLUMN sample_count SET DEFAULT 2",
+        ),
+        (
+            "events merge-meta default",
+            "ALTER TABLE events ALTER COLUMN merge_meta SET DEFAULT '{\"wrong\":true}'::jsonb",
+        ),
+        (
+            "events creation default",
+            "ALTER TABLE events ALTER COLUMN created_at SET DEFAULT clock_timestamp()",
+        ),
+        (
+            "events update default",
+            "ALTER TABLE events ALTER COLUMN updated_at SET DEFAULT clock_timestamp()",
+        ),
+    ] {
+        assert_preflight_rejects_single_mutation(mutation, invariant)
+            .await
+            .with_context(|| format!("verify {invariant}"))?;
     }
-    .await;
-    db.finish(test_result).await
+    Ok(())
+}
+
+#[tokio::test]
+async fn preflight_rejects_weakened_check_constraint_definition() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        "ALTER TABLE events DROP CONSTRAINT events_sample_count_positive; \
+         ALTER TABLE events ADD CONSTRAINT events_sample_count_positive \
+         CHECK (sample_count >= 1 OR true)",
+        "exact sample-count check definition",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn preflight_rejects_weakened_partial_index_predicate() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        "DROP INDEX events_ocr_text_hash_idx; \
+         CREATE INDEX events_ocr_text_hash_idx ON events (ocr_text_hash) \
+         WHERE ocr_text_hash <> '' OR true",
+        "exact OCR hash partial-index predicate",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn preflight_rejects_swapped_readable_and_ocr_search_weights() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        r#"
+        DROP INDEX events_search_tsv_gin;
+        ALTER TABLE events DROP COLUMN search_tsv;
+        ALTER TABLE events ADD COLUMN search_tsv TSVECTOR GENERATED ALWAYS AS (
+            setweight(to_tsvector('english', coalesce(title, '')), 'A')
+            || setweight(to_tsvector('english', coalesce(caption, '')), 'A')
+            || setweight(to_tsvector('english', coalesce(readable_text, '')), 'C')
+            || setweight(to_tsvector('english', coalesce(ocr_text, '')), 'B')
+            || setweight(to_tsvector('english', coalesce(window_title, '')), 'D')
+        ) STORED;
+        CREATE INDEX events_search_tsv_gin ON events USING GIN (search_tsv);
+        "#,
+        "ordered generated FTS field weights",
+    )
+    .await
 }
 
 #[tokio::test]
