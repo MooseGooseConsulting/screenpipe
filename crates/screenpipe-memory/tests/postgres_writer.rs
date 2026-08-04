@@ -418,6 +418,24 @@ async fn preflight_rejects_missing_search_gin_index() -> Result<()> {
 }
 
 #[tokio::test]
+async fn preflight_rejects_writer_breaking_extra_required_event_column() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        "ALTER TABLE events ADD COLUMN blocker TEXT NOT NULL",
+        "exact authoritative event column set",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn preflight_rejects_space_text_default_literal() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        "ALTER TABLE events ALTER COLUMN window_title SET DEFAULT ' '",
+        "space text default differs from empty text default",
+    )
+    .await
+}
+
+#[tokio::test]
 async fn preflight_rejects_each_authoritative_default_drift() -> Result<()> {
     for (invariant, mutation) in [
         (
@@ -516,12 +534,33 @@ async fn preflight_rejects_weakened_check_constraint_definition() -> Result<()> 
 }
 
 #[tokio::test]
+async fn preflight_rejects_space_check_constraint_literal() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        "ALTER TABLE events DROP CONSTRAINT events_kind_nonempty; \
+         ALTER TABLE events ADD CONSTRAINT events_kind_nonempty CHECK (kind <> ' ')",
+        "space CHECK literal differs from empty CHECK literal",
+    )
+    .await
+}
+
+#[tokio::test]
 async fn preflight_rejects_weakened_partial_index_predicate() -> Result<()> {
     assert_preflight_rejects_single_mutation(
         "DROP INDEX events_ocr_text_hash_idx; \
          CREATE INDEX events_ocr_text_hash_idx ON events (ocr_text_hash) \
          WHERE ocr_text_hash <> '' OR true",
         "exact OCR hash partial-index predicate",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn preflight_rejects_space_partial_index_predicate_literal() -> Result<()> {
+    assert_preflight_rejects_single_mutation(
+        "DROP INDEX events_ocr_text_hash_idx; \
+         CREATE INDEX events_ocr_text_hash_idx ON events (ocr_text_hash) \
+         WHERE ocr_text_hash <> ' '",
+        "space partial-index literal differs from empty partial-index literal",
     )
     .await
 }

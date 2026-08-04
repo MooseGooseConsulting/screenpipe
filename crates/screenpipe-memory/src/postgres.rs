@@ -55,6 +55,7 @@ actual AS MATERIALIZED (
       AND NOT a.attisdropped
 )
 SELECT count(*) = (SELECT count(*) FROM expected)
+   AND (SELECT count(*) FROM actual) = (SELECT count(*) FROM expected)
 FROM expected e
 JOIN actual a USING (table_name, column_name)
 WHERE a.type_name = e.type_name
@@ -86,7 +87,7 @@ WITH expected(table_name, column_name, expression) AS (
 actual AS MATERIALIZED (
     SELECT c.relname::text AS table_name,
            a.attname::text AS column_name,
-           regexp_replace(pg_get_expr(d.adbin, d.adrelid), '\s+', '', 'g') AS expression
+           pg_get_expr(d.adbin, d.adrelid) AS expression
     FROM pg_catalog.pg_attrdef d
     JOIN pg_catalog.pg_attribute a
       ON a.attrelid = d.adrelid AND a.attnum = d.adnum
@@ -106,20 +107,20 @@ WHERE a.expression = e.expression
 const REQUIRED_CONSTRAINTS_SQL: &str = r#"
 WITH expected(constraint_name, table_name, constraint_type, columns, referenced_table, definition) AS (
     VALUES
-        ('machines_pkey', 'machines', 'p', ARRAY['id']::text[], '', 'PRIMARYKEY(id)'),
-        ('machines_slug_format', 'machines', 'c', ARRAY['slug']::text[], '', 'CHECK((slug~''^[a-z][a-z0-9_]*$''::text))'),
-        ('machines_next_event_seq_positive', 'machines', 'c', ARRAY['next_event_seq']::text[], '', 'CHECK((next_event_seq>=1))'),
-        ('apps_pkey', 'apps', 'p', ARRAY['id']::text[], '', 'PRIMARYKEY(id)'),
-        ('apps_machine_id_fkey', 'apps', 'f', ARRAY['machine_id']::text[], 'machines', 'FOREIGNKEY(machine_id)REFERENCESmachines(id)'),
-        ('apps_machine_app_key_uidx', 'apps', 'u', ARRAY['machine_id', 'app_key']::text[], '', 'UNIQUE(machine_id,app_key)'),
-        ('events_pkey', 'events', 'p', ARRAY['id']::text[], '', 'PRIMARYKEY(id)'),
-        ('events_machine_id_fkey', 'events', 'f', ARRAY['machine_id']::text[], 'machines', 'FOREIGNKEY(machine_id)REFERENCESmachines(id)'),
-        ('events_app_id_fkey', 'events', 'f', ARRAY['app_id']::text[], 'apps', 'FOREIGNKEY(app_id)REFERENCESapps(id)'),
-        ('events_machine_seq_uidx', 'events', 'u', ARRAY['machine_id', 'seq']::text[], '', 'UNIQUE(machine_id,seq)'),
-        ('events_seq_positive', 'events', 'c', ARRAY['seq']::text[], '', 'CHECK((seq>=1))'),
-        ('events_sample_count_positive', 'events', 'c', ARRAY['sample_count']::text[], '', 'CHECK((sample_count>=1))'),
-        ('events_window_order', 'events', 'c', ARRAY['started_at', 'ended_at']::text[], '', 'CHECK((ended_at>=started_at))'),
-        ('events_kind_nonempty', 'events', 'c', ARRAY['kind']::text[], '', 'CHECK((kind<>''''::text))')
+        ('machines_pkey', 'machines', 'p', ARRAY['id']::text[], '', 'PRIMARY KEY (id)'),
+        ('machines_slug_format', 'machines', 'c', ARRAY['slug']::text[], '', 'CHECK ((slug ~ ''^[a-z][a-z0-9_]*$''::text))'),
+        ('machines_next_event_seq_positive', 'machines', 'c', ARRAY['next_event_seq']::text[], '', 'CHECK ((next_event_seq >= 1))'),
+        ('apps_pkey', 'apps', 'p', ARRAY['id']::text[], '', 'PRIMARY KEY (id)'),
+        ('apps_machine_id_fkey', 'apps', 'f', ARRAY['machine_id']::text[], 'machines', 'FOREIGN KEY (machine_id) REFERENCES machines(id)'),
+        ('apps_machine_app_key_uidx', 'apps', 'u', ARRAY['machine_id', 'app_key']::text[], '', 'UNIQUE (machine_id, app_key)'),
+        ('events_pkey', 'events', 'p', ARRAY['id']::text[], '', 'PRIMARY KEY (id)'),
+        ('events_machine_id_fkey', 'events', 'f', ARRAY['machine_id']::text[], 'machines', 'FOREIGN KEY (machine_id) REFERENCES machines(id)'),
+        ('events_app_id_fkey', 'events', 'f', ARRAY['app_id']::text[], 'apps', 'FOREIGN KEY (app_id) REFERENCES apps(id)'),
+        ('events_machine_seq_uidx', 'events', 'u', ARRAY['machine_id', 'seq']::text[], '', 'UNIQUE (machine_id, seq)'),
+        ('events_seq_positive', 'events', 'c', ARRAY['seq']::text[], '', 'CHECK ((seq >= 1))'),
+        ('events_sample_count_positive', 'events', 'c', ARRAY['sample_count']::text[], '', 'CHECK ((sample_count >= 1))'),
+        ('events_window_order', 'events', 'c', ARRAY['started_at', 'ended_at']::text[], '', 'CHECK ((ended_at >= started_at))'),
+        ('events_kind_nonempty', 'events', 'c', ARRAY['kind']::text[], '', 'CHECK ((kind <> ''''::text))')
 ),
 actual AS MATERIALIZED (
     SELECT con.conname::text AS constraint_name,
@@ -134,7 +135,7 @@ actual AS MATERIALIZED (
                ORDER BY attribute.attname
            ) AS columns,
            coalesce(referenced_class.relname::text, '') AS referenced_table,
-           regexp_replace(pg_get_constraintdef(con.oid), '\s+', '', 'g') AS definition,
+           pg_get_constraintdef(con.oid) AS definition,
            con.convalidated AS validated
     FROM pg_catalog.pg_constraint con
     JOIN pg_catalog.pg_class table_class ON table_class.oid = con.conrelid
@@ -158,8 +159,8 @@ WITH expected(index_name, table_name, method_name, unique_index, columns, sort_o
         ('apps_machine_id_idx', 'apps', 'btree', false, ARRAY['machine_id']::text[], '0', ''),
         ('events_machine_started_idx', 'events', 'btree', false, ARRAY['machine_id', 'started_at']::text[], '0 3', ''),
         ('events_started_at_idx', 'events', 'btree', false, ARRAY['started_at']::text[], '3', ''),
-        ('events_ocr_text_hash_idx', 'events', 'btree', false, ARRAY['ocr_text_hash']::text[], '0', '(ocr_text_hash<>''''::text)'),
-        ('events_app_id_idx', 'events', 'btree', false, ARRAY['app_id']::text[], '0', '(app_idISNOTNULL)'),
+        ('events_ocr_text_hash_idx', 'events', 'btree', false, ARRAY['ocr_text_hash']::text[], '0', '(ocr_text_hash <> ''''::text)'),
+        ('events_app_id_idx', 'events', 'btree', false, ARRAY['app_id']::text[], '0', '(app_id IS NOT NULL)'),
         ('events_search_tsv_gin', 'events', 'gin', false, ARRAY['search_tsv']::text[], '0', '')
 ),
 actual AS MATERIALIZED (
@@ -177,7 +178,7 @@ actual AS MATERIALIZED (
                ORDER BY key.position
            ) AS columns,
            index.indoption::text AS sort_options,
-           regexp_replace(coalesce(pg_get_expr(index.indpred, index.indrelid), ''), '\s+', '', 'g') AS predicate,
+           coalesce(pg_get_expr(index.indpred, index.indrelid), '') AS predicate,
            index.indisvalid AS valid,
            index.indisready AS ready
     FROM pg_catalog.pg_index index
@@ -195,11 +196,11 @@ WHERE a.valid AND a.ready
 
 const GENERATED_SEARCH_SQL: &str = r#"
 WITH expected(expression) AS (
-    VALUES ($fts$((((setweight(to_tsvector('english'::regconfig,COALESCE(title,''::text)),'A'::"char")||setweight(to_tsvector('english'::regconfig,COALESCE(caption,''::text)),'A'::"char"))||setweight(to_tsvector('english'::regconfig,COALESCE(readable_text,''::text)),'B'::"char"))||setweight(to_tsvector('english'::regconfig,COALESCE(ocr_text,''::text)),'C'::"char"))||setweight(to_tsvector('english'::regconfig,COALESCE(window_title,''::text)),'D'::"char"))$fts$)
+    VALUES ($fts$((((setweight(to_tsvector('english'::regconfig, COALESCE(title, ''::text)), 'A'::"char") || setweight(to_tsvector('english'::regconfig, COALESCE(caption, ''::text)), 'A'::"char")) || setweight(to_tsvector('english'::regconfig, COALESCE(readable_text, ''::text)), 'B'::"char")) || setweight(to_tsvector('english'::regconfig, COALESCE(ocr_text, ''::text)), 'C'::"char")) || setweight(to_tsvector('english'::regconfig, COALESCE(window_title, ''::text)), 'D'::"char"))$fts$)
 ),
 target AS MATERIALIZED (
     SELECT a.attgenerated,
-           regexp_replace(pg_get_expr(d.adbin, d.adrelid), '\s+', '', 'g') AS expression
+           pg_get_expr(d.adbin, d.adrelid) AS expression
     FROM pg_catalog.pg_attribute a
     JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
