@@ -160,16 +160,11 @@ async fn run_doctor(database_url: &str, machine_slug: &str, display_name: &str) 
         report.machine_slug == machine_slug && report.display_name == display_name,
         "PostgreSQL machine identity does not match requested identity"
     );
+    // `preflight` returns Err unless the authoritative schema validated, so
+    // reaching this line is itself the evidence that the schema is present.
     println!(
-        "doctor postgres=available version={} schema={} machine_slug={} display_name={}",
-        report.server_version,
-        if report.schema_present {
-            "present"
-        } else {
-            "missing"
-        },
-        report.machine_slug,
-        report.display_name
+        "doctor postgres=available version={} schema=present machine_slug={} display_name={}",
+        report.server_version, report.machine_slug, report.display_name
     );
     Ok(())
 }

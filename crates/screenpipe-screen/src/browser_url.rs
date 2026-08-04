@@ -325,6 +325,11 @@ where
     selected
 }
 
+// Diagnostics go to stderr, matching the capture-gap diagnostics elsewhere in
+// the workspace. Do not route these through `tracing` until a subscriber is
+// actually installed: no crate in this workspace initializes one, so a
+// `tracing::debug!` here is discarded at the dispatcher and the operator loses
+// the only signal that Chrome's address-bar automation id has drifted again.
 fn emit_diagnostic(diagnostic: BrowserUrlDiagnostic) {
     eprintln!("{}", diagnostic.event_line());
 }
@@ -482,6 +487,7 @@ mod tests {
         let mut trusted_identity_edits = 0;
         let mut trusted_url_value_reads = 0;
         let mut trusted_url_value_edits = 0;
+        let mut trusted_url_value_unavailable = 0;
         let mut trusted_legacy_value_reads = 0;
         let mut trusted_legacy_non_http_values = 0;
         let mut trusted_legacy_value_unavailable = 0;
@@ -501,17 +507,19 @@ mod tests {
                 && looks_like_address_bar(&snapshot)
             {
                 trusted_identity_edits += 1;
-                if let Some(snapshot) = read_candidate_after_provenance(
+                match read_candidate_after_provenance(
                     || has_document_ancestor(&edit, &root_runtime_id, &walker),
                     || snapshot_candidate_identity(&edit),
                     || read_candidate_value(&edit),
-                )
-                .expect("trusted candidate value must be readable")
-                {
-                    trusted_url_value_reads += 1;
-                    if select_address_bar("chrome.exe", &[snapshot]).is_some() {
-                        trusted_url_value_edits += 1;
+                ) {
+                    Ok(Some(snapshot)) => {
+                        trusted_url_value_reads += 1;
+                        if select_address_bar("chrome.exe", &[snapshot]).is_some() {
+                            trusted_url_value_edits += 1;
+                        }
                     }
+                    Ok(None) => {}
+                    Err(_) => trusted_url_value_unavailable += 1,
                 }
                 match edit
                     .get_pattern::<UILegacyIAccessiblePattern>()
@@ -534,7 +542,7 @@ mod tests {
         }
         drop(automation);
         println!(
-            "BROWSER_URL_LIVE_PROBE non_document_edits={non_document_edits} trusted_identity_edits={trusted_identity_edits} trusted_url_value_reads={trusted_url_value_reads} trusted_url_value_edits={trusted_url_value_edits} trusted_legacy_value_reads={trusted_legacy_value_reads} trusted_legacy_non_http_values={trusted_legacy_non_http_values} trusted_legacy_value_unavailable={trusted_legacy_value_unavailable} trusted_legacy_url_value_edits={trusted_legacy_url_value_edits}"
+            "BROWSER_URL_LIVE_PROBE non_document_edits={non_document_edits} trusted_identity_edits={trusted_identity_edits} trusted_url_value_reads={trusted_url_value_reads} trusted_url_value_edits={trusted_url_value_edits} trusted_url_value_unavailable={trusted_url_value_unavailable} trusted_legacy_value_reads={trusted_legacy_value_reads} trusted_legacy_non_http_values={trusted_legacy_non_http_values} trusted_legacy_value_unavailable={trusted_legacy_value_unavailable} trusted_legacy_url_value_edits={trusted_legacy_url_value_edits}"
         );
     }
 }

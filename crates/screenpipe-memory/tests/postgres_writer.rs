@@ -349,7 +349,6 @@ async fn preflight_verifies_postgres_schema_and_machine_identity() -> Result<()>
         let report = writer.preflight().await?;
 
         ensure!(report.server_version_num >= 180_000);
-        ensure!(report.schema_present);
         ensure!(report.machine_slug == "icarus");
         ensure!(report.display_name == "Icarus-Laptop");
         Ok(())

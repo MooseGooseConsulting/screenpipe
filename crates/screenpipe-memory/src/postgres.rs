@@ -51,6 +51,7 @@ actual AS MATERIALIZED (
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = current_schema()
       AND c.relkind = 'r'
+      AND c.relname IN ('machines', 'apps', 'events')
       AND a.attnum > 0
       AND NOT a.attisdropped
 )
@@ -221,11 +222,14 @@ pub struct PgEventWriter {
     machine_slug: String,
 }
 
+/// Returned only when `preflight` succeeded, which means
+/// `validate_authoritative_schema` already passed. There is deliberately no
+/// `schema_present` field: it was a hardcoded `true`, so it reported schema
+/// validity as a fact without ever checking anything.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PgPreflight {
     pub server_version: String,
     pub server_version_num: i32,
-    pub schema_present: bool,
     pub machine_slug: String,
     pub display_name: String,
 }
@@ -272,8 +276,6 @@ impl PgEventWriter {
             "PostgreSQL 18 or newer is required"
         );
 
-        let schema_present = true;
-
         let (machine_id, machine_slug, display_name, next_event_seq) =
             sqlx::query_as::<_, (i64, String, String, i64)>(
                 "SELECT id, slug, display_name, next_event_seq \
@@ -295,7 +297,6 @@ impl PgEventWriter {
         Ok(PgPreflight {
             server_version,
             server_version_num,
-            schema_present,
             machine_slug,
             display_name,
         })

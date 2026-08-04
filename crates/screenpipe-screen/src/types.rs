@@ -86,9 +86,17 @@ impl TransientFrame {
         self.height
     }
 
+    /// Digests only the colour bytes of each pixel, deliberately skipping
+    /// alpha. `to_opaque_rgba_image` forces alpha to 255 before OCR, so alpha
+    /// can never change what OCR reads - but DWM composites rounded corners,
+    /// shadows, and acrylic/mica backdrops with varying alpha. Hashing alpha
+    /// therefore reported a visual change on every tick for a static screen,
+    /// which pinned the cadence at 2s and defeated the unchanged-frame OCR
+    /// cache. Fingerprints are memory-only and never persisted, so changing
+    /// the digest domain has no migration cost.
     pub fn fingerprint(&self) -> FrameFingerprint {
         let mut digest = Sha256::new();
-        digest.update(b"screenpipe-frame-fingerprint-v1\0");
+        digest.update(b"screenpipe-frame-fingerprint-v2\0");
         digest.update(self.width.to_le_bytes());
         digest.update(self.height.to_le_bytes());
 
@@ -97,7 +105,9 @@ impl TransientFrame {
         let stride =
             usize::try_from(self.stride).expect("validated transient frame stride must fit usize");
         for row in self.pixels.chunks_exact(stride) {
-            digest.update(&row[..packed_stride]);
+            for pixel in row[..packed_stride].chunks_exact(4) {
+                digest.update(&pixel[..3]);
+            }
         }
 
         FrameFingerprint(digest.finalize().into())
@@ -146,10 +156,26 @@ mod tests {
 
     #[test]
     fn fingerprint_changes_when_a_visual_pixel_changes() {
+        // Byte 6 is the red channel of the second BGRA pixel. Do not assert on
+        // byte 7 here - that is the alpha byte, which the fingerprint ignores
+        // on purpose.
         let before = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
-        let after = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 7, 9]).unwrap();
+        let after = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 9, 8]).unwrap();
 
         assert_ne!(before.fingerprint(), after.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_ignores_alpha_because_ocr_never_sees_it() {
+        // DWM composites rounded corners, shadows, and acrylic backdrops with
+        // varying alpha. OCR reads the frame through `to_opaque_rgba_image`,
+        // which forces alpha to 255, so an alpha-only delta is not a visual
+        // change and must not force a re-OCR or reset the cadence.
+        let opaque = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 255, 5, 6, 7, 255]).unwrap();
+        let translucent =
+            TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 7, 5, 6, 7, 64]).unwrap();
+
+        assert_eq!(opaque.fingerprint(), translucent.fingerprint());
     }
 
     #[test]
