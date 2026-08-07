@@ -158,5 +158,21 @@
     "replace": "            LoopStep::Retry(failure_backoff(0))",
     "package": "screenpipe-cli",
     "claim": "a locked desktop is polled at the slowest backoff, not the fastest"
+  },
+  {
+    "id": "lock-transition-blamed-on-capture",
+    "file": "crates/screenpipe-cli/src/windows_source.rs",
+    "find": "                let gap = if self.ops.interactive_desktop_available() {\n                    CaptureGap::CaptureUnavailable\n                } else {\n                    CaptureGap::DesktopLocked\n                };",
+    "replace": "                let gap = CaptureGap::CaptureUnavailable;",
+    "package": "screenpipe-cli",
+    "claim": "a capture failure during a lock transition is attributed to the lock, not the capture device"
+  },
+  {
+    "id": "every-capture-failure-excused-as-a-lock",
+    "file": "crates/screenpipe-cli/src/windows_source.rs",
+    "find": "                    CaptureGap::CaptureUnavailable\n                } else {\n                    CaptureGap::DesktopLocked\n                };",
+    "replace": "                    CaptureGap::DesktopLocked\n                } else {\n                    CaptureGap::DesktopLocked\n                };",
+    "package": "screenpipe-cli",
+    "claim": "a genuine capture fault on a live desktop is not excused as a lock"
   }
 ]

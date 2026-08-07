@@ -144,7 +144,26 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
             Ok(capture) => capture,
             Err(_) => {
                 self.next_sleep = Some(RETRY_CADENCE);
-                return Ok(SampleRead::Gap(CaptureGap::CaptureUnavailable));
+                // Re-probe before blaming capture.
+                //
+                // The pre-capture probe is not enough on its own: locking a
+                // workstation stops capture working BEFORE `OpenInputDesktop`
+                // starts refusing, so the probe still answers "available" for
+                // the first few samples of a lock. Measured on a real lock,
+                // that window was six samples - all recorded as
+                // `capture_unavailable`, which is the code for a broken
+                // capture device, and all of them counted toward the ceiling
+                // that exists to catch one.
+                //
+                // Asking again after the failure closes the window: if the
+                // desktop has gone by the time capture failed, the lock is the
+                // explanation, not a fault.
+                let gap = if self.ops.interactive_desktop_available() {
+                    CaptureGap::CaptureUnavailable
+                } else {
+                    CaptureGap::DesktopLocked
+                };
+                return Ok(SampleRead::Gap(gap));
             }
         };
         let (captured_at, monotonic_now) = self.ops.now().await;
@@ -301,6 +320,7 @@ mod tests {
         input_idle: VecDeque<Result<Duration>>,
         browser_urls: VecDeque<Result<Option<String>>>,
         interactive_desktop: bool,
+        desktop_answers: VecDeque<bool>,
     }
 
     impl TestOps {
@@ -320,7 +340,14 @@ mod tests {
                 input_idle: input_idle.into_iter().collect(),
                 browser_urls: browser_urls.into_iter().collect(),
                 interactive_desktop: true,
+                desktop_answers: VecDeque::new(),
             }
+        }
+
+        /// Answer the desktop probe from a script, in order.
+        fn with_desktop_answers(mut self, answers: impl IntoIterator<Item = bool>) -> Self {
+            self.desktop_answers = answers.into_iter().collect();
+            self
         }
 
         fn with_locked_desktop(mut self) -> Self {
@@ -340,9 +367,15 @@ mod tests {
         fn interactive_desktop_available(&mut self) -> bool {
             // Every pre-existing test predates the desktop probe and asserts
             // behaviour that only happens on an unlocked desktop. Defaulting to
-            // `true` keeps them meaning what they meant; the locked path has
-            // its own fixture below.
-            self.interactive_desktop
+            // `true` keeps them meaning what they meant; the locked fixtures
+            // below override it.
+            //
+            // A queue rather than a flag, because the defect this models is
+            // precisely that the answer CHANGES between the pre-capture probe
+            // and the post-failure one.
+            self.desktop_answers
+                .pop_front()
+                .unwrap_or(self.interactive_desktop)
         }
 
         async fn sleep(&mut self, duration: Duration) {
@@ -398,6 +431,22 @@ mod tests {
                 self.base_utc + chrono::Duration::seconds(seconds as i64),
                 self.base_instant + Duration::from_secs(seconds),
             );
+        }
+
+        /// A desktop that still probes as available, then fails to capture,
+        /// then probes as gone - the real transition when a screen locks.
+        fn locking_source(&self) -> Source<TestOps> {
+            Source::new(
+                TestOps::new(
+                    Arc::clone(&self.clock),
+                    Arc::clone(&self.calls),
+                    [Err(anyhow::anyhow!("foreground window is gone"))],
+                    [],
+                    [],
+                    [],
+                )
+                .with_desktop_answers([true, false]),
+            )
         }
 
         fn locked_source(&self) -> Source<TestOps> {
@@ -968,6 +1017,47 @@ mod tests {
             read,
             SampleRead::Gap(CaptureGap::CaptureUnavailable),
             "a lock must not be reported as a capture failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lock_caught_mid_transition_is_not_blamed_on_capture() {
+        // Locking a workstation stops capture working BEFORE OpenInputDesktop
+        // starts refusing, so the pre-capture probe answers "available" for the
+        // first few samples of a lock. Measured on a real lock on this machine,
+        // that window was six samples - every one recorded as
+        // `capture_unavailable`, the code for a broken capture device, and
+        // every one counted toward the ceiling that exists to catch one.
+        //
+        // The fixture is that exact sequence: probe says available, capture
+        // fails, probe now says gone.
+        let harness = Harness::new();
+        let mut source = harness.locking_source();
+
+        let read = source.next_sample().await.unwrap();
+
+        assert_eq!(
+            read,
+            SampleRead::Gap(CaptureGap::DesktopLocked),
+            "a capture failure during a lock transition must be attributed to              the lock, not to the capture device"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_capture_failure_on_a_live_desktop_is_still_a_capture_failure() {
+        // The negative control for the test above. If the re-probe answered
+        // "gone" unconditionally, every capture fault would be relabelled as a
+        // lock and the ceiling that catches a dead capture device would never
+        // fire again.
+        let harness = Harness::new();
+        let mut source = harness.source([Err(anyhow::anyhow!("WGC timed out"))], [], [], []);
+
+        let read = source.next_sample().await.unwrap();
+
+        assert_eq!(
+            read,
+            SampleRead::Gap(CaptureGap::CaptureUnavailable),
+            "a genuine capture fault on a live desktop must not be excused as a lock"
         );
     }
 }
