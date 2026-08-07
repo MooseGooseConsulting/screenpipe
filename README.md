@@ -14,8 +14,9 @@ gates before the runtime may be considered operational.
 
 The workspace contains only:
 
-- `screenpipe-screen`: foreground Windows capture, transient frames, OCR, and
-  metadata-only Chrome/Edge address-bar access;
+- `screenpipe-screen`: foreground Windows capture, transient frames, OCR,
+  metadata-only Chrome/Edge address-bar access, and the clipboard text
+  boundary;
 - `screenpipe-memory`: deterministic OCR identity, merge decisions, cadence,
   and capture-to-sink orchestration;
 - `screenpipe-cli`: the minimal `run`, `doctor`, and `service` command surface.
@@ -51,6 +52,53 @@ database:
 $env:SCREEN_MEMORY_TEST_DATABASE_URL = 'postgresql://<user>:<password>@127.0.0.1:5432/screen_memory_test'
 cargo test --workspace
 ```
+
+## Clipboard channel
+
+Text the operator copies is recorded as `events` of kind `clipboard`, in the
+same table, under the same `{slug}_{seq}` identifiers, with the same
+`merge_meta` document as screen events. **It is ON by default**; turn it off
+with:
+
+```powershell
+doppler run -p homelab -c dev_personal -- .\target\release\screenpipe.exe run --no-clipboard
+```
+
+What it records, and what it refuses:
+
+- **Text only.** `CF_UNICODETEXT` or nothing. An image, a file list, or a
+  private application format is ignored entirely - no event, and no capture
+  gap either, because nothing was lost.
+- **Never a refused clipboard.** If the owning application sets
+  `ExcludeClipboardContentFromMonitorProcessing`, or sets
+  `CanIncludeInClipboardHistory` or `CanUploadToCloudClipboard` to `0` - which
+  is what password managers do - the text is never read at all, and the run
+  log records only `event=clipboard_excluded reason=owner_refused`. A
+  permission format that is present but unreadable is treated as a refusal.
+- **The first poll never reads.** Whatever is on the clipboard at startup was
+  copied before the channel existed, so capturing it would re-record the same
+  stale text on every service restart. The first poll learns where the
+  clipboard is; only changes observed while running are captured.
+- **Detection is a sequence-number poll** on a two-second tick
+  (`GetClipboardSequenceNumber`), not `AddClipboardFormatListener`, which
+  would need a hidden window and a message pump this process does not have.
+- **A locked workstation captures nothing.** Windows refuses `OpenClipboard`
+  to the default desktop while the session is locked, though the sequence
+  number stays readable - so a locked machine polls a counter that never
+  moves, and a copy made just before the lock is captured after it, not lost.
+
+Merge discipline, deterministic and per kind: consecutive captures of the same
+normalized text merge into the open event and raise its `sample_count`, so
+re-copying the same thing does not write a second row saying the same thing.
+Different text closes the event and opens a new one
+(`start_reason = text_hash_change`), and the shared idle-gap threshold closes
+it too. Scroll overlap is deliberately not consulted - two clipboard entries
+that share most of their words are two copies of two different things, not one
+thing being scrolled past.
+
+A clipboard event has no application: `events.app_id` is NULL and no `apps`
+row is created, because the foreground window at poll time is not reliably
+where the copy came from.
 
 ## Runtime and secrets contract
 
@@ -91,5 +139,8 @@ PostgreSQL 18+, the authoritative schema, OCR, and controlled foreground WGC.
 Frames exist only as transient in-memory BGRA buffers and are zeroed on drop.
 They are never written to disk or PostgreSQL. OCR supplies content text. UI
 Automation is restricted to app/window metadata and the Chrome or Edge address
-bar. Logs and debug output do not include OCR bodies, readable text, URL query
-strings, secret values, frame bytes, or frame fingerprints.
+bar. Clipboard text is read only from generations whose owner did not refuse
+monitoring, and reaches only the `events` row, exactly as OCR text does. Logs
+and debug output do not include OCR bodies, readable text, clipboard text or
+its length or hash, URL query strings, secret values, frame bytes, or frame
+fingerprints.
