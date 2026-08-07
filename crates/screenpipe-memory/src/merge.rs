@@ -15,7 +15,52 @@ use crate::text_hash::{TextIdentity, jaccard_overlap, normalize_text};
 /// below 4 could hold a row spanning the whole run, so an analysis that reads
 /// `ended_at - started_at` as "how long that activity lasted" is only true from
 /// 4 onward.
-pub const MERGE_CONTRACT_VERSION: u32 = 4;
+///
+/// Bumped to 5 when the contract stopped describing one kind of event. Below 5
+/// every row is a screen row and the content test that produced its boundary is
+/// implied by the version alone; from 5 on, `events.kind` selects the test -
+/// see [`EventKind::merge_rule`] - so the version no longer determines how a
+/// row was segmented on its own.
+pub const MERGE_CONTRACT_VERSION: u32 = 5;
+
+/// What a durable event is a record of.
+///
+/// The kind selects the CONTENT test that decides whether the next sample
+/// extends the open event, and only that. The idle-gap boundary and the
+/// ceilings below are shared, so both kinds land in the same table, under the
+/// same `{slug}_{seq}` identifiers, with the same `merge_meta` shape - there is
+/// one merge discipline here, not two.
+///
+/// It rides on the config and the event rather than on the writer because it
+/// describes what was observed, not where it is stored. The writer binds
+/// `events.kind` straight from the event, so a kind can only be decided in one
+/// place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    /// The foreground screen, read by OCR. Content continues when this event
+    /// has already seen the screen, or when the five-gram overlap with the
+    /// previous sample is high enough to be a scroll through the same material.
+    Screen,
+    /// Text the operator copied. Content continues ONLY when the normalized
+    /// text is byte-identical after normalization - that is, a re-copy of the
+    /// same thing.
+    ///
+    /// Scroll overlap is deliberately not consulted: two clipboard entries that
+    /// share most of their words are two separate copies of two different
+    /// things, not one thing being scrolled past. The window title is not
+    /// consulted either, because a clipboard capture has no window of its own.
+    Clipboard,
+}
+
+impl EventKind {
+    /// Stable code. Persisted verbatim as `events.kind`.
+    pub const fn as_code(self) -> &'static str {
+        match self {
+            Self::Screen => "screen",
+            Self::Clipboard => "clipboard",
+        }
+    }
+}
 
 /// Longest span one event may cover before it is forced to split.
 ///
@@ -246,6 +291,9 @@ pub enum MergeDecision {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MergeConfig {
+    /// Which content test decides a boundary, and what the events this merger
+    /// opens will be recorded as.
+    pub kind: EventKind,
     /// Must be strictly greater than the maximum cadence interval. The split
     /// test compares the delta between *consecutive samples*, so if this
     /// equals the slowest cadence the sleep alone reaches the threshold and
@@ -253,11 +301,14 @@ pub struct MergeConfig {
     /// fragmenting a quiet window into one-sample events, which is the exact
     /// opposite of what an idle gap is for. See `MAX_CADENCE_INTERVAL`.
     pub idle_gap: Duration,
+    /// Five-gram Jaccard overlap at which a changed screen still counts as the
+    /// same material. Consulted only by [`EventKind::Screen`].
     pub scroll_overlap: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenEvent {
+    pub kind: EventKind,
     pub merge_contract_version: u32,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
@@ -300,47 +351,9 @@ impl Merger {
             );
         };
 
-        // CONTENT DECIDES. The window title is a hint, not the authority.
-        //
-        // This used to test the title second, before content was consulted at
-        // all, and a title change short-circuited straight to a split. A window
-        // title is a presentation surface: apps put spinners, unsaved-change
-        // markers, notification counts and download percentages in it. Every
-        // one of those became a semantic event boundary.
-        //
-        // Measured on 784 real events from this machine: 690 of them - 88% -
-        // started because of a title change, averaging 3.2 samples each. The
-        // control was in the same table. Events that started from an app change
-        // - an unambiguous, real change of activity - averaged 24.1 samples,
-        // 7.5x longer. Nothing about the underlying activity was that
-        // fragmented; the segmentation was. Content only ever got a vote 59
-        // times, because the title check ran first and almost always fired.
-        //
-        // So the order is inverted. If the text is continuous - the same screen
-        // seen before, or enough five-gram overlap to be a scroll - this is the
-        // same activity and the title is decoration. A title change still
-        // splits, but only when the content changed too, and it keeps its own
-        // reason code because "the title changed" is the more informative
-        // description of what happened.
-        let reason = if sample.app_key != open.latest.app_key {
-            Some(SplitReason::AppChange)
-        } else if sample.captured_at - open.ended_at > self.config.idle_gap {
-            Some(SplitReason::IdleGap)
-        } else {
-            let previous_identity = TextIdentity::from_ocr(&open.latest.ocr_text);
-            let content_continues = open.hash_counts.contains(&identity.exact_hash)
-                || jaccard_overlap(&previous_identity.five_grams, &identity.five_grams)
-                    >= self.config.scroll_overlap;
-
-            if content_continues {
-                None
-            } else if normalize_text(&sample.window_title)
-                != normalize_text(&open.latest.window_title)
-            {
-                Some(SplitReason::WindowTitleChange)
-            } else {
-                Some(SplitReason::TextHashChange)
-            }
+        let reason = match self.config.kind {
+            EventKind::Screen => self.screen_split_reason(open, &sample, &identity),
+            EventKind::Clipboard => self.clipboard_split_reason(open, &sample, &identity),
         };
 
         // The ceilings are consulted last, so an observed reason always wins
@@ -376,6 +389,93 @@ impl Merger {
         }
     }
 
+    /// The boundary test for [`EventKind::Screen`].
+    ///
+    /// CONTENT DECIDES. The window title is a hint, not the authority.
+    ///
+    /// This used to test the title second, before content was consulted at all,
+    /// and a title change short-circuited straight to a split. A window title
+    /// is a presentation surface: apps put spinners, unsaved-change markers,
+    /// notification counts and download percentages in it. Every one of those
+    /// became a semantic event boundary.
+    ///
+    /// Measured on 784 real events from this machine: 690 of them - 88% -
+    /// started because of a title change, averaging 3.2 samples each. The
+    /// control was in the same table. Events that started from an app change -
+    /// an unambiguous, real change of activity - averaged 24.1 samples, 7.5x
+    /// longer. Nothing about the underlying activity was that fragmented; the
+    /// segmentation was. Content only ever got a vote 59 times, because the
+    /// title check ran first and almost always fired.
+    ///
+    /// So the order is inverted. If the text is continuous - the same screen
+    /// seen before, or enough five-gram overlap to be a scroll - this is the
+    /// same activity and the title is decoration. A title change still splits,
+    /// but only when the content changed too, and it keeps its own reason code
+    /// because "the title changed" is the more informative description of what
+    /// happened.
+    fn screen_split_reason(
+        &self,
+        open: &OpenEvent,
+        sample: &ObservationSample,
+        identity: &TextIdentity,
+    ) -> Option<SplitReason> {
+        if sample.app_key != open.latest.app_key {
+            Some(SplitReason::AppChange)
+        } else if sample.captured_at - open.ended_at > self.config.idle_gap {
+            Some(SplitReason::IdleGap)
+        } else {
+            let previous_identity = TextIdentity::from_ocr(&open.latest.ocr_text);
+            let content_continues = open.hash_counts.contains(&identity.exact_hash)
+                || jaccard_overlap(&previous_identity.five_grams, &identity.five_grams)
+                    >= self.config.scroll_overlap;
+
+            if content_continues {
+                None
+            } else if normalize_text(&sample.window_title)
+                != normalize_text(&open.latest.window_title)
+            {
+                Some(SplitReason::WindowTitleChange)
+            } else {
+                Some(SplitReason::TextHashChange)
+            }
+        }
+    }
+
+    /// The boundary test for [`EventKind::Clipboard`].
+    ///
+    /// Two closers, and deliberately no others: the text changed, or the
+    /// operator went quiet for longer than the idle gap. A capture whose
+    /// normalized text hash equals the open event's merges instead, which is
+    /// what makes re-copying the same thing - hitting Ctrl-C twice, or a
+    /// re-copy from a different app - one event with a higher `sample_count`
+    /// rather than a second row saying the same thing.
+    ///
+    /// The comparison is against the OPEN EVENT'S OWN hash and not against its
+    /// ledger. `hash_counts` answers "did this event ever see this screen",
+    /// which is the right question for a screen scrolling back to something it
+    /// showed before; a clipboard event only ever holds one distinct text, so
+    /// consulting the ledger would answer the same question in a way that
+    /// stops being true the moment the rule changes.
+    ///
+    /// The app key is not consulted, because a clipboard capture is not
+    /// attributed to an app at all: the foreground window at poll time is not
+    /// reliably the window the copy came from, and asserting otherwise would
+    /// put a guess in a durable row.
+    fn clipboard_split_reason(
+        &self,
+        open: &OpenEvent,
+        sample: &ObservationSample,
+        identity: &TextIdentity,
+    ) -> Option<SplitReason> {
+        if sample.captured_at - open.ended_at > self.config.idle_gap {
+            Some(SplitReason::IdleGap)
+        } else if identity.exact_hash != open.latest_exact_ocr_hash {
+            Some(SplitReason::TextHashChange)
+        } else {
+            None
+        }
+    }
+
     fn start(
         &mut self,
         sample: ObservationSample,
@@ -386,6 +486,7 @@ impl Merger {
     ) -> MergeDecision {
         let hash_counts = HashLedger::with_first(merge_hash.clone());
         let event = OpenEvent {
+            kind: self.config.kind,
             merge_contract_version: MERGE_CONTRACT_VERSION,
             started_at: sample.captured_at,
             ended_at: sample.captured_at,

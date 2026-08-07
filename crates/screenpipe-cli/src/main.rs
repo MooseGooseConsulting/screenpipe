@@ -4,8 +4,8 @@ use anyhow::{Context, Result, ensure};
 use chrono::Duration;
 use clap::{Parser, Subcommand};
 use screenpipe_memory::{
-    EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventWriter, RunOutcome, Runner,
-    SampleSource,
+    EventKind, EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventWriter, RunOutcome,
+    Runner, SampleSource,
 };
 use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
@@ -227,6 +227,7 @@ const IDLE_GAP_SECONDS: i64 = MAX_CADENCE_INTERVAL_SECONDS * 2;
 
 fn default_runner() -> Runner {
     Runner::new(MergeConfig {
+        kind: EventKind::Screen,
         idle_gap: Duration::seconds(IDLE_GAP_SECONDS),
         scroll_overlap: 0.35,
     })
@@ -570,8 +571,8 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use clap::Parser;
     use screenpipe_memory::{
-        CadenceInput, CadenceRecord, EventId, EventSink, MergeConfig, ObservationSample, OpenEvent,
-        RunOutcome, Runner, SampleRead, SampleSource, SplitReason,
+        CadenceInput, CadenceRecord, EventId, EventKind, EventSink, MergeConfig, ObservationSample,
+        OpenEvent, RunOutcome, Runner, SampleRead, SampleSource, SplitReason,
     };
 
     use super::{Cli, Command, IDLE_GAP_SECONDS, run_iteration};
@@ -835,6 +836,7 @@ mod tests {
         }));
         let sink = RecordingSink::default();
         let mut runner = Runner::new(MergeConfig {
+            kind: EventKind::Screen,
             idle_gap: Duration::seconds(30),
             scroll_overlap: 0.35,
         });

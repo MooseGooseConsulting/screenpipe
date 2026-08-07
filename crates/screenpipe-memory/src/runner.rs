@@ -168,7 +168,7 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     use crate::{
-        CadenceInput, CadenceRecord, CaptureGap, CaptureGapSummary, EventId, EventSink,
+        CadenceInput, CadenceRecord, CaptureGap, CaptureGapSummary, EventId, EventKind, EventSink,
         MERGE_CONTRACT_VERSION, MergeConfig, MergeDecisionKind, ObservationSample, OpenEvent,
         RunOutcome, Runner, SampleRead, SampleSource, SplitReason, TextIdentity,
     };
@@ -212,6 +212,7 @@ mod tests {
 
     fn runner() -> Runner {
         Runner::new(MergeConfig {
+            kind: EventKind::Screen,
             idle_gap: Duration::seconds(30),
             scroll_overlap: 0.35,
         })

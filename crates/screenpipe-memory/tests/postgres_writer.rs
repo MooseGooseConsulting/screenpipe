@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, ensure};
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
-    CadenceInput, CadenceRecord, CaptureGapSummary, HashLedger, MERGE_CONTRACT_VERSION,
+    CadenceInput, CadenceRecord, CaptureGapSummary, EventKind, HashLedger, MERGE_CONTRACT_VERSION,
     MINIMUM_SERVER_VERSION_NUM, MergeDecisionKind, ObservationSample, OpenEvent, PgEventWriter,
     SplitReason,
 };
@@ -338,6 +338,7 @@ fn event(
 ) -> OpenEvent {
     let hash = format!("hash-{second}");
     OpenEvent {
+        kind: EventKind::Screen,
         merge_contract_version: MERGE_CONTRACT_VERSION,
         started_at: at(0),
         ended_at: at(second),
@@ -1223,6 +1224,195 @@ async fn search_finds_by_words_by_time_and_by_both() -> Result<()> {
                 .await
                 .is_err(),
             "a blank query with no time window must be refused, not answered with everything"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+/// Feeds the runner a fixed script of clipboard reads, then refuses to be asked
+/// again.
+///
+/// Panicking on an extra read is what proves the runner consumed exactly the
+/// captures the channel produced - a source that returned a default sample
+/// forever would make every assertion below pass for the wrong reason.
+struct ScriptedSource(std::collections::VecDeque<screenpipe_memory::SampleRead>);
+
+#[async_trait::async_trait]
+impl screenpipe_memory::SampleSource for ScriptedSource {
+    async fn next_sample(&mut self) -> Result<screenpipe_memory::SampleRead> {
+        Ok(self
+            .0
+            .pop_front()
+            .expect("the runner asked for more clipboard captures than the script holds"))
+    }
+}
+
+/// A clipboard capture in the shape the channel produces one: text, no app.
+fn clipboard_read(second: u32, text: &str) -> screenpipe_memory::SampleRead {
+    screenpipe_memory::SampleRead::Sample {
+        sample: ObservationSample {
+            captured_at: at(second),
+            app_key: String::new(),
+            app_title: "Clipboard".to_owned(),
+            window_title: String::new(),
+            ocr_text: text.to_owned(),
+            readable_text: text.to_owned(),
+            browser_url: None,
+        },
+        cadence: CadenceRecord {
+            input: CadenceInput {
+                input_idle: Duration::zero(),
+                frame_stable_for: Duration::zero(),
+                foreground_changed: false,
+                frame_changed: false,
+            },
+            next_interval: Duration::seconds(2),
+        },
+    }
+}
+
+#[tokio::test]
+async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_discipline()
+-> Result<()> {
+    // The whole channel end to end, through the real merger, the real runner,
+    // and the real writer: only the Win32 clipboard read is scripted. What this
+    // has to prove is that clipboard capture reuses the durable machinery
+    // rather than paralleling it - the same `{slug}_{seq}` allocator, the same
+    // `events` table, the same `merge_meta` - and that the rows it writes say
+    // `clipboard` and not `screen`.
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        // A screen event first, so the sequence the clipboard events get is
+        // demonstrably the SHARED machine sequence and not a second counter.
+        let screen_id = writer
+            .write_start(
+                &event(0, "notepad.exe", "Notepad", "notes", "screen text", None),
+                SplitReason::Initial,
+            )
+            .await?;
+
+        let copied = "the release checklist item that was copied";
+        let mut runner = screenpipe_memory::Runner::new(screenpipe_memory::MergeConfig {
+            kind: EventKind::Clipboard,
+            idle_gap: Duration::seconds(60),
+            scroll_overlap: 0.35,
+        });
+        let mut source = ScriptedSource(
+            [
+                clipboard_read(1, copied),
+                // The same text copied again: one event, two samples.
+                clipboard_read(3, copied),
+                // Different text: a second event.
+                clipboard_read(5, "an unrelated thing that was copied later"),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let first = runner.run_once(&mut source, &writer).await?;
+        let merged = runner.run_once(&mut source, &writer).await?;
+        let second = runner.run_once(&mut source, &writer).await?;
+
+        let (first_id, second_id) = match (&first, &merged, &second) {
+            (
+                screenpipe_memory::RunOutcome::Started {
+                    event_id: first_id,
+                    reason: SplitReason::Initial,
+                },
+                screenpipe_memory::RunOutcome::Merged {
+                    event_id: merged_id,
+                },
+                screenpipe_memory::RunOutcome::Started {
+                    event_id: second_id,
+                    reason: SplitReason::TextHashChange,
+                },
+            ) if merged_id == first_id => (first_id.clone(), second_id.clone()),
+            other => anyhow::bail!("clipboard channel produced {other:?}"),
+        };
+
+        // Durable ids come from the machine allocator, in one shared sequence
+        // with the screen event above.
+        ensure!(
+            (screen_id.as_str(), first_id.as_str(), second_id.as_str())
+                == ("icarus_1", "icarus_2", "icarus_3"),
+            "clipboard events did not take the shared slug_seq allocator: \
+             {screen_id}, {first_id}, {second_id}"
+        );
+
+        let row = sqlx::query(
+            "SELECT kind, started_at, ended_at, ocr_text, readable_text, ocr_text_hash, \
+                    sample_count, app_id, window_title, title, merge_meta \
+             FROM events WHERE id = $1",
+        )
+        .bind(&first_id)
+        .fetch_one(&db.pool)
+        .await?;
+        ensure!(row.try_get::<String, _>("kind")? == "clipboard");
+        ensure!(row.try_get::<chrono::DateTime<Utc>, _>("started_at")? == at(1));
+        // The merge extended the open event rather than opening a new one.
+        ensure!(row.try_get::<chrono::DateTime<Utc>, _>("ended_at")? == at(3));
+        ensure!(row.try_get::<i32, _>("sample_count")? == 2);
+        // The copied text lands in the same columns OCR text does, so search
+        // and retrieval need no second path.
+        ensure!(row.try_get::<String, _>("ocr_text")? == copied);
+        ensure!(row.try_get::<String, _>("readable_text")? == copied);
+        ensure!(
+            row.try_get::<String, _>("ocr_text_hash")?
+                == screenpipe_memory::TextIdentity::from_ocr(copied).exact_hash
+        );
+        // No application invented for a capture that has none.
+        ensure!(row.try_get::<Option<i64>, _>("app_id")?.is_none());
+        ensure!(row.try_get::<String, _>("window_title")?.is_empty());
+        ensure!(row.try_get::<Option<String>, _>("title")? == Some("Clipboard".to_owned()));
+
+        let meta: Value = row.try_get("merge_meta")?;
+        ensure!(
+            meta["merge_contract_version"] == json!(MERGE_CONTRACT_VERSION),
+            "clipboard merge_meta did not record the contract: {meta:#}"
+        );
+        ensure!(meta["start_reason"] == json!("initial"));
+        ensure!(meta["last_decision"] == json!("merge"));
+        ensure!(meta["sample_count"] == json!(2));
+
+        // And the second event is a separate row, not an overwrite.
+        let second_row = sqlx::query(
+            "SELECT kind, ocr_text, sample_count, merge_meta FROM events WHERE id = $1",
+        )
+        .bind(&second_id)
+        .fetch_one(&db.pool)
+        .await?;
+        ensure!(second_row.try_get::<String, _>("kind")? == "clipboard");
+        ensure!(second_row.try_get::<i32, _>("sample_count")? == 1);
+        ensure!(
+            second_row.try_get::<Value, _>("merge_meta")?["start_reason"]
+                == json!("text_hash_change")
+        );
+
+        // The screen event kept its own kind, so `kind` is bound per event and
+        // not per writer.
+        let screen_kind: String = sqlx::query_scalar("SELECT kind FROM events WHERE id = $1")
+            .bind(&screen_id)
+            .fetch_one(&db.pool)
+            .await?;
+        ensure!(screen_kind == "screen");
+
+        // Clipboard text is searchable through the same index as screen text.
+        let hits = writer
+            .search(&screenpipe_memory::SearchRequest {
+                query: "release checklist".to_owned(),
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        ensure!(
+            hits.iter().any(|hit| hit.event_id == first_id),
+            "the clipboard event was not searchable: {:?}",
+            hits.iter().map(|hit| &hit.event_id).collect::<Vec<_>>()
         );
         Ok(())
     }
