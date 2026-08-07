@@ -408,6 +408,7 @@ mod tests {
                 capture_unavailable: 1,
                 ocr_unavailable: 0,
                 empty_ocr: 0,
+                desktop_locked: 0,
             }
         );
         assert_eq!(runner.pending_gaps(), CaptureGapSummary::default());
@@ -434,6 +435,7 @@ mod tests {
                 capture_unavailable: 0,
                 ocr_unavailable: 1,
                 empty_ocr: 0,
+                desktop_locked: 0,
             }
         );
         assert_eq!(runner.pending_gaps(), CaptureGapSummary::default());
@@ -668,6 +670,7 @@ mod tests {
                 capture_unavailable: 1,
                 ocr_unavailable: 0,
                 empty_ocr: 1,
+                desktop_locked: 0,
             }
         );
         assert_eq!(merged.latest, second);

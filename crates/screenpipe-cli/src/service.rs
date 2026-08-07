@@ -121,8 +121,26 @@ impl ServiceSpec {
         // `screen_started`, `capture_gap`, and `capture_error` line the agent
         // prints goes to a console nobody can read and dies with the process -
         // leaving a 24-hour unattended run with no diagnostic record at all.
-        // `*>>` captures every stream, appending so a wrapper restart never
-        // truncates the evidence from the run that just failed.
+        //
+        // The output goes through `Add-Content` per line rather than the
+        // obvious `*>> $log`. Running the `*>>` version against a real
+        // installed service broke it three separate ways, all specific to
+        // Windows PowerShell 5.1, which is what the scheduled task runs:
+        //
+        //   1. It writes UTF-16LE. The banner lines around it use
+        //      `-Encoding utf8`, so one log held two encodings and every
+        //      byte-oriented reader saw NUL-separated garbage.
+        //   2. It holds the file open EXCLUSIVELY for the life of the agent.
+        //      The log could not be read while capture was running, which is
+        //      the only time anyone wants to read it, and the seam tests that
+        //      assert on its contents could not open it at all.
+        //   3. The redirect target is resolved as a wildcard path, so a
+        //      service root containing `[` or `]` silently discards every line
+        //      while the `-LiteralPath` banners still land.
+        //
+        // `Add-Content` opens and closes per line: UTF-8, literal path, and
+        // readable by anyone while the agent runs. The line rate is one every
+        // two to thirty seconds, so the per-call cost does not matter.
         let wrapper_contents = format!(
             r#"$ErrorActionPreference = 'Continue'
 $agent = '{escaped_agent}'
@@ -132,9 +150,10 @@ if (-not (Test-Path -LiteralPath $logDirectory)) {{
 }}
 while ($true) {{
     $log = Join-Path $logDirectory ('screenpipe-agent-{{0:yyyy-MM-dd}}.log' -f (Get-Date))
-    "=== agent start {{0:o}} ===" -f (Get-Date).ToUniversalTime() | Out-File -LiteralPath $log -Append -Encoding utf8
-    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop *>> $log
-    "=== agent exited {{0:o}} exit={{1}} ===" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE | Out-File -LiteralPath $log -Append -Encoding utf8
+    Add-Content -LiteralPath $log -Encoding utf8 -Value ("=== agent start {{0:o}} ===" -f (Get-Date).ToUniversalTime())
+    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop 2>&1 |
+        ForEach-Object {{ Add-Content -LiteralPath $log -Encoding utf8 -Value ([string]$_) }}
+    Add-Content -LiteralPath $log -Encoding utf8 -Value ("=== agent exited {{0:o}} exit={{1}} ===" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE)
     Start-Sleep -Seconds 10
 }}
 "#
@@ -899,9 +918,10 @@ $parseErrors = $null
                 "}\n",
                 "while ($true) {\n",
                 "    $log = Join-Path $logDirectory ('screenpipe-agent-{0:yyyy-MM-dd}.log' -f (Get-Date))\n",
-                "    \"=== agent start {0:o} ===\" -f (Get-Date).ToUniversalTime() | Out-File -LiteralPath $log -Append -Encoding utf8\n",
-                "    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop *>> $log\n",
-                "    \"=== agent exited {0:o} exit={1} ===\" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE | Out-File -LiteralPath $log -Append -Encoding utf8\n",
+                "    Add-Content -LiteralPath $log -Encoding utf8 -Value (\"=== agent start {0:o} ===\" -f (Get-Date).ToUniversalTime())\n",
+                "    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop 2>&1 |\n",
+                "        ForEach-Object { Add-Content -LiteralPath $log -Encoding utf8 -Value ([string]$_) }\n",
+                "    Add-Content -LiteralPath $log -Encoding utf8 -Value (\"=== agent exited {0:o} exit={1} ===\" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE)\n",
                 "    Start-Sleep -Seconds 10\n",
                 "}\n",
             )

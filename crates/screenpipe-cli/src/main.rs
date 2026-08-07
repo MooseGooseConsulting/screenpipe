@@ -132,10 +132,12 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
                 match outcome {
                     Ok(outcome) => {
                         print_run_outcome(&outcome);
-                        let kind = if matches!(outcome, RunOutcome::GapRecorded { .. }) {
-                            IterationKind::Gap
-                        } else {
-                            IterationKind::Persisted
+                        let kind = match &outcome {
+                            RunOutcome::GapRecorded {
+                                gap: screenpipe_memory::CaptureGap::DesktopLocked,
+                            } => IterationKind::DesktopLocked,
+                            RunOutcome::GapRecorded { .. } => IterationKind::Gap,
+                            _ => IterationKind::Persisted,
                         };
                         match next_step(kind, &mut consecutive_failures, &mut consecutive_gaps) {
                             LoopStep::Continue => {}
@@ -203,8 +205,17 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
 enum IterationKind {
     /// An observation reached PostgreSQL. This is the only genuine success.
     Persisted,
-    /// A typed capture gap. Ordinary and expected, but NOT a success.
+    /// A typed capture gap on a live desktop. Ordinary and expected, but NOT
+    /// a success - a persistent one means capture is broken.
     Gap,
+    /// The desktop is locked or absent.
+    ///
+    /// Held separate from `Gap` because it is not a fault at all. A machine
+    /// left locked overnight produces nothing else for eight hours, and the
+    /// gap ceiling exists to catch a dead capture device - it must not fire on
+    /// a normal night. Backs off, never aborts, and never touches either
+    /// streak.
+    DesktopLocked,
     /// The iteration returned an error.
     Failure,
 }
@@ -240,6 +251,12 @@ fn next_step(
             *consecutive_gaps = 0;
             LoopStep::Continue
         }
+        IterationKind::DesktopLocked => {
+            // Deliberately does NOT advance the gap streak. Waiting for a user
+            // to come back is not a fault, and treating it as one made the
+            // agent abort and restart every few hours on an idle machine.
+            LoopStep::Retry(failure_backoff(MAX_BACKOFF_STEP))
+        }
         IterationKind::Gap => {
             *consecutive_gaps = consecutive_gaps.saturating_add(1);
             if *consecutive_gaps >= MAX_CONSECUTIVE_GAPS {
@@ -263,6 +280,9 @@ fn next_step(
 /// wrapper restart it from a clean state.
 const MAX_CONSECUTIVE_FAILURES: u32 = 20;
 
+/// Exponent clamp for `failure_backoff`. `2^5 = 32` seconds.
+const MAX_BACKOFF_STEP: u32 = 5;
+
 /// Consecutive capture gaps tolerated before the process exits.
 ///
 /// Far higher than `MAX_CONSECUTIVE_FAILURES` because the two describe
@@ -285,7 +305,7 @@ const MAX_CONSECUTIVE_GAPS: u32 = 640;
 /// was unreachable and anyone raising the clamp to 6 expecting it to hold would
 /// have got 64s instead.
 fn failure_backoff(consecutive_failures: u32) -> std::time::Duration {
-    let seconds = 2_u64.saturating_pow(consecutive_failures.min(5));
+    let seconds = 2_u64.saturating_pow(consecutive_failures.min(MAX_BACKOFF_STEP));
     std::time::Duration::from_secs(seconds)
 }
 
@@ -641,6 +661,46 @@ mod tests {
             failures, 0,
             "gaps must not be counted as failures - the two ceilings differ on purpose"
         );
+    }
+
+    #[test]
+    fn a_locked_desktop_never_reaches_the_gap_ceiling() {
+        use super::{IterationKind, LoopStep, next_step};
+
+        // A machine left locked overnight produces nothing but gaps for eight
+        // hours. The gap ceiling exists to catch a DEAD CAPTURE DEVICE, and
+        // before `DesktopLocked` was typed the two were the same code, so the
+        // agent would abort and restart every few hours on an idle machine.
+        //
+        // Ten times the gap ceiling: if a lock advanced either streak at all,
+        // this would abort long before the loop ends.
+        let mut failures = 0;
+        let mut gaps = 0;
+        for _ in 0..(super::MAX_CONSECUTIVE_GAPS * 10) {
+            let step = next_step(IterationKind::DesktopLocked, &mut failures, &mut gaps);
+            assert!(
+                matches!(step, LoopStep::Retry(_)),
+                "a locked desktop must back off and keep waiting, got {step:?}"
+            );
+        }
+        assert_eq!(gaps, 0, "a lock advanced the gap streak");
+        assert_eq!(failures, 0, "a lock advanced the failure streak");
+    }
+
+    #[test]
+    fn a_locked_desktop_waits_at_the_slowest_backoff() {
+        use super::{IterationKind, next_step};
+
+        // Polling a locked desktop every two seconds is 43,000 futile probes a
+        // day. It must sit at the ceiling, not the floor.
+        let mut failures = 0;
+        let mut gaps = 0;
+        let step = next_step(IterationKind::DesktopLocked, &mut failures, &mut gaps);
+        let super::LoopStep::Retry(delay) = step else {
+            panic!("expected a retry, got {step:?}");
+        };
+        assert_eq!(delay, super::failure_backoff(super::MAX_BACKOFF_STEP));
+        assert_eq!(delay.as_secs(), 32);
     }
 
     #[test]

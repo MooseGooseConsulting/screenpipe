@@ -510,6 +510,10 @@ fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
             "capture_unavailable": event.capture_gaps.capture_unavailable,
             "ocr_unavailable": event.capture_gaps.ocr_unavailable,
             "empty_ocr": event.capture_gaps.empty_ocr,
+            // The durable record that a lock happened. merge_meta.capture_gaps
+            // is the only place a seam run can read it back after the fact -
+            // the agent log rotates and the process restarts, this does not.
+            "desktop_locked": event.capture_gaps.desktop_locked,
         },
         "browser_url": event.latest.browser_url,
     })

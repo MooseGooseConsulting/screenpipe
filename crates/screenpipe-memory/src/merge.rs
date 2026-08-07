@@ -130,6 +130,15 @@ pub enum CaptureGap {
     CaptureUnavailable,
     OcrUnavailable,
     EmptyOcr,
+    /// The interactive desktop is locked or absent.
+    ///
+    /// Distinct from `CaptureUnavailable` on purpose. A locked workstation is
+    /// an ordinary, indefinite state - a machine left overnight produces
+    /// nothing else - whereas `CaptureUnavailable` means capture was attempted
+    /// against a live desktop and failed. Collapsing the two made them
+    /// indistinguishable to the run loop, so the ceiling that exists to catch a
+    /// dead capture device would fire on a normal night's sleep instead.
+    DesktopLocked,
 }
 
 impl CaptureGap {
@@ -138,6 +147,7 @@ impl CaptureGap {
             Self::CaptureUnavailable => "capture_unavailable",
             Self::OcrUnavailable => "ocr_unavailable",
             Self::EmptyOcr => "empty_ocr",
+            Self::DesktopLocked => "desktop_locked",
         }
     }
 }
@@ -147,6 +157,7 @@ pub struct CaptureGapSummary {
     pub capture_unavailable: u64,
     pub ocr_unavailable: u64,
     pub empty_ocr: u64,
+    pub desktop_locked: u64,
 }
 
 impl CaptureGapSummary {
@@ -155,6 +166,7 @@ impl CaptureGapSummary {
             CaptureGap::CaptureUnavailable => &mut self.capture_unavailable,
             CaptureGap::OcrUnavailable => &mut self.ocr_unavailable,
             CaptureGap::EmptyOcr => &mut self.empty_ocr,
+            CaptureGap::DesktopLocked => &mut self.desktop_locked,
         };
         *count = count.saturating_add(1);
     }
@@ -166,6 +178,7 @@ impl CaptureGapSummary {
                 .saturating_add(other.capture_unavailable),
             ocr_unavailable: self.ocr_unavailable.saturating_add(other.ocr_unavailable),
             empty_ocr: self.empty_ocr.saturating_add(other.empty_ocr),
+            desktop_locked: self.desktop_locked.saturating_add(other.desktop_locked),
         }
     }
 }

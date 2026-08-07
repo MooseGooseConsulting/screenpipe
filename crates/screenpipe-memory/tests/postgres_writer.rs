@@ -271,6 +271,9 @@ fn event(
             capture_unavailable: 1,
             ocr_unavailable: 2,
             empty_ocr: 3,
+            // Non-zero on purpose: a fixture of 0 would let a writer that
+            // hardcodes the key pass the exact-JSON assertion below.
+            desktop_locked: 4,
         },
         sample_count: 1,
         hash_counts: HashLedger::from_hashes([hash]),
@@ -367,6 +370,7 @@ async fn starts_allocate_icarus_ids_and_persist_authoritative_event_fields() -> 
                 "capture_unavailable": 1,
                 "ocr_unavailable": 2,
                 "empty_ocr": 3,
+                "desktop_locked": 4,
             },
             "browser_url": "https://example.test/path",
         }),
@@ -458,6 +462,7 @@ async fn merge_refreshes_app_title_latest_text_and_domain_metadata() -> Result<(
                 "capture_unavailable": 1,
                 "ocr_unavailable": 2,
                 "empty_ocr": 3,
+                "desktop_locked": 4,
             },
             "browser_url": "https://example.test/latest",
         }),

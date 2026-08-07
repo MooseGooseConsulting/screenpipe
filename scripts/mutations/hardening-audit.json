@@ -50,7 +50,7 @@
   {
     "id": "failure-backoff-goes-flat",
     "file": "crates/screenpipe-cli/src/main.rs",
-    "find": "    let seconds = 2_u64.saturating_pow(consecutive_failures.min(5));",
+    "find": "    let seconds = 2_u64.saturating_pow(consecutive_failures.min(MAX_BACKOFF_STEP));",
     "replace": "    let seconds = 2_u64;",
     "package": "screenpipe-cli",
     "claim": "the failure backoff actually grows and reaches its documented 32s ceiling"
@@ -126,5 +126,37 @@
     "replace": "             app_title = EXCLUDED.app_title \\",
     "package": "screenpipe-memory",
     "claim": "a repeat app sighting advances apps.last_seen_at"
+  },
+  {
+    "id": "locked-desktop-probe-deleted",
+    "file": "crates/screenpipe-cli/src/windows_source.rs",
+    "find": "        if !self.ops.interactive_desktop_available() {",
+    "replace": "        if false {",
+    "package": "screenpipe-cli",
+    "claim": "a locked desktop is detected before capture is attempted"
+  },
+  {
+    "id": "locked-desktop-collapses-into-capture-unavailable",
+    "file": "crates/screenpipe-cli/src/windows_source.rs",
+    "find": "            return Ok(SampleRead::Gap(CaptureGap::DesktopLocked));",
+    "replace": "            return Ok(SampleRead::Gap(CaptureGap::CaptureUnavailable));",
+    "package": "screenpipe-cli",
+    "claim": "a lock is its own gap kind, not collapsed into a capture failure"
+  },
+  {
+    "id": "locked-desktop-counts-toward-the-gap-ceiling",
+    "file": "crates/screenpipe-cli/src/main.rs",
+    "find": "        IterationKind::DesktopLocked => {",
+    "replace": "        IterationKind::DesktopLocked if false => {\n            unreachable!()\n        }\n        IterationKind::DesktopLocked => {\n            *consecutive_gaps = consecutive_gaps.saturating_add(1);",
+    "package": "screenpipe-cli",
+    "claim": "waiting for a locked desktop never advances the gap streak"
+  },
+  {
+    "id": "locked-desktop-polls-at-the-fastest-cadence",
+    "file": "crates/screenpipe-cli/src/main.rs",
+    "find": "            LoopStep::Retry(failure_backoff(MAX_BACKOFF_STEP))",
+    "replace": "            LoopStep::Retry(failure_backoff(0))",
+    "package": "screenpipe-cli",
+    "claim": "a locked desktop is polled at the slowest backoff, not the fastest"
   }
 ]

@@ -287,6 +287,7 @@ fn capture_gaps_accumulate_per_kind_across_a_merge() {
             capture_unavailable: 1,
             ocr_unavailable: 0,
             empty_ocr: 2,
+            desktop_locked: 0,
         },
         "record must credit each gap kind to its own counter"
     );
@@ -315,6 +316,7 @@ fn capture_gaps_accumulate_per_kind_across_a_merge() {
             capture_unavailable: 1,
             ocr_unavailable: 3,
             empty_ocr: 2,
+            desktop_locked: 0,
         },
         "a merge must sum each gap counter with its own kind"
     );
