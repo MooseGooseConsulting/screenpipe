@@ -193,6 +193,7 @@ async fn observe() -> ObservationSample {
         readable_text: ocr_text.clone(),
         ocr_text,
         browser_url: metadata.browser_url,
+        audio: None,
     }
 }
 

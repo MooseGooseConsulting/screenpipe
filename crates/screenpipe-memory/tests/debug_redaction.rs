@@ -18,6 +18,7 @@ fn sensitive_sample() -> ObservationSample {
         ocr_text: OCR_SECRET.to_owned(),
         readable_text: READABLE_SECRET.to_owned(),
         browser_url: Some(BROWSER_URL.to_owned()),
+        audio: None,
     }
 }
 

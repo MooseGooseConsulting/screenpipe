@@ -11,16 +11,28 @@ use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
 use crate::service::{ServiceManager, ServiceRoot, ServiceStatus, WindowsTaskScheduler};
 
+#[cfg(feature = "audio")]
+mod audio_source;
 mod clipboard_source;
 mod service;
 mod windows_source;
 
 use crate::clipboard_source::ClipboardSampleSource;
+use crate::service::ServiceKind;
 use crate::windows_source::WindowsSampleSource;
 
 const DATABASE_URL_ENV: &str = "SCREEN_MEMORY_DATABASE_URL";
 const DEFAULT_MACHINE_SLUG: &str = "icarus";
 const DEFAULT_DISPLAY_NAME: &str = "Icarus-Laptop";
+
+/// Overrides where the whisper model is looked for.
+#[cfg(feature = "audio")]
+const WHISPER_MODEL_ENV: &str = "SCREEN_MEMORY_WHISPER_MODEL";
+
+/// Where the model lives if nothing says otherwise. Beside the service's own
+/// binaries, under the same runtime root everything else in this system uses.
+#[cfg(feature = "audio")]
+const DEFAULT_MODEL_RELATIVE: &str = r"screen-memory\models\ggml-base.en.bin";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -73,6 +85,19 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Record and transcribe audio. OFF unless you run or install it.
+    ///
+    /// Nothing under here starts as a side effect of anything else: `run`
+    /// records only while it is in the foreground, and `service install`
+    /// registers a task of its own that `screenpipe service install` never
+    /// touches. Before enabling either, read
+    /// `docs/build/tracks/audio-channel.md` section 6 - this channel can record
+    /// other people, and whether that is lawful where you are is not something
+    /// this program can decide.
+    Audio {
+        #[command(subcommand)]
+        action: AudioAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -80,6 +105,58 @@ enum ServiceAction {
     Install,
     Uninstall,
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum AudioAction {
+    /// Capture, transcribe, and record until interrupted.
+    Run {
+        #[arg(long, default_value = DEFAULT_MACHINE_SLUG)]
+        machine_slug: String,
+        #[arg(long, default_value = DEFAULT_DISPLAY_NAME)]
+        display_name: String,
+        /// Record the microphone instead of system audio.
+        ///
+        /// A separate decision from enabling the channel, and a much larger
+        /// one: loopback hears what came out of the speakers, a microphone
+        /// hears the room and everyone in it.
+        #[arg(long)]
+        microphone: bool,
+        /// Path to a ggml whisper model. Defaults to
+        /// `%LOCALAPPDATA%\screen-memory\models\ggml-base.en.bin`, or
+        /// `SCREEN_MEMORY_WHISPER_MODEL` if that is set.
+        #[arg(long)]
+        model: Option<String>,
+        /// Voice-detection sensitivity: quality, low_bitrate, aggressive,
+        /// very_aggressive. Least aggressive by default.
+        #[arg(long, default_value = "quality")]
+        vad: String,
+        /// Language to assume, e.g. `en`. Detected per utterance when omitted.
+        #[arg(long)]
+        language: Option<String>,
+        /// Threads for transcription. Defaults to half the machine's, capped at
+        /// four, so a channel that is off by default cannot take the machine
+        /// over when it is on.
+        #[arg(long)]
+        threads: Option<i32>,
+    },
+    /// Check the audio endpoint, the model, and PostgreSQL - and record
+    /// nothing.
+    Doctor {
+        #[arg(long, default_value = DEFAULT_MACHINE_SLUG)]
+        machine_slug: String,
+        #[arg(long, default_value = DEFAULT_DISPLAY_NAME)]
+        display_name: String,
+        #[arg(long)]
+        microphone: bool,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Manage the audio channel's own scheduled task.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -115,7 +192,68 @@ async fn main() -> anyhow::Result<()> {
             };
             run_search(&database_url, &request).await
         }
-        Command::Service { action } => run_service_action(action),
+        Command::Service { action } => run_service_action(action, ServiceKind::Screen),
+        Command::Audio { action } => run_audio_action(action).await,
+    }
+}
+
+/// Dispatches the audio subcommands.
+///
+/// `service` works in every build, because a binary that cannot record must
+/// still be able to REMOVE a task that a previous one installed - discovering
+/// that you cannot turn it off without rebuilding would be the worst possible
+/// property for this particular channel.
+async fn run_audio_action(action: AudioAction) -> Result<()> {
+    match action {
+        AudioAction::Service { action } => run_service_action(action, ServiceKind::Audio),
+        #[cfg(feature = "audio")]
+        AudioAction::Run {
+            machine_slug,
+            display_name,
+            microphone,
+            model,
+            vad,
+            language,
+            threads,
+        } => {
+            let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
+            audio::run(
+                &database_url,
+                &machine_slug,
+                &display_name,
+                audio::Options {
+                    microphone,
+                    model,
+                    vad,
+                    language,
+                    threads,
+                },
+            )
+            .await
+        }
+        #[cfg(feature = "audio")]
+        AudioAction::Doctor {
+            machine_slug,
+            display_name,
+            microphone,
+            model,
+        } => {
+            let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
+            audio::doctor(
+                &database_url,
+                &machine_slug,
+                &display_name,
+                microphone,
+                model,
+            )
+            .await
+        }
+        #[cfg(not(feature = "audio"))]
+        _ => Err(anyhow::anyhow!(
+            "this build has no audio channel. It is a compile-time feature, off by default: \
+             rebuild with `cargo build --release --features audio` to get one that can record \
+             audio, and read docs/build/tracks/audio-channel.md section 6 first."
+        )),
     }
 }
 
@@ -636,19 +774,256 @@ async fn run_doctor(database_url: &str, machine_slug: &str, display_name: &str) 
     Ok(())
 }
 
-fn run_service_action(action: ServiceAction) -> anyhow::Result<()> {
+fn run_service_action(action: ServiceAction, kind: ServiceKind) -> anyhow::Result<()> {
     let service_root = ServiceRoot::current_user()?;
     let mut manager = ServiceManager::new(WindowsTaskScheduler);
     let status = match action {
         ServiceAction::Install => {
             let current_exe = std::env::current_exe().context("resolve running executable")?;
-            manager.install(&service_root, &current_exe)?
+            manager.install(&service_root, kind, &current_exe)?
         }
-        ServiceAction::Uninstall => manager.uninstall(&service_root)?,
-        ServiceAction::Status => manager.status(&service_root)?,
+        ServiceAction::Uninstall => manager.uninstall(&service_root, kind)?,
+        ServiceAction::Status => manager.status(&service_root, kind)?,
     };
+    println!("task_name={}", kind.task_name());
     print_service_status(&status);
     Ok(())
+}
+
+/// The audio channel's run loop, doctor, and configuration.
+///
+/// Everything specific to audio lives in this module so that the
+/// `#[cfg(feature = "audio")]` boundary is one line rather than scattered
+/// across the file. Without the feature, none of this is compiled and the
+/// binary cannot open a microphone even in principle.
+#[cfg(feature = "audio")]
+mod audio {
+    use anyhow::{Context, Result, ensure};
+    use screenpipe_audio::{Channel, ModelPath, VadAggressiveness, describe_default_endpoint};
+    use screenpipe_memory::{EventKind, MergeConfig, PgEventWriter, Runner};
+
+    use crate::audio_source::{AudioConfig, AudioSampleSource, CAPTURE_STOPPED};
+    use crate::{
+        DEFAULT_MODEL_RELATIVE, IDLE_GAP_SECONDS, WHISPER_MODEL_ENV, failure_backoff,
+        failure_category, print_run_outcome, run_iteration,
+    };
+
+    /// Most threads transcription may use.
+    ///
+    /// Half the machine, capped here. A channel that is off by default has no
+    /// business taking a laptop over when it is on, and `base.en` runs faster
+    /// than real time well below this.
+    const MAX_TRANSCRIBE_THREADS: i32 = 4;
+
+    pub(crate) struct Options {
+        pub(crate) microphone: bool,
+        pub(crate) model: Option<String>,
+        pub(crate) vad: String,
+        pub(crate) language: Option<String>,
+        pub(crate) threads: Option<i32>,
+    }
+
+    /// The audio channel's merger.
+    ///
+    /// The same idle gap as the screen and clipboard channels, for the same
+    /// reason: it is one threshold describing one thing, how long a silence has
+    /// to be before what follows is a new activity rather than a continuation.
+    /// `scroll_overlap` is carried but never consulted for this kind - speech
+    /// is not scrolled.
+    fn audio_runner() -> Runner {
+        Runner::new(MergeConfig {
+            kind: EventKind::Audio,
+            idle_gap: chrono::Duration::seconds(IDLE_GAP_SECONDS),
+            scroll_overlap: 0.35,
+        })
+    }
+
+    fn channel_of(microphone: bool) -> Channel {
+        if microphone {
+            Channel::Microphone
+        } else {
+            Channel::Loopback
+        }
+    }
+
+    /// Where the model is, in the order the operator would expect: the flag
+    /// they just typed, then the variable they set, then the default.
+    fn resolve_model(explicit: Option<String>) -> Result<ModelPath> {
+        if let Some(path) = explicit {
+            return ModelPath::new(&path)
+                .map_err(anyhow::Error::from)
+                .context("the --model path does not point at a file");
+        }
+        if let Some(path) = std::env::var_os(WHISPER_MODEL_ENV) {
+            return ModelPath::new(&path)
+                .map_err(anyhow::Error::from)
+                .with_context(|| format!("{WHISPER_MODEL_ENV} does not point at a file"));
+        }
+        let local = std::env::var_os("LOCALAPPDATA")
+            .context("LOCALAPPDATA is not set, so the default model location cannot be resolved")?;
+        let default = std::path::Path::new(&local).join(DEFAULT_MODEL_RELATIVE);
+        ModelPath::new(&default).map_err(anyhow::Error::from).context(
+            "no whisper model at the default location; download a ggml model there or pass --model",
+        )
+    }
+
+    fn resolve_threads(explicit: Option<i32>) -> i32 {
+        if let Some(threads) = explicit {
+            return threads.clamp(1, 64);
+        }
+        let cores = std::thread::available_parallelism()
+            .map(|count| i32::try_from(count.get()).unwrap_or(1))
+            .unwrap_or(1);
+        (cores / 2).clamp(1, MAX_TRANSCRIBE_THREADS)
+    }
+
+    /// Opens nothing that records. Answers "would this work" and stops.
+    pub(crate) async fn doctor(
+        database_url: &str,
+        machine_slug: &str,
+        display_name: &str,
+        microphone: bool,
+        model: Option<String>,
+    ) -> Result<()> {
+        let channel = channel_of(microphone);
+        println!("doctor audio_channel={}", channel.as_code());
+
+        let category = describe_default_endpoint(channel)
+            .map_err(anyhow::Error::from)
+            .context("resolve the default audio endpoint for this channel")?;
+        println!(
+            "doctor audio_endpoint=available role={}",
+            category.as_code()
+        );
+
+        // Loaded, not merely found: a truncated download is a file that exists.
+        let model = resolve_model(model)?;
+        let engine = screenpipe_audio::WhisperEngine::load(model, 1, None)
+            .map_err(anyhow::Error::from)
+            .context("load the whisper model")?;
+        println!(
+            "doctor whisper_model=loadable model={}",
+            engine.model_label()
+        );
+
+        let writer = PgEventWriter::connect(database_url, machine_slug, display_name)
+            .await
+            .context("verify PostgreSQL connection and machine identity")?;
+        let report = writer.preflight().await?;
+        ensure!(
+            report.machine_slug == machine_slug && report.display_name == display_name,
+            "PostgreSQL machine identity does not match requested identity"
+        );
+        println!(
+            "doctor postgres=available version={} schema=present machine_slug={} display_name={}",
+            report.server_version, report.machine_slug, report.display_name
+        );
+        println!("doctor recorded=nothing");
+        Ok(())
+    }
+
+    /// Records until interrupted.
+    ///
+    /// Unlike the screen loop this does not abort on a run of failures. It has
+    /// no service wrapper of its own to restart it in the ordinary case - and
+    /// more to the point, an audio channel that exits quietly looks exactly
+    /// like an audio channel that is working in a silent room. It backs off and
+    /// says what happened instead.
+    pub(crate) async fn run(
+        database_url: &str,
+        machine_slug: &str,
+        display_name: &str,
+        options: Options,
+    ) -> Result<()> {
+        let channel = channel_of(options.microphone);
+        let aggressiveness = VadAggressiveness::from_code(&options.vad).with_context(|| {
+            format!(
+                "--vad must be one of quality, low_bitrate, aggressive, very_aggressive (got {:?})",
+                options.vad
+            )
+        })?;
+        let model = resolve_model(options.model)?;
+        let threads = resolve_threads(options.threads);
+
+        if options.microphone {
+            // Said out loud, every time, at the top of the log. This channel
+            // records the room and anyone in it, and that must never be a thing
+            // somebody discovers from a database row.
+            println!("event=audio_microphone state=on note=records_the_room_and_anyone_in_it");
+        }
+
+        let writer = PgEventWriter::connect(database_url, machine_slug, display_name).await?;
+        let mut source = AudioSampleSource::start(AudioConfig {
+            channel,
+            model,
+            aggressiveness,
+            threads,
+            language: options.language,
+        })?;
+        let mut runner = audio_runner();
+        let mut consecutive_failures: u32 = 0;
+        println!("event=audio_runtime_ready machine_slug={machine_slug}");
+
+        let shutdown = tokio::signal::ctrl_c();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                signal = &mut shutdown => {
+                    signal.context("listen for Ctrl-C")?;
+                    println!("event=shutdown reason=ctrl_c");
+                    return Ok(());
+                }
+                step = run_iteration(&mut runner, &mut source, &writer) => match step {
+                    Ok(outcome) => {
+                        print_run_outcome("audio", &outcome);
+                        consecutive_failures = 0;
+                    }
+                    Err(error) if format!("{error:#}").contains(CAPTURE_STOPPED) => {
+                        // Not retryable. The WASAPI stream and the model live
+                        // on threads that have exited; backing off would print
+                        // the same line every second until logoff. Exiting
+                        // hands off to the service wrapper's restart loop,
+                        // which re-opens everything from a clean process.
+                        println!("event=shutdown reason=capture_stopped");
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        let category = failure_category(&error);
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        println!(
+                            "event=audio_error category={category} consecutive={consecutive_failures}"
+                        );
+                        tokio::time::sleep(failure_backoff(consecutive_failures)).await;
+                    }
+                },
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{MAX_TRANSCRIBE_THREADS, channel_of, resolve_threads};
+        use screenpipe_audio::Channel;
+
+        #[test]
+        fn the_default_channel_is_loopback() {
+            // Loopback hears what came out of the speakers. The microphone
+            // hears the room. Only one of those can be a default.
+            assert_eq!(channel_of(false), Channel::Loopback);
+            assert_eq!(channel_of(true), Channel::Microphone);
+        }
+
+        #[test]
+        fn transcription_threads_stay_inside_a_budget() {
+            assert!(resolve_threads(None) >= 1);
+            assert!(resolve_threads(None) <= MAX_TRANSCRIBE_THREADS);
+            // An explicit request is honoured, but not a nonsensical one: zero
+            // or a negative would reach whisper.cpp and be undefined there.
+            assert_eq!(resolve_threads(Some(7)), 7);
+            assert_eq!(resolve_threads(Some(0)), 1);
+            assert_eq!(resolve_threads(Some(-3)), 1);
+        }
+    }
 }
 
 fn print_service_status(status: &ServiceStatus) {
@@ -756,6 +1131,7 @@ mod tests {
                         ocr_text: "an unchanged idle window".to_owned(),
                         readable_text: "an unchanged idle window".to_owned(),
                         browser_url: None,
+                        audio: None,
                     },
                     cadence: idle_cadence,
                 })
@@ -834,6 +1210,7 @@ mod tests {
                 ocr_text: "an observation worth not losing".to_owned(),
                 readable_text: "an observation worth not losing".to_owned(),
                 browser_url: None,
+                audio: None,
             },
             cadence: CadenceRecord::from_input(CadenceInput {
                 input_idle: Duration::zero(),
@@ -950,6 +1327,7 @@ mod tests {
                 ocr_text: "runner wiring sample".to_owned(),
                 readable_text: "runner wiring sample".to_owned(),
                 browser_url: None,
+                audio: None,
             },
             cadence,
         }));

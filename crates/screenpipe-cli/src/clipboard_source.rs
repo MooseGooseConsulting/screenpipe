@@ -150,6 +150,7 @@ impl<Ops: ClipboardOps> Source<Ops> {
                 readable_text: text.clone(),
                 ocr_text: text,
                 browser_url: None,
+                audio: None,
             },
             // Reported, not computed. `CadencePolicy` answers a question about
             // screen frames and input idleness, and neither describes a

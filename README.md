@@ -100,6 +100,96 @@ A clipboard event has no application: `events.app_id` is NULL and no `apps`
 row is created, because the foreground window at poll time is not reliably
 where the copy came from.
 
+## Audio channel
+
+Speech is transcribed locally and recorded as `events` of kind `audio`, in the
+same table, under the same `{slug}_{seq}` identifiers, through the same writer.
+**It is OFF**, and it is off in two independent ways:
+
+1. **It is not in this binary.** `audio` is a Cargo feature, disabled by
+   default. Without it there is no capture path, no whisper model, and no code
+   that can open a microphone - and the build needs neither CMake nor libclang.
+2. **Even in a build that has it, it records nothing until it is started.**
+   `screenpipe run` does not start it and `screenpipe service install` does not
+   install it. It has its own subcommand and its own scheduled task.
+
+```powershell
+# A build that CAN record audio. Needs CMake and libclang for whisper.cpp.
+$env:LIBCLANG_PATH = "$env:LOCALAPPDATA\screen-memory\llvm\bin"
+cargo build --release -p screenpipe-cli --features audio
+
+# Prove the endpoint, the model and the database work. Records nothing.
+doppler run -p homelab -c dev_personal -- .\target\release\screenpipe.exe audio doctor
+
+# Record, in the foreground, until Ctrl-C.
+doppler run -p homelab -c dev_personal -- .\target\release\screenpipe.exe audio run
+```
+
+The model is a ggml whisper file, `ggml-base.en.bin` by default, looked for at
+`%LOCALAPPDATA%\screen-memory\models\`, overridable with
+`SCREEN_MEMORY_WHISPER_MODEL` or `--model`. Nothing downloads it automatically:
+a channel that is off by default has no business fetching 141 MB on its own.
+
+### What it records, and what it refuses
+
+- **System audio, not the microphone.** The default is loopback: what came back
+  through the speakers. It hears the far side of a call and not the operator's
+  own voice. `--microphone` records the room instead, and everyone audible in
+  it; that is a second, separate decision, it is never implied by turning the
+  channel on, and every run that does it prints
+  `event=audio_microphone state=on` at the top of the log.
+- **Never a device name.** Windows exposes strings like `Microphone (Realtek
+  High Definition Audio)`, which identify hardware in a particular person's
+  house. None of them are read. What is recorded is the endpoint ROLE -
+  `console` or `communications` - which says whether this stream follows the
+  device a call would actually use.
+- **Never near-silence.** Whisper does not return nothing for nothing; it
+  returns its best guess, which over room tone is a caption artefact. Audio
+  shorter than 250 ms is not transcribed at all, segments the model itself
+  scores above 0.6 no-speech are dropped, and an utterance with nothing left
+  writes no row - it logs `event=audio_discarded reason=no_speech`.
+- **Never the transcript in a log line.** whisper.cpp will print segments to
+  stdout if asked; every one of those switches is off, and the channel's own
+  diagnostics are fixed strings that carry no length, timing, or hash of what
+  was said.
+
+### Boundaries
+
+Silence decides. A WebRTC voice-activity detector runs on 20 ms frames: three
+voiced frames open an utterance, 600 ms of silence closes it, the 200 ms before
+the trigger is kept so the first consonant is not clipped, and the trailing
+silence is cut before the audio reaches the model. Whisper is never asked where
+speech starts.
+
+Each utterance is then its own event, unless its transcript is identical to the
+open one, in which case it merges. That is the same rule the clipboard channel
+uses, and it is load-bearing here for a different reason: the writer replaces
+`ocr_text` on a merge, so merging two different transcripts would keep the
+second and lose the first. What it does merge is repetition - whisper's
+favourite hallucination over a quiet room is the same short phrase over and
+over, and that becomes one row with a higher `sample_count`.
+
+An audio event has an application, unlike a clipboard event: `audio:loopback`
+or `audio:microphone`, titled `System Audio` or `Microphone`. `window_title` is
+empty - attaching the foreground window would need a live channel to the screen
+recorder that does not exist, and a guess would put `Zoom` on a video playing in
+a browser.
+
+`merge_meta.audio` carries the engine, the model's file stem, the VAD and its
+sensitivity, the endpoint role, why the utterance ended, and the model's own
+mean no-speech probability in parts per thousand. Screen and clipboard rows
+carry no `audio` key at all.
+
+### Three threads, and why
+
+Capture owns the WASAPI stream and must never block: the audio engine's buffer
+is finite, and a stalled reader loses audio with no record that it happened. It
+hands closed utterances to a transcription thread and, if that thread is more
+than eight utterances behind, drops them and says so
+(`event=audio_dropped reason=transcriber_backlog`) rather than wait. The
+transcription thread owns the model and is the expensive one. The async loop
+owns the database. Dropping happens at the cheap end, never at the durable one.
+
 ## Runtime and secrets contract
 
 PostgreSQL is the only canonical store. The runtime reads the connection string

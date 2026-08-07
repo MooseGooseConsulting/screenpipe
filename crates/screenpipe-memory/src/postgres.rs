@@ -533,7 +533,7 @@ fn event_title(event: &OpenEvent) -> Option<String> {
 }
 
 fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
-    json!({
+    let mut meta = json!({
         "merge_contract_version": event.merge_contract_version,
         "start_reason": start_reason.as_code(),
         "last_decision": event.last_decision.as_code(),
@@ -562,7 +562,32 @@ fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
             "desktop_locked": event.capture_gaps.desktop_locked,
         },
         "browser_url": event.latest.browser_url,
-    })
+    });
+
+    // Added rather than always present. A screen or clipboard row carrying
+    // `"audio": null` would be asserting something about a channel it has
+    // nothing to do with, and every reader of this JSONB would have to know to
+    // ignore it.
+    if let Some(audio) = event.latest.audio.as_ref() {
+        meta["audio"] = json!({
+            "channel": audio.channel,
+            "device_category": audio.device_category,
+            "engine": audio.engine,
+            "model": audio.model,
+            "vad_engine": audio.vad_engine,
+            "vad_aggressiveness": audio.vad_aggressiveness,
+            "language": audio.language,
+            // Parts per thousand. See AudioMeta for why this is not the f32
+            // whisper reports.
+            "avg_no_speech_permille": audio.avg_no_speech_permille,
+            "closed_by": audio.closed_by,
+            // The utterance's real length. `ended_at - started_at` is zero on a
+            // single-utterance row; see AudioMeta for why.
+            "duration_ms": audio.duration_ms,
+        });
+    }
+
+    meta
 }
 
 #[cfg(test)]

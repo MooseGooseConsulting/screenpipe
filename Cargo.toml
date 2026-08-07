@@ -2,6 +2,22 @@
 members = [
     "crates/screenpipe-screen",
     "crates/screenpipe-memory",
+    "crates/screenpipe-audio",
+    "crates/screenpipe-cli",
+]
+
+# `screenpipe-audio` is deliberately not here. A bare `cargo build` or
+# `cargo test` in this workspace builds the screen recorder and nothing else,
+# so the audio channel's toolchain - CMake and libclang, to compile whisper.cpp
+# and bind it - is only ever needed by someone who asked for audio. Everything
+# still works on it by name: `cargo test -p screenpipe-audio`.
+#
+# That is the first of the two layers that keep this channel off. The second is
+# the `audio` feature on screenpipe-cli: without it the binary has no audio
+# subcommand at all. See crates/screenpipe-audio/src/lib.rs.
+default-members = [
+    "crates/screenpipe-screen",
+    "crates/screenpipe-memory",
     "crates/screenpipe-cli",
 ]
 exclude = ["vendor/xcap"]

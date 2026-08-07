@@ -50,6 +50,25 @@ pub enum EventKind {
     /// things, not one thing being scrolled past. The window title is not
     /// consulted either, because a clipboard capture has no window of its own.
     Clipboard,
+    /// One utterance of speech, transcribed locally. Same test as
+    /// [`EventKind::Clipboard`], for a different reason that arrives at the
+    /// same place: content continues ONLY when the normalized transcript is
+    /// identical.
+    ///
+    /// Speech does not repeat itself the way a screen does, so the overlap
+    /// test that segments the screen has nothing to measure here - which is
+    /// why the design called for silence to be the boundary instead. It is:
+    /// the idle gap below IS the silence, because an utterance is only
+    /// delivered after voice activity detection has closed it, so the interval
+    /// between two samples on this channel is exactly the silence between two
+    /// utterances.
+    ///
+    /// The identical-transcript merge is not incidental either. Whisper
+    /// reliably hallucinates a short repeated phrase over near-silence - the
+    /// caption-credit line, a bare "Thank you." - and merging those into one
+    /// event with a higher `sample_count` is what keeps a quiet room from
+    /// becoming a hundred identical rows.
+    Audio,
 }
 
 impl EventKind {
@@ -58,6 +77,7 @@ impl EventKind {
         match self {
             Self::Screen => "screen",
             Self::Clipboard => "clipboard",
+            Self::Audio => "audio",
         }
     }
 }
@@ -353,7 +373,9 @@ impl Merger {
 
         let reason = match self.config.kind {
             EventKind::Screen => self.screen_split_reason(open, &sample, &identity),
-            EventKind::Clipboard => self.clipboard_split_reason(open, &sample, &identity),
+            EventKind::Clipboard | EventKind::Audio => {
+                self.discrete_split_reason(open, &sample, &identity)
+            }
         };
 
         // The ceilings are consulted last, so an observed reason always wins
@@ -441,27 +463,45 @@ impl Merger {
         }
     }
 
-    /// The boundary test for [`EventKind::Clipboard`].
+    /// The boundary test for the discrete channels - [`EventKind::Clipboard`]
+    /// and [`EventKind::Audio`].
     ///
     /// Two closers, and deliberately no others: the text changed, or the
-    /// operator went quiet for longer than the idle gap. A capture whose
+    /// channel went quiet for longer than the idle gap. A capture whose
     /// normalized text hash equals the open event's merges instead, which is
     /// what makes re-copying the same thing - hitting Ctrl-C twice, or a
     /// re-copy from a different app - one event with a higher `sample_count`
-    /// rather than a second row saying the same thing.
+    /// rather than a second row saying the same thing. On the audio channel it
+    /// does the same job for a transcript whisper emitted twice.
+    ///
+    /// One rule for both because both channels deliver DISCRETE, already-bounded
+    /// text: a copy is a copy, an utterance is an utterance, and neither is a
+    /// continuous surface being sampled. The screen is the odd one out - it is
+    /// sampled on a clock, so the same material shows up over and over and has
+    /// to be recognised as continuing.
+    ///
+    /// **Every distinct text starts a new row, and that is load-bearing.** The
+    /// writer persists `latest.ocr_text`, replacing what the row held before,
+    /// so a rule that merged two different transcripts would keep the second
+    /// and silently lose the first. Splitting is what makes every utterance
+    /// durable and searchable. Runs of speech are reassembled downstream by the
+    /// summarization ladder, which is where grouping belongs.
     ///
     /// The comparison is against the OPEN EVENT'S OWN hash and not against its
     /// ledger. `hash_counts` answers "did this event ever see this screen",
     /// which is the right question for a screen scrolling back to something it
-    /// showed before; a clipboard event only ever holds one distinct text, so
-    /// consulting the ledger would answer the same question in a way that
-    /// stops being true the moment the rule changes.
+    /// showed before; an event on these channels only ever holds one distinct
+    /// text, so consulting the ledger would answer the same question in a way
+    /// that stops being true the moment the rule changes.
     ///
-    /// The app key is not consulted, because a clipboard capture is not
-    /// attributed to an app at all: the foreground window at poll time is not
-    /// reliably the window the copy came from, and asserting otherwise would
-    /// put a guess in a durable row.
-    fn clipboard_split_reason(
+    /// The app key is not consulted. A clipboard capture is not attributed to
+    /// an app at all - the foreground window at poll time is not reliably the
+    /// window the copy came from, and asserting otherwise would put a guess in
+    /// a durable row. An audio capture does carry one, `audio:loopback` or
+    /// `audio:microphone`, but it cannot change within a merger: each enabled
+    /// channel runs its own capture stream and its own `Merger`, so there is no
+    /// sample sequence in which that key differs.
+    fn discrete_split_reason(
         &self,
         open: &OpenEvent,
         sample: &ObservationSample,

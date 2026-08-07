@@ -47,6 +47,7 @@ fn sample(second: i64, app_key: &str, window_title: &str, ocr_text: &str) -> Obs
         ocr_text: ocr_text.to_owned(),
         readable_text: ocr_text.to_owned(),
         browser_url: None,
+        audio: None,
     }
 }
 
@@ -718,6 +719,7 @@ fn clipboard_sample(second: i64, text: &str) -> ObservationSample {
         ocr_text: text.to_owned(),
         readable_text: text.to_owned(),
         browser_url: None,
+        audio: None,
     }
 }
 
@@ -866,4 +868,156 @@ fn a_clipboard_event_is_closed_by_the_shared_idle_gap() {
 
     assert_eq!(event.sample_count, 1);
     assert_eq!(event.started_at, at(TEST_IDLE_GAP_SECONDS * 2 + 1));
+}
+
+// --- The audio contract ----------------------------------------------------
+//
+// The audio channel shares the discrete rule with the clipboard, but for a
+// different reason and with a different consequence, so it is pinned
+// separately: for a clipboard the rule dedupes a double Ctrl-C, and for audio
+// it is what stands between a quiet room and a hundred identical rows of
+// whisper's favourite hallucination.
+
+/// One transcribed utterance, as the audio channel produces it.
+///
+/// The app key is NOT empty here, unlike the clipboard's. An audio event has a
+/// real source worth naming - which of the two channels heard it - and naming
+/// it is what gives the event a title a person can recognise.
+fn audio_sample(second: i64, transcript: &str) -> ObservationSample {
+    ObservationSample {
+        captured_at: at(second),
+        app_key: "audio:loopback".to_owned(),
+        app_title: "System Audio".to_owned(),
+        window_title: String::new(),
+        ocr_text: transcript.to_owned(),
+        readable_text: transcript.to_owned(),
+        browser_url: None,
+        audio: Some(screenpipe_memory::AudioMeta {
+            channel: "system_audio",
+            device_category: "communications",
+            engine: "whisper-rs",
+            model: "ggml-base.en".to_owned(),
+            vad_engine: "webrtc-vad",
+            vad_aggressiveness: "quality",
+            language: Some("en".to_owned()),
+            avg_no_speech_permille: Some(30),
+            closed_by: "silence",
+            duration_ms: 4_200,
+        }),
+    }
+}
+
+fn audio_merger() -> Merger {
+    Merger::new(MergeConfig {
+        kind: EventKind::Audio,
+        idle_gap: Duration::seconds(TEST_IDLE_GAP_SECONDS),
+        scroll_overlap: 0.35,
+    })
+}
+
+#[test]
+fn an_audio_event_records_its_kind_so_the_writer_cannot_mislabel_it() {
+    let mut merger = audio_merger();
+
+    let event = started(
+        merger.ingest(audio_sample(0, "the deploy finished about ten minutes ago")),
+        SplitReason::Initial,
+    );
+
+    assert_eq!(event.kind, EventKind::Audio);
+    assert_eq!(event.kind.as_code(), "audio");
+}
+
+#[test]
+fn every_distinct_utterance_becomes_its_own_event() {
+    // Load-bearing, not incidental. The writer persists `latest.ocr_text` -
+    // it REPLACES what the row held - so a rule that merged two different
+    // transcripts would keep the second and silently lose the first. Splitting
+    // is what makes every utterance durable and searchable.
+    let mut merger = audio_merger();
+    started(
+        merger.ingest(audio_sample(0, "did you see the review comments")),
+        SplitReason::Initial,
+    );
+
+    let second = started(
+        merger.ingest(audio_sample(3, "yes, two of them were real")),
+        SplitReason::TextHashChange,
+    );
+
+    assert_eq!(second.sample_count, 1);
+    assert_eq!(second.latest.ocr_text, "yes, two of them were real");
+}
+
+#[test]
+fn a_repeated_transcript_merges_rather_than_writing_the_same_row_twice() {
+    // Whisper reliably produces a short repeated phrase over near-silence - a
+    // caption credit, a bare "Thank you." - and a quiet room would otherwise
+    // become a row per utterance saying the same thing.
+    let mut merger = audio_merger();
+    started(
+        merger.ingest(audio_sample(0, "Thank you.")),
+        SplitReason::Initial,
+    );
+
+    let merged_once = merged(merger.ingest(audio_sample(2, "Thank you.")));
+    let merged_twice = merged(merger.ingest(audio_sample(4, " thank   you. ")));
+
+    assert_eq!(merged_once.sample_count, 2);
+    // Normalized, so case and whitespace do not make a second row either.
+    assert_eq!(merged_twice.sample_count, 3);
+}
+
+#[test]
+fn a_silence_longer_than_the_idle_gap_starts_a_new_audio_event() {
+    // The VAD has already closed each utterance, so the interval between two
+    // audio samples IS the silence between two turns. This is the design's
+    // "silence is the boundary", expressed in the shared merger.
+    let mut merger = audio_merger();
+    let line = "same thing said twice, an hour apart";
+    started(merger.ingest(audio_sample(0, line)), SplitReason::Initial);
+
+    let at_threshold = merged(merger.ingest(audio_sample(TEST_IDLE_GAP_SECONDS, line)));
+    assert_eq!(at_threshold.sample_count, 2);
+
+    let event = started(
+        merger.ingest(audio_sample(TEST_IDLE_GAP_SECONDS * 2 + 1, line)),
+        SplitReason::IdleGap,
+    );
+
+    assert_eq!(event.sample_count, 1);
+}
+
+#[test]
+fn the_audio_metadata_rides_on_the_event_for_the_writer_to_persist() {
+    // None of it has a column: which model produced the transcript, and whether
+    // that model thought it was hearing speech at all, is the difference
+    // between a row worth reading and one invented over room tone.
+    let mut merger = audio_merger();
+
+    let event = started(
+        merger.ingest(audio_sample(0, "an utterance with metadata")),
+        SplitReason::Initial,
+    );
+
+    let meta = event.latest.audio.as_ref().expect("audio metadata");
+    assert_eq!(meta.channel, "system_audio");
+    assert_eq!(meta.device_category, "communications");
+    assert_eq!(meta.model, "ggml-base.en");
+    assert_eq!(meta.avg_no_speech_permille, Some(30));
+    assert_eq!(meta.closed_by, "silence");
+}
+
+#[test]
+fn a_screen_sample_carries_no_audio_metadata_at_all() {
+    // Absent rather than empty: a screen row asserting anything about an audio
+    // channel would have to be ignored by every reader of merge_meta.
+    let mut merger = merger();
+
+    let event = started(
+        merger.ingest(sample(0, "notepad.exe", "notes", "ordinary screen text")),
+        SplitReason::Initial,
+    );
+
+    assert!(event.latest.audio.is_none());
 }

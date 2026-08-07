@@ -17,5 +17,5 @@ pub use postgres::{
     MINIMUM_SERVER_VERSION_NUM, PgEventWriter, PgPreflight, SearchHit, SearchRequest,
 };
 pub use runner::{EventId, EventSink, RunOutcome, Runner, SampleRead, SampleSource};
-pub use sample::ObservationSample;
+pub use sample::{AudioMeta, ObservationSample};
 pub use text_hash::{TextIdentity, jaccard_overlap};

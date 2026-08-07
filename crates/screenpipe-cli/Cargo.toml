@@ -9,11 +9,27 @@ repository.workspace = true
 name = "screenpipe"
 path = "src/main.rs"
 
+[features]
+# The audio channel, off by default and compiled out entirely when it is.
+#
+# This is the strongest form of "off": without the feature the binary has no
+# `audio` subcommand, no whisper model in memory, and no code path that can
+# open a microphone - and building it needs neither CMake nor libclang, which
+# whisper.cpp and its bindings otherwise require.
+#
+# Turning the feature on still records nothing. It has to be run
+# (`screenpipe audio run`) or installed (`screenpipe audio service install`),
+# both of which are separate deliberate acts. See
+# docs/build/tracks/audio-channel.md section 6.
+default = []
+audio = ["dep:screenpipe-audio"]
+
 [dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1"
 chrono = "0.4"
 clap = { version = "4.5.51", features = ["derive"] }
+screenpipe-audio = { path = "../screenpipe-audio", optional = true }
 screenpipe-memory = { path = "../screenpipe-memory" }
 screenpipe-screen = { path = "../screenpipe-screen" }
 tokio = { version = "1", features = ["macros", "rt", "signal", "time"] }
