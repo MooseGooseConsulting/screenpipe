@@ -1,7 +1,7 @@
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
-    CadenceInput, CadenceRecord, CaptureGapSummary, MergeConfig, MergeDecision, Merger,
-    ObservationSample, SplitReason, TextIdentity,
+    CadenceInput, CadenceRecord, CaptureGap, CaptureGapSummary, MergeConfig, MergeDecision,
+    MergeDecisionKind, Merger, ObservationSample, SplitReason, TextIdentity,
 };
 
 trait TestIngest {
@@ -21,6 +21,15 @@ impl TestIngest for Merger {
             CaptureGapSummary::default(),
         )
     }
+}
+
+fn idle_cadence() -> CadenceRecord {
+    CadenceRecord::from_input(CadenceInput {
+        input_idle: Duration::zero(),
+        frame_stable_for: Duration::zero(),
+        foreground_changed: false,
+        frame_changed: false,
+    })
 }
 
 /// Offset in seconds from a fixed base. Adds a duration rather than packing
@@ -58,6 +67,24 @@ fn started(decision: MergeDecision, expected_reason: SplitReason) -> screenpipe_
     match decision {
         MergeDecision::Start { reason, event } => {
             assert_eq!(reason, expected_reason);
+            // The reason carried by the decision and the reason stored on the
+            // event are two separate writes, and only the first was ever
+            // asserted - so `start_reason` could be hardcoded to `Initial` for
+            // every split and the whole suite stayed green. It is persisted
+            // into `merge_meta`, so a wrong value is durable.
+            assert_eq!(
+                event.start_reason, expected_reason,
+                "the event's stored start_reason must match the decision's reason"
+            );
+            assert_eq!(
+                event.last_decision,
+                MergeDecisionKind::Start,
+                "a start decision must leave last_decision at Start"
+            );
+            assert_eq!(
+                event.merge_contract_version,
+                screenpipe_memory::MERGE_CONTRACT_VERSION
+            );
             event
         }
         MergeDecision::Merge { .. } => panic!("expected a start decision"),
@@ -66,7 +93,14 @@ fn started(decision: MergeDecision, expected_reason: SplitReason) -> screenpipe_
 
 fn merged(decision: MergeDecision) -> screenpipe_memory::OpenEvent {
     match decision {
-        MergeDecision::Merge { event } => event,
+        MergeDecision::Merge { event } => {
+            assert_eq!(
+                event.last_decision,
+                MergeDecisionKind::Merge,
+                "a merge decision must leave last_decision at Merge"
+            );
+            event
+        }
         MergeDecision::Start { .. } => panic!("expected a merge decision"),
     }
 }
@@ -234,6 +268,86 @@ fn exactly_thirty_five_percent_overlap_merges() {
     let event = merged(merger.ingest(sample(1, "notepad.exe", "notes", second_text)));
 
     assert_eq!(event.sample_count, 2);
+}
+
+#[test]
+fn capture_gaps_accumulate_per_kind_across_a_merge() {
+    // Every other test in this file passes `CaptureGapSummary::default()`, so
+    // `record` never ran and `add` never ran with a nonzero operand: the
+    // three-way counter dispatch and the three saturating adds were entirely
+    // unprotected here. The three counts are deliberately pairwise distinct -
+    // with equal counts, swapping two counters is undetectable.
+    let mut first = CaptureGapSummary::default();
+    first.record(CaptureGap::CaptureUnavailable);
+    first.record(CaptureGap::EmptyOcr);
+    first.record(CaptureGap::EmptyOcr);
+    assert_eq!(
+        first,
+        CaptureGapSummary {
+            capture_unavailable: 1,
+            ocr_unavailable: 0,
+            empty_ocr: 2,
+        },
+        "record must credit each gap kind to its own counter"
+    );
+
+    let mut second = CaptureGapSummary::default();
+    for _ in 0..3 {
+        second.record(CaptureGap::OcrUnavailable);
+    }
+
+    let mut merger = merger();
+    merger.ingest_with_metadata(
+        sample(0, "notepad.exe", "notes", "same text"),
+        idle_cadence(),
+        first,
+    );
+
+    let event = merged(merger.ingest_with_metadata(
+        sample(1, "notepad.exe", "notes", "same text"),
+        idle_cadence(),
+        second,
+    ));
+
+    assert_eq!(
+        event.capture_gaps,
+        CaptureGapSummary {
+            capture_unavailable: 1,
+            ocr_unavailable: 3,
+            empty_ocr: 2,
+        },
+        "a merge must sum each gap counter with its own kind"
+    );
+}
+
+#[test]
+fn just_under_thirty_five_percent_overlap_starts_a_text_hash_event() {
+    // The companion of `exactly_thirty_five_percent_overlap_merges`. Without a
+    // case that sits just BELOW the threshold, the comparison can be scaled
+    // arbitrarily far down (0.35 -> 0.00035) and every merge test still passes,
+    // because the only "must split" case had overlap of exactly 0.0. That would
+    // make scroll detection mean "merge on any single shared five-gram".
+    //
+    // 17 words -> 13 grams; 22 words -> 18 grams; grams starting w06..w13 are
+    // shared -> 8. Union = 13 + 18 - 8 = 23, so overlap = 8/23 = 0.3478 < 0.35.
+    // The second text is also a hash never seen before, so the `hash_counts`
+    // short-circuit cannot mask the threshold.
+    let first_text = "w01 w02 w03 w04 w05 w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17";
+    let second_text =
+        "w06 w07 w08 w09 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27";
+    let mut merger = merger();
+    merger.ingest(sample(0, "notepad.exe", "notes", first_text));
+
+    let event = started(
+        merger.ingest(sample(1, "notepad.exe", "notes", second_text)),
+        SplitReason::TextHashChange,
+    );
+
+    assert_eq!(event.sample_count, 1);
+    assert_eq!(
+        event.merge_hash,
+        TextIdentity::from_ocr(second_text).exact_hash
+    );
 }
 
 #[test]

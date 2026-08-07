@@ -271,10 +271,7 @@ impl PgEventWriter {
         .fetch_one(&self.pool)
         .await
         .context("read PostgreSQL server version")?;
-        ensure!(
-            server_version_num >= 180_000,
-            "PostgreSQL 18 or newer is required"
-        );
+        ensure_supported_server_version(server_version_num)?;
 
         let (machine_id, machine_slug, display_name, next_event_seq) =
             sqlx::query_as::<_, (i64, String, String, i64)>(
@@ -437,6 +434,24 @@ fn checked_sample_count(event: &OpenEvent) -> Result<i32> {
     i32::try_from(event.sample_count).context("event sample count exceeds PostgreSQL integer")
 }
 
+/// Minimum `server_version_num` the writer will run against. The authoritative
+/// schema uses a generated `search_tsv` column, so an older server cannot hold
+/// it.
+const MINIMUM_SERVER_VERSION_NUM: i32 = 180_000;
+
+/// Extracted from `preflight` so it can be proven without a second PostgreSQL
+/// installation. Inline, the guard was untestable: every integration test runs
+/// against a live PostgreSQL 18, so the assertion `report.server_version_num >=
+/// 180_000` certified the *server*, not the guard, and deleting the guard
+/// changed nothing.
+fn ensure_supported_server_version(server_version_num: i32) -> Result<()> {
+    ensure!(
+        server_version_num >= MINIMUM_SERVER_VERSION_NUM,
+        "PostgreSQL 18 or newer is required, found server_version_num {server_version_num}"
+    );
+    Ok(())
+}
+
 fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
     json!({
         "merge_contract_version": event.merge_contract_version,
@@ -460,4 +475,30 @@ fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
         },
         "browser_url": event.latest.browser_url,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MINIMUM_SERVER_VERSION_NUM, ensure_supported_server_version};
+
+    #[test]
+    fn server_versions_below_postgres_18_are_rejected() {
+        // Both sides of the boundary, plus a plausible real older release.
+        for rejected in [0, 90_624, 150_004, 170_009, MINIMUM_SERVER_VERSION_NUM - 1] {
+            let error = ensure_supported_server_version(rejected)
+                .expect_err("server_version_num {rejected} must be rejected");
+            assert!(
+                format!("{error:#}").contains("PostgreSQL 18 or newer is required"),
+                "unexpected rejection message for {rejected}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn postgres_18_and_newer_are_accepted() {
+        for accepted in [MINIMUM_SERVER_VERSION_NUM, 180_004, 190_000] {
+            ensure_supported_server_version(accepted)
+                .unwrap_or_else(|error| panic!("{accepted} must be accepted: {error:#}"));
+        }
+    }
 }

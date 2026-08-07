@@ -402,6 +402,62 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_chrome_edit_outside_a_document_is_never_value_read() {
+        // The test above returns early on the document branch, so it never
+        // reaches the identity filter that guards the value read. That left
+        // `!looks_like_address_bar(&snapshot)` deletable with the whole suite
+        // green - which would call the UIA Value pattern on every enabled,
+        // on-screen Edit in the browser chrome and store the result in a
+        // non-zeroized snapshot. This fixture sits OUTSIDE any document, so
+        // only the identity check can stop the read.
+        for (description, untrusted) in [
+            (
+                "neither half of the identity matches",
+                UiaElementSnapshot {
+                    name: "Find".to_owned(),
+                    automation_id: "find-bar-textfield".to_owned(),
+                    ..trusted_address_bar()
+                },
+            ),
+            (
+                "the name matches but the automation id does not",
+                UiaElementSnapshot {
+                    automation_id: "toolbar-omnibox-shim".to_owned(),
+                    ..trusted_address_bar()
+                },
+            ),
+            (
+                "the automation id matches but the name does not",
+                UiaElementSnapshot {
+                    name: "Bookmark URL".to_owned(),
+                    ..trusted_address_bar()
+                },
+            ),
+        ] {
+            let value_read = Cell::new(false);
+
+            let selected = read_candidate_after_provenance(
+                || Ok(false),
+                || Ok(untrusted.clone()),
+                || {
+                    value_read.set(true);
+                    Ok("https://leaked.example.test/private".to_owned())
+                },
+            )
+            .unwrap();
+
+            assert!(
+                selected.is_none(),
+                "an edit where {description} must not be selected"
+            );
+            assert!(
+                !value_read.get(),
+                "the UIA value pattern must not be read when {description}"
+            );
+        }
+    }
+
+    #[test]
     fn focus_loss_after_enumeration_returns_structured_unavailable() {
         let (selected, diagnostics) =
             read_with_focus_script(&[true, false], vec![trusted_address_bar()]);

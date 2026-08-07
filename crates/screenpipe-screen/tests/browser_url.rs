@@ -42,6 +42,77 @@ fn page_input(name: &str, automation_id: &str, value: &str) -> UiaElementSnapsho
     }
 }
 
+/// An enabled, on-screen Edit that lives in the browser *chrome* rather than
+/// under a page Document, and whose value is a perfectly parseable https URL.
+/// Only the trusted-identity check can reject one of these.
+fn chrome_edit(name: &str, automation_id: &str, value: &str) -> UiaElementSnapshot {
+    UiaElementSnapshot {
+        control_type: EDIT_CONTROL,
+        name: name.to_owned(),
+        automation_id: automation_id.to_owned(),
+        value: Some(value.to_owned()),
+        is_enabled: true,
+        is_offscreen: false,
+        has_document_ancestor: false,
+    }
+}
+
+#[test]
+fn rejects_url_valued_browser_chrome_edits_that_are_not_the_address_bar() {
+    // Every fixture that was previously expected to be rejected came from
+    // `page_input`, which hardcodes `has_document_ancestor: true` - so the
+    // document guard rejected them before the identity check ever ran, and
+    // `looks_like_address_bar` could be deleted outright with the whole suite
+    // green. In production that would report any URL-valued Edit in the
+    // browser chrome as the page URL: find-in-page with a pasted link, the
+    // bookmark-edit URL field, DevTools' network filter, an extension popup.
+    //
+    // The identity check is an AND of automation id and name, so each decoy
+    // below independently pins one half of it.
+    let decoys = [
+        (
+            "neither half matches",
+            chrome_edit("Find", "find-bar-textfield", "https://leaked.test/find"),
+        ),
+        (
+            "name matches but the automation id does not",
+            chrome_edit(
+                "Address and search bar",
+                "toolbar-omnibox-shim",
+                "https://leaked.test/name-only",
+            ),
+        ),
+        (
+            "automation id matches but the name does not",
+            chrome_edit("Bookmark URL", "view_1022", "https://leaked.test/id-only"),
+        ),
+    ];
+
+    for (description, decoy) in decoys {
+        assert_eq!(
+            select_address_bar("chrome.exe", std::slice::from_ref(&decoy)),
+            None,
+            "a chrome edit where {description} must never be reported as the page URL"
+        );
+    }
+}
+
+#[test]
+fn prefers_the_trusted_address_bar_over_an_earlier_url_valued_chrome_edit() {
+    // Ordering matters: `find_map` takes the first element that passes every
+    // guard. A decoy placed before the real address bar proves the identity
+    // check is what discriminates, not position.
+    let elements = vec![
+        chrome_edit("Find", "find-bar-textfield", "https://leaked.test/find"),
+        address_bar(Some("https://example.test/real-page")),
+    ];
+
+    assert_eq!(
+        select_address_bar("chrome.exe", &elements),
+        Some(Url::parse("https://example.test/real-page").unwrap())
+    );
+}
+
 #[test]
 fn selects_the_enabled_visible_chrome_address_bar() {
     let elements = vec![

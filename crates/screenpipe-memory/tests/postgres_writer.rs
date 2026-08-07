@@ -8,7 +8,7 @@ use screenpipe_memory::{
     CadenceInput, CadenceRecord, CaptureGapSummary, MERGE_CONTRACT_VERSION, MergeDecisionKind,
     ObservationSample, OpenEvent, PgEventWriter, SplitReason,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool, Row};
 
@@ -234,7 +234,7 @@ async fn starts_allocate_icarus_ids_and_persist_authoritative_event_fields() -> 
     let db = TestDatabase::create().await?;
     let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
     let first = event(0, "notepad.exe", "Notepad", "notes", "first text", None);
-    let second = event(
+    let mut second = event(
         1,
         "msedge.exe",
         "Microsoft Edge",
@@ -242,13 +242,17 @@ async fn starts_allocate_icarus_ids_and_persist_authoritative_event_fields() -> 
         "second text",
         Some("https://example.test/path"),
     );
+    // Deliberately not 1. `sample_count` has `DEFAULT 1` in the schema, so a
+    // fixture of 1 is satisfied by the column default even if the writer never
+    // binds the column at all.
+    second.sample_count = 9;
 
     let first_id = writer.write_start(&first, SplitReason::Initial).await?;
     let second_id = writer.write_start(&second, SplitReason::AppChange).await?;
     let row = sqlx::query(
-        "SELECT e.id, e.seq, e.kind, e.window_title, e.ocr_text, e.readable_text, \
-                e.ocr_text_hash, e.sample_count, e.merge_meta, m.slug, m.display_name, \
-                a.app_key, a.app_title \
+        "SELECT e.id, e.seq, e.kind, e.started_at, e.ended_at, e.window_title, e.ocr_text, \
+                e.readable_text, e.ocr_text_hash, e.sample_count, e.merge_meta, \
+                m.slug, m.display_name, a.app_key, a.app_title \
          FROM events e JOIN machines m ON m.id = e.machine_id \
          JOIN apps a ON a.id = e.app_id WHERE e.id = $1",
     )
@@ -260,18 +264,50 @@ async fn starts_allocate_icarus_ids_and_persist_authoritative_event_fields() -> 
     ensure!((first_id, second_id.as_str()) == ("icarus_1".to_owned(), "icarus_2"));
     ensure!(row.try_get::<i64, _>("seq")? == 2);
     ensure!(row.try_get::<String, _>("kind")? == "screen");
+    // The event window is the primary data product. Nothing read these two
+    // columns back, so both could be bound from the same instant - collapsing
+    // every event to zero duration - and the CHECK (ended_at >= started_at)
+    // would still be satisfied.
+    ensure!(row.try_get::<chrono::DateTime<Utc>, _>("started_at")? == at(0));
+    ensure!(row.try_get::<chrono::DateTime<Utc>, _>("ended_at")? == at(1));
     ensure!(row.try_get::<String, _>("window_title")? == "browser");
     ensure!(row.try_get::<String, _>("ocr_text")? == "second text");
     ensure!(row.try_get::<String, _>("readable_text")? == "readable second text");
     ensure!(row.try_get::<String, _>("ocr_text_hash")? == "hash-1");
-    ensure!(row.try_get::<i32, _>("sample_count")? == 1);
+    ensure!(row.try_get::<i32, _>("sample_count")? == 9);
     ensure!(row.try_get::<String, _>("slug")? == "icarus");
     ensure!(row.try_get::<String, _>("display_name")? == "Icarus-Laptop");
     ensure!(row.try_get::<String, _>("app_key")? == "msedge.exe");
     ensure!(row.try_get::<String, _>("app_title")? == "Microsoft Edge");
-    ensure!(meta["start_reason"] == "app_change");
-    ensure!(meta["browser_url"] == "https://example.test/path");
-    ensure!(meta["hashes_seen"]["hash-1"] == 1);
+
+    // Assert the WHOLE merge_meta document, not a few keys. Cherry-picking left
+    // merge_hash/latest_exact_ocr_hash swappable, the three capture-gap
+    // counters swappable, and latest_cadence entirely droppable.
+    ensure!(
+        meta == json!({
+            "merge_contract_version": MERGE_CONTRACT_VERSION,
+            "start_reason": "app_change",
+            "last_decision": "start",
+            "merge_hash": "stable-merge-hash",
+            "latest_exact_ocr_hash": "hash-1",
+            "hashes_seen": { "hash-1": 1 },
+            "sample_count": 9,
+            "latest_cadence": {
+                "input_idle_ms": 1000,
+                "frame_stable_for_ms": 1000,
+                "foreground_changed": false,
+                "frame_changed": true,
+                "next_interval_ms": 2000,
+            },
+            "capture_gaps": {
+                "capture_unavailable": 1,
+                "ocr_unavailable": 2,
+                "empty_ocr": 3,
+            },
+            "browser_url": "https://example.test/path",
+        }),
+        "persisted merge_meta drifted: {meta:#}"
+    );
     db.cleanup().await
 }
 
@@ -313,6 +349,10 @@ async fn merge_refreshes_app_title_latest_text_and_domain_metadata() -> Result<(
     );
     merged.sample_count = 2;
     merged.last_decision = MergeDecisionKind::Merge;
+    // Not `Initial`. `write_merge` passes `event.start_reason` through to
+    // `merge_meta`; with an `Initial` fixture that argument could be hardcoded
+    // and every merged row would claim it started for the wrong reason.
+    merged.start_reason = SplitReason::AppChange;
     merged.hash_counts = BTreeMap::from([("hash-0".to_owned(), 1), ("hash-5".to_owned(), 1)]);
 
     writer.write_merge(&event_id, &merged).await?;
@@ -333,12 +373,181 @@ async fn merge_refreshes_app_title_latest_text_and_domain_metadata() -> Result<(
     ensure!(row.try_get::<String, _>("ocr_text_hash")? == "hash-5");
     ensure!(row.try_get::<i32, _>("sample_count")? == 2);
     ensure!(row.try_get::<String, _>("app_title")? == "Microsoft Edge");
-    ensure!(meta["last_decision"] == "merge");
-    ensure!(meta["browser_url"] == "https://example.test/latest");
-    ensure!(meta["hashes_seen"]["hash-0"] == 1);
-    ensure!(meta["hashes_seen"]["hash-5"] == 1);
-    ensure!(meta["capture_gaps"]["empty_ocr"] == 3);
+    ensure!(
+        meta == json!({
+            "merge_contract_version": MERGE_CONTRACT_VERSION,
+            "start_reason": "app_change",
+            "last_decision": "merge",
+            "merge_hash": "stable-merge-hash",
+            "latest_exact_ocr_hash": "hash-5",
+            "hashes_seen": { "hash-0": 1, "hash-5": 1 },
+            "sample_count": 2,
+            "latest_cadence": {
+                "input_idle_ms": 5000,
+                "frame_stable_for_ms": 5000,
+                "foreground_changed": false,
+                "frame_changed": true,
+                "next_interval_ms": 2000,
+            },
+            "capture_gaps": {
+                "capture_unavailable": 1,
+                "ocr_unavailable": 2,
+                "empty_ocr": 3,
+            },
+            "browser_url": "https://example.test/latest",
+        }),
+        "persisted merge_meta drifted: {meta:#}"
+    );
     db.cleanup().await
+}
+
+#[tokio::test]
+async fn preflight_rejects_removal_of_every_authoritative_constraint_and_index() -> Result<()> {
+    // The constraint and index validators compare `count(matched)` against
+    // `count(expected)`. Deleting a row from the expected VALUES list shrinks
+    // BOTH sides, so the check still returns true - the expectation list can be
+    // silently shortened. Only a per-object drift test closes that: if an
+    // object is dropped from the expected list, the test that drops it from the
+    // database stops failing and is itself detected.
+    //
+    // The objects below previously had no dedicated drift test at all.
+    for (mutation, invariant) in [
+        (
+            "ALTER TABLE machines DROP CONSTRAINT machines_slug_format",
+            "machines_slug_format",
+        ),
+        (
+            "ALTER TABLE machines DROP CONSTRAINT machines_next_event_seq_positive",
+            "machines_next_event_seq_positive",
+        ),
+        (
+            "ALTER TABLE apps DROP CONSTRAINT apps_machine_id_fkey",
+            "apps_machine_id_fkey",
+        ),
+        (
+            "ALTER TABLE events DROP CONSTRAINT events_machine_id_fkey",
+            "events_machine_id_fkey",
+        ),
+        (
+            "ALTER TABLE events DROP CONSTRAINT events_app_id_fkey",
+            "events_app_id_fkey",
+        ),
+        (
+            "ALTER TABLE events DROP CONSTRAINT events_machine_seq_uidx",
+            "events_machine_seq_uidx",
+        ),
+        (
+            "ALTER TABLE events DROP CONSTRAINT events_seq_positive",
+            "events_seq_positive",
+        ),
+        (
+            "ALTER TABLE events DROP CONSTRAINT events_window_order",
+            "events_window_order",
+        ),
+        ("DROP INDEX machines_slug_uidx", "machines_slug_uidx"),
+        ("DROP INDEX apps_machine_id_idx", "apps_machine_id_idx"),
+        ("DROP INDEX events_started_at_idx", "events_started_at_idx"),
+        ("DROP INDEX events_app_id_idx", "events_app_id_idx"),
+    ] {
+        assert_preflight_rejects_single_mutation(mutation, invariant).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_app_sightings_preserve_first_seen_and_advance_last_seen() -> Result<()> {
+    // `upsert_app`'s ON CONFLICT clause deliberately refreshes only app_title
+    // and last_seen_at. Nothing read either timestamp back, so adding
+    // `first_seen_at = EXCLUDED.first_seen_at` - which destroys the whole
+    // meaning of "first seen" - passed the entire suite.
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let first = event(0, "notepad.exe", "Notepad", "notes", "first text", None);
+        writer.write_start(&first, SplitReason::Initial).await?;
+
+        let original: (chrono::DateTime<Utc>, chrono::DateTime<Utc>) =
+            sqlx::query_as("SELECT first_seen_at, last_seen_at FROM apps WHERE app_key = $1")
+                .bind("notepad.exe")
+                .fetch_one(&db.pool)
+                .await?;
+
+        // A later sighting of the same app, under a new display title.
+        let later = event(
+            5,
+            "notepad.exe",
+            "Notepad Renamed",
+            "notes",
+            "later text",
+            None,
+        );
+        writer
+            .write_start(&later, SplitReason::WindowTitleChange)
+            .await?;
+
+        let refreshed: (chrono::DateTime<Utc>, chrono::DateTime<Utc>, String) = sqlx::query_as(
+            "SELECT first_seen_at, last_seen_at, app_title FROM apps WHERE app_key = $1",
+        )
+        .bind("notepad.exe")
+        .fetch_one(&db.pool)
+        .await?;
+
+        ensure!(
+            refreshed.0 == original.0,
+            "first_seen_at moved on a repeat sighting: {:?} -> {:?}",
+            original.0,
+            refreshed.0
+        );
+        ensure!(
+            refreshed.1 >= original.1,
+            "last_seen_at went backwards on a repeat sighting"
+        );
+        ensure!(refreshed.2 == "Notepad Renamed", "app_title must refresh");
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn merge_never_reaches_an_event_owned_by_another_machine() -> Result<()> {
+    // `write_merge` scopes its UPDATE with `AND machine_id = $10`. Every other
+    // test uses a single machine, so that clause could be dropped and one
+    // machine's writer would happily overwrite another machine's event row -
+    // silently corrupting rows it does not own. Two machines share the
+    // disposable schema here, exactly as they would share a real database.
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let icarus = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let daedalus =
+            PgEventWriter::connect(&db.scoped_url, "daedalus", "Daedalus-Desktop").await?;
+
+        let owned = event(0, "notepad.exe", "Notepad", "owned", "owned text", None);
+        let icarus_id = icarus.write_start(&owned, SplitReason::Initial).await?;
+        ensure!(icarus_id == "icarus_1");
+
+        let mut intruder = event(5, "msedge.exe", "Edge", "stolen", "stolen text", None);
+        intruder.sample_count = 2;
+
+        let result = daedalus.write_merge(&icarus_id, &intruder).await;
+        ensure!(
+            result.is_err(),
+            "a writer merged into an event belonging to another machine"
+        );
+
+        // Failing is not enough - prove the row is untouched.
+        let row =
+            sqlx::query("SELECT window_title, ocr_text, sample_count FROM events WHERE id = $1")
+                .bind(&icarus_id)
+                .fetch_one(&db.pool)
+                .await?;
+        ensure!(row.try_get::<String, _>("window_title")? == "owned");
+        ensure!(row.try_get::<String, _>("ocr_text")? == "owned text");
+        ensure!(row.try_get::<i32, _>("sample_count")? == 1);
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
 }
 
 #[tokio::test]

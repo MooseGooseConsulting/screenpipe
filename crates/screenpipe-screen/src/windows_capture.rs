@@ -115,7 +115,23 @@ mod session_tests {
 
     #[test]
     fn missing_or_different_active_console_session_is_rejected() {
+        // `(u32::MAX, 1)` is rejected by the session-equality guard alone, so
+        // it does not reach the no-console-session guard at all - that guard
+        // could be deleted outright and this test stayed green. The MAX/MAX
+        // case is the only fixture that isolates it: the session ids match,
+        // so only the sentinel check can reject it.
+        let no_console = validate_interactive_session(u32::MAX, u32::MAX).unwrap_err();
+        assert!(
+            format!("{no_console:#}").contains("no active console session"),
+            "expected the no-console-session guard to reject MAX/MAX, got: {no_console:#}"
+        );
+
+        let mismatched = validate_interactive_session(2, 1).unwrap_err();
+        assert!(
+            format!("{mismatched:#}").contains("not running in the active interactive"),
+            "expected the session-mismatch guard, got: {mismatched:#}"
+        );
+
         assert!(validate_interactive_session(u32::MAX, 1).is_err());
-        assert!(validate_interactive_session(2, 1).is_err());
     }
 }

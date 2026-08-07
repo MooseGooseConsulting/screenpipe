@@ -87,12 +87,31 @@ fn unicode_17_case_pair_remains_distinct_under_unicode_16_hash_contract() {
 
 #[test]
 fn identity_uses_literal_word_five_grams() {
-    let identity = TextIdentity::from_ocr("one two three four five six");
+    // Deliberately unnormalized input: mixed case, tabs, and runs of spaces.
+    // Feeding already-normalized text here let the grams be built from the raw
+    // string instead of the normalized one without any test noticing, which
+    // would silently break scroll-overlap merging the moment OCR returned a
+    // different case or spacing for the same screen - exactly the flicker the
+    // merge contract exists to absorb.
+    let identity = TextIdentity::from_ocr("  One\tTWO   three FOUR five  Six ");
 
     assert_eq!(
         identity.five_grams.into_iter().collect::<Vec<_>>(),
         vec!["one two three four five", "two three four five six"]
     );
+}
+
+#[test]
+fn identity_expands_compatibility_forms_before_case_folding() {
+    // U+3390 SQUARE HZ has no case-fold mapping of its own. Only an NFKC pass
+    // *before* the fold turns it into "Hz" so the "H" can then be lowered.
+    // Fold-then-NFKC yields "Hz", which hashes differently - so this pins the
+    // leading NFKC in the NFKC -> case fold -> NFKC chain, which nothing else
+    // distinguished.
+    let squared = TextIdentity::from_ocr("㎐");
+
+    assert_eq!(squared.normalized, "hz");
+    assert_eq!(squared.exact_hash, TextIdentity::from_ocr("hz").exact_hash);
 }
 
 #[test]

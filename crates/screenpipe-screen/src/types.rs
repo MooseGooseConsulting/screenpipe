@@ -155,14 +155,30 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_changes_when_a_visual_pixel_changes() {
-        // Byte 6 is the red channel of the second BGRA pixel. Do not assert on
-        // byte 7 here - that is the alpha byte, which the fingerprint ignores
-        // on purpose.
-        let before = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
-        let after = TransientFrame::from_bgra(2, 1, 8, vec![1, 2, 3, 4, 5, 6, 9, 8]).unwrap();
+    fn fingerprint_changes_when_any_colour_channel_changes() {
+        // Bytes 4, 5, 6 are the blue, green, and red channels of the second
+        // BGRA pixel. Do not assert on byte 7 - that is alpha, which the
+        // fingerprint ignores on purpose.
+        //
+        // Every channel is probed separately: a fixture that varies only red
+        // leaves the digest free to drop green or blue entirely, and a frame
+        // whose only change was in the dropped channel would then be treated
+        // as unchanged - serving stale cached OCR and holding the cadence at
+        // its stable interval.
+        for (offset, channel) in [(0_usize, "blue"), (1, "green"), (2, "red")] {
+            let baseline = vec![1, 2, 3, 4, 5, 6, 7, 8];
+            let mut changed = baseline.clone();
+            changed[4 + offset] ^= 0xFF;
 
-        assert_ne!(before.fingerprint(), after.fingerprint());
+            let before = TransientFrame::from_bgra(2, 1, 8, baseline).unwrap();
+            let after = TransientFrame::from_bgra(2, 1, 8, changed).unwrap();
+
+            assert_ne!(
+                before.fingerprint(),
+                after.fingerprint(),
+                "the {channel} channel must be inside the fingerprint digest domain"
+            );
+        }
     }
 
     #[test]
