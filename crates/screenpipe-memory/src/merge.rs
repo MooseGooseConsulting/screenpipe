@@ -10,7 +10,41 @@ use crate::text_hash::{TextIdentity, jaccard_overlap, normalize_text};
 /// recorded every distinct OCR hash they ever saw; version 2 events record at
 /// most `MAX_TRACKED_HASHES` and carry an eviction count, so `hashes_seen` is
 /// no longer a complete census and must not be read as one.
-pub const MERGE_CONTRACT_VERSION: u32 = 3;
+///
+/// Bumped to 4 when an event's span and sample count became bounded. Versions
+/// below 4 could hold a row spanning the whole run, so an analysis that reads
+/// `ended_at - started_at` as "how long that activity lasted" is only true from
+/// 4 onward.
+pub const MERGE_CONTRACT_VERSION: u32 = 4;
+
+/// Longest span one event may cover before it is forced to split.
+///
+/// Three of the merge path's four split tests describe a *change*: the app, the
+/// window's idleness, the text. An event whose app never changes, whose window
+/// never goes idle, and whose text keeps overlapping matches none of them and
+/// merges forever. A dashboard, a video player, a clock, a terminal tailing a
+/// log all behave exactly like that, so an unattended week produces one row
+/// spanning the week - with a week-old screen in `ocr_text`, a duration that
+/// describes nothing, and a `sample_count` no reader can act on.
+///
+/// An hour is far above any real activity that a person would call one thing,
+/// and far below the span at which a row stops meaning anything. The split
+/// carries its own reason code, so a reader can tell a forced boundary from an
+/// observed one and never mistake it for a real change of activity.
+pub const MAX_EVENT_DURATION_SECONDS: i64 = 3_600;
+
+/// Most samples one event may absorb before it is forced to split.
+///
+/// Not redundant with `MAX_EVENT_DURATION_SECONDS`, because that ceiling is
+/// measured on the wall clock and this one is not. A clock that stops or steps
+/// backwards - a suspend/resume, an NTP correction, a VM restored from a
+/// snapshot - leaves the duration ceiling unreachable while samples keep
+/// arriving every two seconds. This is the bound that still holds when the
+/// clock does not.
+///
+/// At the fastest cadence an hour is 1,800 samples, so on a healthy clock this
+/// never binds; it exists for the case where the other ceiling cannot.
+pub const MAX_EVENT_SAMPLES: u32 = 4_000;
 
 /// Upper bound on distinct OCR hashes remembered inside one open event.
 ///
@@ -96,6 +130,14 @@ pub enum SplitReason {
     WindowTitleChange,
     IdleGap,
     TextHashChange,
+    /// The open event reached `MAX_EVENT_DURATION_SECONDS`.
+    ///
+    /// Held apart from the observed reasons on purpose: nothing about the
+    /// screen changed here. A reader that treats this boundary as a change of
+    /// activity would be reading the ceiling, not the user.
+    MaxDuration,
+    /// The open event reached `MAX_EVENT_SAMPLES`.
+    MaxSamples,
 }
 
 impl SplitReason {
@@ -106,7 +148,15 @@ impl SplitReason {
             Self::WindowTitleChange => "window_title_change",
             Self::IdleGap => "idle_gap",
             Self::TextHashChange => "text_hash_change",
+            Self::MaxDuration => "max_duration",
+            Self::MaxSamples => "max_samples",
         }
+    }
+
+    /// True when the boundary was forced by a ceiling rather than observed on
+    /// the screen.
+    pub const fn is_forced(self) -> bool {
+        matches!(self, Self::MaxDuration | Self::MaxSamples)
     }
 }
 
@@ -292,6 +342,21 @@ impl Merger {
                 Some(SplitReason::TextHashChange)
             }
         };
+
+        // The ceilings are consulted last, so an observed reason always wins
+        // and a forced boundary is only ever reported when nothing on the
+        // screen explained it. Every check above describes a CHANGE; an event
+        // that never changes matches none of them and would otherwise merge for
+        // the length of the run.
+        let reason = reason.or_else(|| {
+            if (sample.captured_at - open.started_at).num_seconds() >= MAX_EVENT_DURATION_SECONDS {
+                Some(SplitReason::MaxDuration)
+            } else if open.sample_count >= MAX_EVENT_SAMPLES {
+                Some(SplitReason::MaxSamples)
+            } else {
+                None
+            }
+        });
 
         if let Some(reason) = reason {
             return self.start(sample, identity.exact_hash, cadence, capture_gaps, reason);

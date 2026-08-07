@@ -571,3 +571,121 @@ fn event_of(decision: &MergeDecision) -> &screenpipe_memory::OpenEvent {
         MergeDecision::Start { event, .. } | MergeDecision::Merge { event } => event,
     }
 }
+
+#[test]
+fn an_unchanging_window_is_split_once_it_outlives_the_duration_ceiling() {
+    // Every other split test in this file describes a CHANGE - of app, of
+    // idleness, of text. An event whose app never changes, whose window never
+    // goes idle and whose text keeps matching answers none of them and merges
+    // for the length of the run. A dashboard, a video player, a clock, a
+    // terminal tailing a log all behave exactly like this, so an unattended
+    // week produced one row spanning the week: a week-old screen in `ocr_text`,
+    // a duration that describes nothing, and a `sample_count` no reader can act
+    // on.
+    //
+    // The idle gap here is deliberately enormous, so the only thing that can
+    // end this event is the ceiling.
+    let ceiling = screenpipe_memory::MAX_EVENT_DURATION_SECONDS;
+    let mut merger = Merger::new(MergeConfig {
+        idle_gap: Duration::seconds(ceiling * 10),
+        scroll_overlap: 0.35,
+    });
+    let unchanged = "a dashboard nobody is looking at";
+    merger.ingest(sample(0, "chrome.exe", "Dashboard", unchanged));
+
+    // One second inside the ceiling still merges: the bound must not fire early
+    // and fragment ordinary long sessions.
+    let inside = merged(merger.ingest(sample(ceiling - 1, "chrome.exe", "Dashboard", unchanged)));
+    assert_eq!(inside.sample_count, 2);
+    assert_eq!(inside.started_at, at(0));
+
+    let event = started(
+        merger.ingest(sample(ceiling, "chrome.exe", "Dashboard", unchanged)),
+        SplitReason::MaxDuration,
+    );
+
+    assert_eq!(event.started_at, at(ceiling));
+    assert_eq!(event.sample_count, 1);
+    assert!(
+        event.start_reason.is_forced(),
+        "a ceiling boundary must be distinguishable from an observed change"
+    );
+}
+
+#[test]
+fn an_unchanging_window_is_split_once_it_outgrows_the_sample_ceiling() {
+    // The duration ceiling is measured on the wall clock, and the wall clock is
+    // not something an unattended recorder can rely on: a suspend/resume, an
+    // NTP correction, or a VM restored from a snapshot all leave it unreachable
+    // while samples keep arriving. Every sample here shares one timestamp, so
+    // the duration is permanently zero and only the sample ceiling can end the
+    // event - which is exactly the frozen-clock case.
+    let ceiling = screenpipe_memory::MAX_EVENT_SAMPLES;
+    let mut merger = Merger::new(MergeConfig {
+        idle_gap: Duration::seconds(30),
+        scroll_overlap: 0.35,
+    });
+    let unchanged = "the same screen, and a clock that stopped";
+
+    merger.ingest(sample(0, "code.exe", "Frozen", unchanged));
+    for index in 1..ceiling {
+        let event = merged(merger.ingest(sample(0, "code.exe", "Frozen", unchanged)));
+        assert_eq!(
+            event.sample_count,
+            index + 1,
+            "the fixture stopped merging, so it no longer reaches the ceiling"
+        );
+    }
+
+    let event = started(
+        merger.ingest(sample(0, "code.exe", "Frozen", unchanged)),
+        SplitReason::MaxSamples,
+    );
+
+    assert_eq!(event.sample_count, 1);
+    assert!(event.start_reason.is_forced());
+}
+
+#[test]
+fn a_forced_boundary_never_outranks_an_observed_one() {
+    // The ceilings are consulted last on purpose. If they ran first, an event
+    // that reached the ceiling in the same sample that changed app would be
+    // recorded as `max_duration` - blaming the recorder's own bound for a real
+    // change of activity, and hiding the boundary a reader actually wants.
+    let ceiling = screenpipe_memory::MAX_EVENT_DURATION_SECONDS;
+    let mut merger = Merger::new(MergeConfig {
+        idle_gap: Duration::seconds(ceiling * 10),
+        scroll_overlap: 0.35,
+    });
+    merger.ingest(sample(0, "chrome.exe", "Dashboard", "unchanged screen"));
+
+    let event = started(
+        merger.ingest(sample(ceiling, "notepad.exe", "notes", "something else")),
+        SplitReason::AppChange,
+    );
+
+    assert!(!event.start_reason.is_forced());
+}
+
+#[test]
+fn every_split_reason_has_its_own_durable_code() {
+    // These codes are written into `merge_meta.start_reason` and are the only
+    // thing a reader has to tell one boundary from another. Two reasons sharing
+    // a code is silent and durable.
+    let codes = [
+        SplitReason::Initial,
+        SplitReason::AppChange,
+        SplitReason::WindowTitleChange,
+        SplitReason::IdleGap,
+        SplitReason::TextHashChange,
+        SplitReason::MaxDuration,
+        SplitReason::MaxSamples,
+    ]
+    .map(SplitReason::as_code);
+
+    let mut unique = codes.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), codes.len(), "duplicate split reason code");
+    assert!(codes.iter().all(|code| !code.is_empty()));
+}
