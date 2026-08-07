@@ -996,3 +996,117 @@ async fn connect_refuses_an_unsupported_server_before_touching_it() -> Result<()
     .await;
     db.finish(test_result).await
 }
+
+#[tokio::test]
+async fn search_finds_by_words_by_time_and_by_both() -> Result<()> {
+    // The read path. Until it existed this system was write-only: it recorded
+    // continuously and offered no way to ask it anything, which made every
+    // other property of it unverifiable by a person.
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+
+        // Two events an hour apart, with distinct text.
+        let mut old = event(0, "code.exe", "Code", "editor", "merge contract", None);
+        old.latest.readable_text = "reviewing the deterministic merge contract".to_owned();
+        old.started_at = at(0);
+        old.ended_at = at(10);
+        let old_id = writer.write_start(&old, SplitReason::Initial).await?;
+
+        let mut recent = event(20, "chrome.exe", "Chrome", "browser", "release notes", None);
+        recent.latest.readable_text = "reading the postgres release notes".to_owned();
+        recent.started_at = at(50);
+        recent.ended_at = at(59);
+        let recent_id = writer.write_start(&recent, SplitReason::AppChange).await?;
+
+        // 1. Words alone.
+        let by_word = writer
+            .search(&screenpipe_memory::SearchRequest {
+                query: "postgres".to_owned(),
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        ensure!(
+            by_word
+                .iter()
+                .map(|h| h.event_id.as_str())
+                .eq([recent_id.as_str()]),
+            "keyword search returned {:?}",
+            by_word.iter().map(|h| &h.event_id).collect::<Vec<_>>()
+        );
+        ensure!(
+            by_word[0].snippet.contains('['),
+            "a keyword hit must bracket the match: {:?}",
+            by_word[0].snippet
+        );
+
+        // 2. Time alone - the "what was I doing then" question, which has no
+        //    keywords in it at all.
+        let by_time = writer
+            .search(&screenpipe_memory::SearchRequest {
+                query: String::new(),
+                limit: 10,
+                since: Some(at(40)),
+                ..Default::default()
+            })
+            .await?;
+        ensure!(
+            by_time
+                .iter()
+                .map(|h| h.event_id.as_str())
+                .eq([recent_id.as_str()]),
+            "time-only browse returned {:?}",
+            by_time.iter().map(|h| &h.event_id).collect::<Vec<_>>()
+        );
+
+        // 3. The window must actually EXCLUDE. A filter that is accepted and
+        //    ignored is worse than none, because it looks like an answer.
+        let excluded = writer
+            .search(&screenpipe_memory::SearchRequest {
+                query: "postgres".to_owned(),
+                limit: 10,
+                until: Some(at(30)),
+                ..Default::default()
+            })
+            .await?;
+        ensure!(
+            excluded.is_empty(),
+            "the until bound did not exclude a later event: {:?}",
+            excluded.iter().map(|h| &h.event_id).collect::<Vec<_>>()
+        );
+
+        // 4. Both together, selecting the older event.
+        let both = writer
+            .search(&screenpipe_memory::SearchRequest {
+                query: "merge".to_owned(),
+                limit: 10,
+                until: Some(at(30)),
+                ..Default::default()
+            })
+            .await?;
+        ensure!(
+            both.iter()
+                .map(|h| h.event_id.as_str())
+                .eq([old_id.as_str()]),
+            "combined search returned {:?}",
+            both.iter().map(|h| &h.event_id).collect::<Vec<_>>()
+        );
+
+        // 5. A request with neither words nor a window is not a question.
+        ensure!(
+            writer
+                .search(&screenpipe_memory::SearchRequest {
+                    query: "   ".to_owned(),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .await
+                .is_err(),
+            "a blank query with no time window must be refused, not answered with everything"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}

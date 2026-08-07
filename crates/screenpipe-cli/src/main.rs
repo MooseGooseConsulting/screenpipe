@@ -48,10 +48,18 @@ enum Command {
     },
     /// Search recorded screen memory.
     Search {
-        /// Words to look for. Ranked, not literal.
+        /// Words to look for. Ranked, not literal. May be omitted if --since
+        /// or --until is given.
         query: Vec<String>,
         #[arg(long, default_value_t = 10)]
         limit: i64,
+        /// Only events that were still going after this. Accepts `90m`, `4h`,
+        /// `3d`, `today`, `yesterday`, or a date like `2026-08-06`.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only events that had started by this. Same formats as --since.
+        #[arg(long)]
+        until: Option<String>,
     },
     /// Manage the per-user headless service.
     Service {
@@ -84,25 +92,91 @@ async fn main() -> anyhow::Result<()> {
             let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
             run_doctor(&database_url, &machine_slug, &display_name).await
         }
-        Command::Search { query, limit } => {
+        Command::Search {
+            query,
+            limit,
+            since,
+            until,
+        } => {
             let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
-            run_search(&database_url, &query.join(" "), limit).await
+            let request = screenpipe_memory::SearchRequest {
+                query: query.join(" "),
+                limit,
+                since: since.as_deref().map(parse_when).transpose()?,
+                until: until.as_deref().map(parse_when).transpose()?,
+            };
+            run_search(&database_url, &request).await
         }
         Command::Service { action } => run_service_action(action),
     }
 }
 
-async fn run_search(database_url: &str, query: &str, limit: i64) -> Result<()> {
+/// Parse the time expressions a person actually types.
+///
+/// Deliberately small and local. `90m`, `4h`, `3d` are relative to now;
+/// `today` and `yesterday` are local midnights, because that is what those
+/// words mean to someone looking back at their own day; a bare `YYYY-MM-DD` is
+/// local midnight on that date. Everything is converted to UTC at the boundary
+/// so the query never depends on the server's timezone.
+fn parse_when(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    use chrono::{Duration as ChronoDuration, Local, NaiveDate, TimeZone};
+
+    let raw = value.trim().to_ascii_lowercase();
+    let local_midnight = |date: chrono::NaiveDate| -> Result<chrono::DateTime<chrono::Utc>> {
+        let naive = date.and_hms_opt(0, 0, 0).context("build local midnight")?;
+        Ok(Local
+            .from_local_datetime(&naive)
+            .single()
+            .context("ambiguous local midnight (daylight-saving boundary)")?
+            .with_timezone(&chrono::Utc))
+    };
+
+    if raw == "today" {
+        return local_midnight(Local::now().date_naive());
+    }
+    if raw == "yesterday" {
+        return local_midnight(
+            Local::now()
+                .date_naive()
+                .pred_opt()
+                .context("yesterday is out of range")?,
+        );
+    }
+    if let Some(rest) = raw.strip_suffix('m') {
+        let minutes: i64 = rest.parse().context("minutes must be a whole number")?;
+        return Ok(chrono::Utc::now() - ChronoDuration::minutes(minutes));
+    }
+    if let Some(rest) = raw.strip_suffix('h') {
+        let hours: i64 = rest.parse().context("hours must be a whole number")?;
+        return Ok(chrono::Utc::now() - ChronoDuration::hours(hours));
+    }
+    if let Some(rest) = raw.strip_suffix('d') {
+        let days: i64 = rest.parse().context("days must be a whole number")?;
+        return Ok(chrono::Utc::now() - ChronoDuration::days(days));
+    }
+    let date = NaiveDate::parse_from_str(&raw, "%Y-%m-%d").with_context(|| {
+        format!(
+            "could not read {value:?} as a time: try 90m, 4h, 3d, today, yesterday, or 2026-08-06"
+        )
+    })?;
+    local_midnight(date)
+}
+
+async fn run_search(database_url: &str, request: &screenpipe_memory::SearchRequest) -> Result<()> {
     // Connects with the same writer used by `run`, so search is subject to the
     // identical schema and server-version guards. A read path that accepts a
     // database the writer would refuse could show results from a shape nothing
     // else in this system agrees with.
     let writer =
         PgEventWriter::connect(database_url, DEFAULT_MACHINE_SLUG, DEFAULT_DISPLAY_NAME).await?;
-    let hits = writer.search(query, limit).await?;
+    let hits = writer.search(request).await?;
 
     if hits.is_empty() {
-        println!("no matches for {query:?}");
+        if request.query.trim().is_empty() {
+            println!("nothing recorded in that window");
+        } else {
+            println!("no matches for {:?}", request.query);
+        }
         return Ok(());
     }
 
@@ -716,6 +790,75 @@ mod tests {
             failures, 0,
             "gaps must not be counted as failures - the two ceilings differ on purpose"
         );
+    }
+
+    #[test]
+    fn time_expressions_a_person_would_actually_type() {
+        use super::parse_when;
+        use chrono::{Local, TimeZone, Utc};
+
+        let now = Utc::now();
+
+        // Relative windows land in the past, in the right ballpark.
+        let ninety = parse_when("90m").unwrap();
+        let delta = (now - ninety).num_minutes();
+        assert!(
+            (89..=91).contains(&delta),
+            "90m resolved to {delta} minutes ago"
+        );
+        assert!(
+            ((3 * 60 - 1)..=(4 * 60 + 1))
+                .contains(&(now - parse_when("4h").unwrap()).num_minutes())
+        );
+        // Hours, not days: `now` is sampled before parse_when runs, so the
+        // delta is a hair under 3 days and num_days() would floor it to 2.
+        let three_days = (now - parse_when("3d").unwrap()).num_hours();
+        assert!(
+            (71..=72).contains(&three_days),
+            "3d resolved to {three_days} hours ago"
+        );
+
+        // `today` is LOCAL midnight, not UTC midnight. Getting this wrong
+        // silently shifts the window by the timezone offset, which is exactly
+        // the kind of error nobody notices until a search misses.
+        let today = parse_when("today").unwrap();
+        let expected = Local
+            .from_local_datetime(&Local::now().date_naive().and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(today, expected);
+        assert_eq!(
+            (today - parse_when("yesterday").unwrap()).num_hours(),
+            24,
+            "yesterday must be exactly one day before today"
+        );
+
+        // Absolute dates.
+        assert_eq!(
+            parse_when("2026-08-06").unwrap(),
+            Local
+                .from_local_datetime(
+                    &chrono::NaiveDate::from_ymd_opt(2026, 8, 6)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                )
+                .single()
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+
+        // Nonsense must be refused with something a person can act on, not
+        // silently treated as "now" - which would quietly return everything.
+        let error = parse_when("last tuesday").unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("try 90m"),
+            "the error must say what IS accepted: {rendered}"
+        );
+        assert!(parse_when("").is_err());
+        assert!(parse_when("4 hours").is_err());
     }
 
     #[test]

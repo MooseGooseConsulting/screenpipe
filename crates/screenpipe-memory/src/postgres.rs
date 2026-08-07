@@ -574,6 +574,19 @@ mod tests {
     }
 }
 
+/// What to look for, and when.
+///
+/// A time window without keywords is a first-class question - "what was I
+/// doing yesterday afternoon" has no search terms in it - so `query` may be
+/// empty as long as a bound is given.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchRequest {
+    pub query: String,
+    pub limit: i64,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// One search hit, shaped for a human reading a terminal.
 ///
 /// Deliberately does NOT carry `ocr_text`. A search result is displayed, and
@@ -603,28 +616,55 @@ impl PgEventWriter {
     /// Ranking is `ts_rank_cd` over the weighted `search_tsv`, so a match in
     /// the event title outranks one buried in the OCR body - which is the
     /// entire reason the weights exist.
-    pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>> {
-        ensure!(!query.trim().is_empty(), "search query is blank");
+    pub async fn search(&self, request: &SearchRequest) -> Result<Vec<SearchHit>> {
+        let SearchRequest {
+            query,
+            limit,
+            since,
+            until,
+        } = request;
+        let limit = *limit;
+        // A blank query is allowed ONLY with a time window. "What was I doing
+        // yesterday afternoon" is how people actually reach for this, and it
+        // has no keywords in it. A blank query and no window would be "return
+        // everything", which is not a question.
+        ensure!(
+            !query.trim().is_empty() || since.is_some() || until.is_some(),
+            "give some words to search for, a time window, or both"
+        );
         ensure!((1..=200).contains(&limit), "limit must be 1..=200");
+        if let (Some(since), Some(until)) = (since, until) {
+            ensure!(since <= until, "the time window ends before it starts");
+        }
+        let terms = query.trim();
+        let ranked = !terms.is_empty();
 
         let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i32, Option<String>, Option<String>, Option<String>, String)>(
             "SELECT e.id, e.started_at, e.ended_at, e.sample_count, e.title, a.app_title, \
                     e.merge_meta ->> 'browser_url', \
-                    ts_headline('english', \
-                                left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 20000), \
-                                plainto_tsquery('english', $1), \
-                                'StartSel=[, StopSel=], MaxFragments=2, FragmentDelimiter= ... , MaxWords=18, MinWords=6') \
+                    CASE WHEN $4 THEN \
+                        ts_headline('english', \
+                                    left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 20000), \
+                                    plainto_tsquery('english', $1), \
+                                    'StartSel=[, StopSel=], MaxFragments=2, FragmentDelimiter= ... , MaxWords=18, MinWords=6') \
+                    ELSE left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 160) END \
              FROM events e \
              LEFT JOIN apps a ON a.id = e.app_id \
              WHERE e.machine_id = $2 \
-               AND e.search_tsv @@ plainto_tsquery('english', $1) \
-             ORDER BY ts_rank_cd(e.search_tsv, plainto_tsquery('english', $1)) DESC, \
-                      e.started_at DESC \
+               AND (NOT $4 OR e.search_tsv @@ plainto_tsquery('english', $1)) \
+               AND ($5::timestamptz IS NULL OR e.ended_at >= $5) \
+               AND ($6::timestamptz IS NULL OR e.started_at <= $6) \
+             ORDER BY \
+               CASE WHEN $4 THEN ts_rank_cd(e.search_tsv, plainto_tsquery('english', $1)) ELSE 0 END DESC, \
+               e.started_at DESC \
              LIMIT $3",
         )
-        .bind(query)
+        .bind(terms)
         .bind(self.machine_id)
         .bind(limit)
+        .bind(ranked)
+        .bind(*since)
+        .bind(*until)
         .fetch_all(&self.pool)
         .await
         .context("search recorded events")?;
