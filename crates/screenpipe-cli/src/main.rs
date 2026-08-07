@@ -11,9 +11,11 @@ use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
 use crate::service::{ServiceManager, ServiceRoot, ServiceStatus, WindowsTaskScheduler};
 
+mod clipboard_source;
 mod service;
 mod windows_source;
 
+use crate::clipboard_source::ClipboardSampleSource;
 use crate::windows_source::WindowsSampleSource;
 
 const DATABASE_URL_ENV: &str = "SCREEN_MEMORY_DATABASE_URL";
@@ -38,6 +40,11 @@ enum Command {
         machine_slug: String,
         #[arg(long, default_value = DEFAULT_DISPLAY_NAME)]
         display_name: String,
+        /// Turn the clipboard channel off. It is ON by default: copied text is
+        /// recorded as events of kind `clipboard`, except from applications
+        /// that mark their clipboard content as excluded, which are never read.
+        #[arg(long)]
+        no_clipboard: bool,
     },
     /// Check capture, OCR, and PostgreSQL prerequisites.
     Doctor {
@@ -81,9 +88,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             machine_slug,
             display_name,
+            no_clipboard,
         } => {
             let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
-            run_capture(&database_url, &machine_slug, &display_name).await
+            run_capture(&database_url, &machine_slug, &display_name, !no_clipboard).await
         }
         Command::Doctor {
             machine_slug,
@@ -233,6 +241,20 @@ fn default_runner() -> Runner {
     })
 }
 
+/// The clipboard channel's merger.
+///
+/// The same idle gap as the screen channel, on purpose: it is one threshold
+/// describing one thing - how long a silence has to be before what comes after
+/// it is a new activity rather than a continuation. `scroll_overlap` is
+/// carried but never consulted for this kind; a copy is not a scroll.
+fn clipboard_runner() -> Runner {
+    Runner::new(MergeConfig {
+        kind: EventKind::Clipboard,
+        idle_gap: Duration::seconds(IDLE_GAP_SECONDS),
+        scroll_overlap: 0.35,
+    })
+}
+
 async fn run_iteration(
     runner: &mut Runner,
     source: &mut dyn SampleSource,
@@ -241,14 +263,34 @@ async fn run_iteration(
     runner.run_once(source, sink).await
 }
 
-async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str) -> Result<()> {
-    let writer = PgEventWriter::connect(database_url, machine_slug, display_name).await?;
+async fn run_capture(
+    database_url: &str,
+    machine_slug: &str,
+    display_name: &str,
+    clipboard: bool,
+) -> Result<()> {
+    let writer = std::sync::Arc::new(
+        PgEventWriter::connect(database_url, machine_slug, display_name).await?,
+    );
     let mut source = WindowsSampleSource::new();
     let mut runner = default_runner();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut consecutive_failures: u32 = 0;
     let mut consecutive_gaps: u32 = 0;
+    // Its own task, and NOT a third arm of the select below. The select's
+    // losing branches are dropped, so a clipboard arm would cancel a capture
+    // that was mid-flight - throwing away the frame, the OCR pass, and the
+    // observation - every time a copy happened to land first.
+    let _clipboard = clipboard.then(|| {
+        println!("event=clipboard_channel state=on");
+        TaskGuard(tokio::spawn(run_clipboard_channel(std::sync::Arc::clone(
+            &writer,
+        ))))
+    });
+    if !clipboard {
+        println!("event=clipboard_channel state=off");
+    }
     println!("event=runtime_ready machine_slug={machine_slug}");
 
     loop {
@@ -261,7 +303,7 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
             step = record_one_observation(
                 &mut runner,
                 &mut source,
-                &writer,
+                writer.as_ref(),
                 &mut consecutive_failures,
                 &mut consecutive_gaps,
             ) => match step {
@@ -293,6 +335,59 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
     }
 }
 
+/// Stops the task it holds when the run loop leaves, whichever way it leaves.
+///
+/// `run_capture` returns from four places - a signal, two ceilings, and a `?`
+/// on the writer - and a background channel that outlived any one of them
+/// would keep writing events for a run that had already reported itself over.
+struct TaskGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The clipboard channel: its own runner, its own merger, the shared writer.
+///
+/// It has to be its own runner. A `Runner` holds exactly one open event, and
+/// interleaving clipboard captures into the screen runner would make every
+/// copy a boundary in the screen timeline and every screen sample a boundary
+/// in the clipboard timeline - the two kinds would tear each other apart.
+///
+/// # Why this never aborts the process
+///
+/// The screen loop exits on a run of failures so the service wrapper can
+/// restart it from a clean process. This does not: the clipboard is the
+/// secondary channel, and taking down a 24-hour screen recording because
+/// copied text could not be written would cost more than it saves. A failure
+/// here backs off and retries, and says so with the same redacted category the
+/// screen loop uses. Anything serious enough to be permanent - a dead
+/// PostgreSQL, a schema that no longer validates - fails on the screen path
+/// too, and that path does exit.
+async fn run_clipboard_channel(writer: std::sync::Arc<PgEventWriter>) {
+    let mut runner = clipboard_runner();
+    let mut source = ClipboardSampleSource::new();
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        match run_iteration(&mut runner, &mut source, writer.as_ref()).await {
+            Ok(outcome) => {
+                print_run_outcome("clipboard", &outcome);
+                consecutive_failures = 0;
+            }
+            Err(error) => {
+                let category = failure_category(&error);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                println!(
+                    "event=clipboard_error category={category} consecutive={consecutive_failures}"
+                );
+                tokio::time::sleep(failure_backoff(consecutive_failures)).await;
+            }
+        }
+    }
+}
+
 /// One turn of the run loop: take an observation, log it, and decide what the
 /// loop does next.
 ///
@@ -314,7 +409,7 @@ async fn record_one_observation(
 ) -> LoopStep {
     match run_iteration(runner, source, sink).await {
         Ok(outcome) => {
-            print_run_outcome(&outcome);
+            print_run_outcome("screen", &outcome);
             let kind = match &outcome {
                 RunOutcome::GapRecorded {
                     gap: screenpipe_memory::CaptureGap::DesktopLocked,
@@ -490,19 +585,25 @@ fn failure_category(error: &anyhow::Error) -> &'static str {
     }
 }
 
-fn print_run_outcome(outcome: &RunOutcome) {
+/// The agent log's record of one persisted observation.
+///
+/// `channel` is the event kind's code, so `screen_started` keeps meaning
+/// exactly what it meant - the service wrapper's log and the seam runbook both
+/// read that line - and clipboard events are distinguishable from it at a
+/// glance rather than by inspecting the id.
+fn print_run_outcome(channel: &str, outcome: &RunOutcome) {
     match outcome {
         RunOutcome::GapRecorded { gap } => {
             println!("event=capture_gap gap={}", gap.as_code());
         }
         RunOutcome::Started { event_id, reason } => {
             println!(
-                "event=screen_started event_id={event_id} reason={}",
+                "event={channel}_started event_id={event_id} reason={}",
                 reason.as_code()
             );
         }
         RunOutcome::Merged { event_id } => {
-            println!("event=screen_merged event_id={event_id}");
+            println!("event={channel}_merged event_id={event_id}");
         }
     }
 }
@@ -800,17 +901,35 @@ mod tests {
     }
 
     #[test]
-    fn run_command_defaults_to_the_icarus_machine_identity() {
+    fn run_command_defaults_to_the_icarus_machine_identity_with_the_clipboard_on() {
         let cli = Cli::try_parse_from(["screenpipe", "run"]).unwrap();
         let Command::Run {
             machine_slug,
             display_name,
+            no_clipboard,
         } = cli.command
         else {
             panic!("run command expected");
         };
         assert_eq!(machine_slug, "icarus");
         assert_eq!(display_name, "Icarus-Laptop");
+        // The default is ON, and it is asserted here rather than only in the
+        // help text: the flag inverts, so a default that flipped would be
+        // invisible to anyone reading `--no-clipboard` and would silently stop
+        // recording a whole channel.
+        assert!(
+            !no_clipboard,
+            "the clipboard channel must be on unless it is turned off"
+        );
+    }
+
+    #[test]
+    fn the_clipboard_channel_can_be_turned_off() {
+        let cli = Cli::try_parse_from(["screenpipe", "run", "--no-clipboard"]).unwrap();
+        let Command::Run { no_clipboard, .. } = cli.command else {
+            panic!("run command expected");
+        };
+        assert!(no_clipboard);
     }
 
     #[tokio::test]

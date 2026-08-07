@@ -27,6 +27,21 @@ fn run_help_exposes_icarus_identity_defaults() {
 }
 
 #[test]
+fn run_help_says_the_clipboard_channel_is_on_and_how_to_turn_it_off() {
+    // The flag inverts, so the help text is the only place the DEFAULT is
+    // visible to the person deciding whether to run this on their machine.
+    // "clipboard text is recorded unless you say otherwise" is a consent
+    // question, and it must not be discoverable only by reading the source.
+    Command::cargo_bin("screenpipe")
+        .unwrap()
+        .args(["run", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-clipboard"))
+        .stdout(predicate::str::contains("ON by default"));
+}
+
+#[test]
 fn run_requires_only_the_named_injected_database_variable() {
     Command::cargo_bin("screenpipe")
         .unwrap()
