@@ -2394,7 +2394,9 @@ name = "screenpipe-screen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "image",
+ "screenpipe-memory",
  "serde",
  "sha2",
  "tokio",

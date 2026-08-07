@@ -31,4 +31,6 @@ windows = { version = "0.58", features = [
 ] }
 
 [dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+screenpipe-memory = { path = "../screenpipe-memory" }
 tokio = { version = "1", features = ["macros"] }
