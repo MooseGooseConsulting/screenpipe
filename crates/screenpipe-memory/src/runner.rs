@@ -188,6 +188,7 @@ mod tests {
             ocr_text: ocr_text.to_owned(),
             readable_text: ocr_text.to_owned(),
             browser_url: None,
+            observed_until: None,
             audio: None,
         }
     }

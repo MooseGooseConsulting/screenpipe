@@ -581,9 +581,6 @@ fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
             // whisper reports.
             "avg_no_speech_permille": audio.avg_no_speech_permille,
             "closed_by": audio.closed_by,
-            // The utterance's real length. `ended_at - started_at` is zero on a
-            // single-utterance row; see AudioMeta for why.
-            "duration_ms": audio.duration_ms,
         });
     }
 

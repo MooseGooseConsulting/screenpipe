@@ -271,6 +271,7 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
             ocr_text: ocr_text.clone(),
             readable_text: ocr_text.clone(),
             browser_url,
+            observed_until: None,
             audio: None,
         };
 

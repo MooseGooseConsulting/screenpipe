@@ -150,6 +150,7 @@ impl<Ops: ClipboardOps> Source<Ops> {
                 readable_text: text.clone(),
                 ocr_text: text,
                 browser_url: None,
+                observed_until: None,
                 audio: None,
             },
             // Reported, not computed. `CadencePolicy` answers a question about

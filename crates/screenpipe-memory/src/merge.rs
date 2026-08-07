@@ -398,7 +398,7 @@ impl Merger {
         }
 
         let open = self.open.as_mut().expect("open event checked above");
-        open.ended_at = sample.captured_at;
+        open.ended_at = sample.observed_until();
         open.latest = sample;
         open.latest_exact_ocr_hash = identity.exact_hash.clone();
         open.last_decision = MergeDecisionKind::Merge;
@@ -529,7 +529,12 @@ impl Merger {
             kind: self.config.kind,
             merge_contract_version: MERGE_CONTRACT_VERSION,
             started_at: sample.captured_at,
-            ended_at: sample.captured_at,
+            // The observation's END, which is its start for everything that
+            // happens at an instant and genuinely later for an utterance. This
+            // is what the idle-gap test above measures FROM, so getting it
+            // wrong would fold the length of one utterance into the silence
+            // after it.
+            ended_at: sample.observed_until(),
             latest: sample,
             latest_exact_ocr_hash: merge_hash.clone(),
             merge_hash,

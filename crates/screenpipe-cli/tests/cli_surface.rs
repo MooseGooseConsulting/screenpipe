@@ -140,3 +140,22 @@ fn a_default_build_refuses_to_record_audio_and_says_how_to_get_one_that_can() {
         .failure()
         .stderr(predicate::str::contains("--features audio"));
 }
+
+#[test]
+#[cfg(not(feature = "audio"))]
+fn a_default_build_refuses_to_install_a_service_it_cannot_run() {
+    // Uninstall and status stay open in every build - see above - but install
+    // is different: it would register a scheduled task running `audio run`
+    // from a binary that refuses `audio run`, so the job would do nothing but
+    // fail and restart every ten seconds with no visible symptom but a log
+    // nobody has a reason to read.
+    Command::cargo_bin("screenpipe")
+        .unwrap()
+        .args(["audio", "service", "install"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--features audio"))
+        .stderr(predicate::str::contains(
+            "Uninstall and status work from any build",
+        ));
+}

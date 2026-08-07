@@ -299,6 +299,12 @@ fn transcribe_loop(
             ocr_text: transcript.raw,
             readable_text: transcript.text,
             browser_url: None,
+            // An utterance occupies a span, and this is the only channel
+            // where that is true. Without it the merger measures the silence
+            // between two turns from the START of the first one, so a long
+            // sentence followed by a short pause reads as a long gap and
+            // splits.
+            observed_until: Some(utterance.ended_at),
             audio: Some(AudioMeta {
                 channel: meta.channel,
                 device_category: meta.device_category,
@@ -309,7 +315,6 @@ fn transcribe_loop(
                 language: meta.language.clone(),
                 avg_no_speech_permille: transcript.avg_no_speech_prob.map(to_permille),
                 closed_by: utterance.closed_by.as_code(),
-                duration_ms: utterance.duration().num_milliseconds(),
             }),
         };
 

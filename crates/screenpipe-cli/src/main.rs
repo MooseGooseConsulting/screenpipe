@@ -205,6 +205,19 @@ async fn main() -> anyhow::Result<()> {
 /// property for this particular channel.
 async fn run_audio_action(action: AudioAction) -> Result<()> {
     match action {
+        // Install is the exception to the exception. Registering a task that
+        // runs `audio run` from a binary that refuses `audio run` produces a
+        // scheduled job doing nothing but failing and restarting every ten
+        // seconds, forever, and the operator's only evidence is a log they have
+        // no reason to read. Uninstall and status stay open in every build.
+        #[cfg(not(feature = "audio"))]
+        AudioAction::Service {
+            action: ServiceAction::Install,
+        } => Err(anyhow::anyhow!(
+            "this build cannot record audio, so installing its service would register a task \
+             that only fails and restarts. Rebuild with `cargo build --release --features audio` \
+             and install from that binary. Uninstall and status work from any build."
+        )),
         AudioAction::Service { action } => run_service_action(action, ServiceKind::Audio),
         #[cfg(feature = "audio")]
         AudioAction::Run {
@@ -1131,6 +1144,7 @@ mod tests {
                         ocr_text: "an unchanged idle window".to_owned(),
                         readable_text: "an unchanged idle window".to_owned(),
                         browser_url: None,
+                        observed_until: None,
                         audio: None,
                     },
                     cadence: idle_cadence,
@@ -1210,6 +1224,7 @@ mod tests {
                 ocr_text: "an observation worth not losing".to_owned(),
                 readable_text: "an observation worth not losing".to_owned(),
                 browser_url: None,
+                observed_until: None,
                 audio: None,
             },
             cadence: CadenceRecord::from_input(CadenceInput {
@@ -1327,6 +1342,7 @@ mod tests {
                 ocr_text: "runner wiring sample".to_owned(),
                 readable_text: "runner wiring sample".to_owned(),
                 browser_url: None,
+                observed_until: None,
                 audio: None,
             },
             cadence,

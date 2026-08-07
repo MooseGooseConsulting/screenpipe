@@ -11,9 +11,32 @@ pub struct ObservationSample {
     pub ocr_text: String,
     pub readable_text: String,
     pub browser_url: Option<String>,
+    /// When the observation STOPPED, if it occupied a span rather than an
+    /// instant. `None` means it was an instant and `captured_at` is both ends.
+    ///
+    /// Screen and clipboard samples are instants: a frame is read at a moment,
+    /// a copy happens at a moment. An utterance is not - it runs for seconds,
+    /// and the merger has to know that. Its idle-gap test measures
+    /// `next.captured_at - open.ended_at`, so without this the "silence"
+    /// between two utterances would include the length of the first one: a
+    /// 30-second utterance followed by 35 seconds of quiet would read as a
+    /// 65-second gap and split at a 60-second threshold that 35 seconds of
+    /// silence never crossed.
+    ///
+    /// It also makes the durable window true. With it, `ended_at - started_at`
+    /// is how long the speech actually ran.
+    pub observed_until: Option<DateTime<Utc>>,
     /// Set only by the audio channel. `None` on every screen and clipboard
     /// sample, and the writer emits nothing for it then.
     pub audio: Option<AudioMeta>,
+}
+
+impl ObservationSample {
+    /// The instant this observation stopped: its own end if it had one, and
+    /// otherwise the instant it was captured.
+    pub fn observed_until(&self) -> DateTime<Utc> {
+        self.observed_until.unwrap_or(self.captured_at)
+    }
 }
 
 /// What produced an audio observation, and how much to believe it.
@@ -50,17 +73,6 @@ pub struct AudioMeta {
     pub avg_no_speech_permille: Option<u16>,
     /// Why the utterance ended: `silence`, `max_length`, or `stream_closed`.
     pub closed_by: &'static str,
-    /// How long the transcribed audio ran.
-    ///
-    /// Here rather than in `events.ended_at` because the merger builds an
-    /// event's window out of sample TIMESTAMPS - one per observation - and an
-    /// utterance is the only kind of observation this system has that occupies
-    /// a span rather than an instant. A single-utterance audio row therefore
-    /// has `started_at == ended_at`, both being when the speech began, and this
-    /// is where its actual length lives. Widening the event window properly
-    /// would mean teaching the merger about durations, which is a change to
-    /// every channel for the benefit of one.
-    pub duration_ms: i64,
 }
 
 impl fmt::Debug for ObservationSample {

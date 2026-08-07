@@ -353,6 +353,7 @@ fn event(
             ocr_text: text.to_owned(),
             readable_text: format!("readable {text}"),
             browser_url: browser_url.map(str::to_owned),
+            observed_until: None,
             audio: None,
         },
         merge_hash: "stable-merge-hash".to_owned(),
@@ -1264,6 +1265,7 @@ fn clipboard_read(second: u32, text: &str) -> screenpipe_memory::SampleRead {
             ocr_text: text.to_owned(),
             readable_text: text.to_owned(),
             browser_url: None,
+            observed_until: None,
             audio: None,
         },
         cadence: CadenceRecord {
@@ -1456,7 +1458,6 @@ async fn an_audio_event_persists_its_kind_its_title_and_its_audio_metadata() -> 
             language: Some("en".to_owned()),
             avg_no_speech_permille: Some(30),
             closed_by: "silence",
-            duration_ms: 4_200,
         });
 
         let id = writer.write_start(&utterance, SplitReason::Initial).await?;
@@ -1492,7 +1493,6 @@ async fn an_audio_event_persists_its_kind_its_title_and_its_audio_metadata() -> 
                     "language": "en",
                     "avg_no_speech_permille": 30,
                     "closed_by": "silence",
-                    "duration_ms": 4_200,
                 }),
             "persisted audio merge_meta drifted: {meta:#}"
         );

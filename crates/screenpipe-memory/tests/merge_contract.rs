@@ -47,6 +47,7 @@ fn sample(second: i64, app_key: &str, window_title: &str, ocr_text: &str) -> Obs
         ocr_text: ocr_text.to_owned(),
         readable_text: ocr_text.to_owned(),
         browser_url: None,
+        observed_until: None,
         audio: None,
     }
 }
@@ -719,6 +720,7 @@ fn clipboard_sample(second: i64, text: &str) -> ObservationSample {
         ocr_text: text.to_owned(),
         readable_text: text.to_owned(),
         browser_url: None,
+        observed_until: None,
         audio: None,
     }
 }
@@ -884,8 +886,14 @@ fn a_clipboard_event_is_closed_by_the_shared_idle_gap() {
 /// real source worth naming - which of the two channels heard it - and naming
 /// it is what gives the event a title a person can recognise.
 fn audio_sample(second: i64, transcript: &str) -> ObservationSample {
+    audio_sample_lasting(second, 0, transcript)
+}
+
+/// An utterance that ran for `seconds` after it started.
+fn audio_sample_lasting(second: i64, seconds: i64, transcript: &str) -> ObservationSample {
     ObservationSample {
         captured_at: at(second),
+        observed_until: Some(at(second + seconds)),
         app_key: "audio:loopback".to_owned(),
         app_title: "System Audio".to_owned(),
         window_title: String::new(),
@@ -902,7 +910,6 @@ fn audio_sample(second: i64, transcript: &str) -> ObservationSample {
             language: Some("en".to_owned()),
             avg_no_speech_permille: Some(30),
             closed_by: "silence",
-            duration_ms: 4_200,
         }),
     }
 }
@@ -1020,4 +1027,69 @@ fn a_screen_sample_carries_no_audio_metadata_at_all() {
     );
 
     assert!(event.latest.audio.is_none());
+}
+
+#[test]
+fn the_silence_is_measured_from_the_end_of_the_previous_utterance() {
+    // The defect this pins: the merger measures `next.captured_at -
+    // open.ended_at`, and an utterance's timestamp is when the speech STARTED.
+    // Without the observation's end, a long sentence followed by a short pause
+    // reads as one long gap - the sentence's own length folded into the
+    // silence after it - and splits at a threshold the silence never crossed.
+    let mut merger = audio_merger();
+    let long_utterance = TEST_IDLE_GAP_SECONDS - 5;
+    started(
+        merger.ingest(audio_sample_lasting(0, long_utterance, "a long sentence")),
+        SplitReason::Initial,
+    );
+
+    // Speech resumes 10s after the previous turn ENDED. Total distance from its
+    // start is long_utterance + 10, comfortably over the gap - which is exactly
+    // what would have split it.
+    let next_start = long_utterance + 10;
+    assert!(
+        next_start > TEST_IDLE_GAP_SECONDS,
+        "the fixture must be one the old arithmetic would have split"
+    );
+    let event = started(
+        merger.ingest(audio_sample_lasting(next_start, 2, "a different sentence")),
+        SplitReason::TextHashChange,
+    );
+
+    assert_eq!(
+        event.start_reason,
+        SplitReason::TextHashChange,
+        "ten seconds of silence must not read as an idle gap"
+    );
+}
+
+#[test]
+fn an_audio_events_window_covers_the_speech_it_holds() {
+    // `ended_at - started_at` is the durable answer to "how long did this run",
+    // and for an instant-shaped observation it is zero. An utterance is not an
+    // instant.
+    let mut merger = audio_merger();
+
+    let event = started(
+        merger.ingest(audio_sample_lasting(0, 7, "seven seconds of speech")),
+        SplitReason::Initial,
+    );
+
+    assert_eq!(event.started_at, at(0));
+    assert_eq!(event.ended_at, at(7));
+}
+
+#[test]
+fn a_screen_events_window_is_still_the_instant_it_was_sampled() {
+    // The span only exists for observations that have one. Nothing about the
+    // screen channel's windows may move.
+    let mut merger = merger();
+
+    let event = started(
+        merger.ingest(sample(0, "notepad.exe", "notes", "ordinary screen text")),
+        SplitReason::Initial,
+    );
+
+    assert_eq!(event.started_at, event.ended_at);
+    assert_eq!(event.ended_at, at(0));
 }
