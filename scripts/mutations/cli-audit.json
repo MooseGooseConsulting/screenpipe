@@ -1,0 +1,110 @@
+[
+  {
+    "id": "stop-script-owns-no-process",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "                [string]::Equals(\n                    $_.ExecutablePath,\n                    $env:SCREENPIPE_SERVICE_BINARY,\n                    [System.StringComparison]::OrdinalIgnoreCase\n                )",
+    "replace": "                $false",
+    "package": "screenpipe-cli",
+    "claim": "the stop script terminates exactly the installed binary's process and nothing else",
+    "note": "predicted survivor - stop_script_does_not_terminate_a_decoy_that_only_mentions_the_wrapper_path is a pure negative control, so a matcher that owns nothing satisfies it"
+  },
+  {
+    "id": "stop-script-prefix-matches-instead-of-exact",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "                [string]::Equals(\n                    $_.ExecutablePath,\n                    $env:SCREENPIPE_SERVICE_BINARY,\n                    [System.StringComparison]::OrdinalIgnoreCase\n                )",
+    "replace": "                $env:SCREENPIPE_SERVICE_BINARY -and $_.ExecutablePath -like \"$env:SCREENPIPE_SERVICE_BINARY*\"",
+    "package": "screenpipe-cli",
+    "claim": "the stop script matches the installed binary path exactly, never as a prefix",
+    "note": "predicted survivor - the only stop-script test asserts an unrelated powershell.exe decoy is spared, and powershell.exe does not share the binary path prefix either"
+  },
+  {
+    "id": "service-root-resolves-roaming-not-local",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "    use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};\n\n    let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None) }",
+    "replace": "    use windows::Win32::UI::Shell::{FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};\n\n    let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, None) }",
+    "package": "screenpipe-cli",
+    "claim": "the service root resolves to the Local known folder",
+    "note": "predicted survivor - current_user_service_root_ignores_localappdata_environment_override only asserts the resolved root is NOT the LOCALAPPDATA override, which Roaming also satisfies"
+  },
+  {
+    "id": "install-script-registers-highest-run-level",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "-LogonType Interactive -RunLevel Limited",
+    "replace": "-LogonType Interactive -RunLevel Highest",
+    "package": "screenpipe-cli",
+    "claim": "the registered task runs least-privilege",
+    "note": "predicted survivor - service_spec_targets_the_interactive_user_task asserts the Rust TaskRunLevel::Limited value, never the PowerShell text that is actually registered"
+  },
+  {
+    "id": "install-script-triggers-at-startup-not-logon",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "New-ScheduledTaskTrigger -AtLogOn -User $identity",
+    "replace": "New-ScheduledTaskTrigger -AtStartup",
+    "package": "screenpipe-cli",
+    "claim": "the registered task starts at user logon",
+    "note": "predicted survivor - task_scheduler_scripts_have_no_powershell_parse_errors only parses the script, and ParseInput does not resolve cmdlet parameter sets"
+  },
+  {
+    "id": "wrapper-path-apostrophe-escaping-deleted",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "let escaped_agent = binary_path.to_string_lossy().replace(''', \"''\");",
+    "replace": "let escaped_agent = binary_path.to_string_lossy().into_owned();",
+    "package": "screenpipe-cli",
+    "claim": "a path containing an apostrophe still produces a valid wrapper",
+    "note": "predicted survivor - every wrapper test uses C:\\Users\\pmacl\\AppData\\Local, so generated_wrapper_has_no_powershell_parse_errors never feeds the escaper a quote"
+  },
+  {
+    "id": "status-parser-accepts-empty-task-state",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "if state.is_empty() || fields.next().is_some() {",
+    "replace": "if fields.next().is_some() {",
+    "package": "screenpipe-cli",
+    "claim": "malformed scheduler output is rejected rather than silently becoming an empty state",
+    "note": "predicted survivor - scheduler_status_parser_rejects_ambiguous_or_malformed_output uses \"\", \"Ready\", \"Ready|maybe\", \"Ready|False|extra\", all of which still fail on the process field or the field count; \"|False\" is never tried"
+  },
+  {
+    "id": "reinstall-writes-wrapper-before-stopping",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "        self.scheduler\n            .stop(&spec)\n            .context(\"stop existing service task and process tree\")?;",
+    "replace": "        fs::create_dir_all(\n            spec.binary_path\n                .parent()\n                .context(\"service binary path has no parent\")?,\n        )\n        .context(\"create service binary directory\")?;\n        replace_file_contents(&spec, &spec.wrapper_path, spec.wrapper_contents.as_bytes())\n            .context(\"write service wrapper\")?;\n        self.scheduler\n            .stop(&spec)\n            .context(\"stop existing service task and process tree\")?;",
+    "package": "screenpipe-cli",
+    "claim": "a failed stop performs NO filesystem mutation",
+    "note": "predicted survivor - stop_failure_prevents_reinstall_from_mutating_the_installed_binary only re-reads the binary, so a wrapper (and directory) written before the failing stop goes unobserved"
+  },
+  {
+    "id": "browser-app-key-drops-edge",
+    "file": "crates/screenpipe-cli/src/windows_source.rs",
+    "find": "\"chrome.exe\" | \"msedge.exe\"",
+    "replace": "\"chrome.exe\"",
+    "package": "screenpipe-cli",
+    "claim": "Edge is a supported browser for URL capture",
+    "note": "predicted survivor - chrome_url_is_attached_and_unavailable_url_is_none uses chrome.exe and non_browser_sample_never_crosses_browser_url_boundary uses notepad.exe; no test ever presents msedge.exe"
+  },
+  {
+    "id": "browser-app-key-match-becomes-case-sensitive",
+    "file": "crates/screenpipe-cli/src/windows_source.rs",
+    "find": "metadata.app_key.to_ascii_lowercase().as_str(),",
+    "replace": "metadata.app_key.as_str(),",
+    "package": "screenpipe-cli",
+    "claim": "app-key matching for browsers is case-insensitive",
+    "note": "predicted survivor - every browser test spells the app key lowercase (\"chrome.exe\"), so a case-sensitive match still hits"
+  },
+  {
+    "id": "idle-gap-margin-collapses-to-one-second",
+    "file": "crates/screenpipe-cli/src/main.rs",
+    "find": "const IDLE_GAP_SECONDS: i64 = MAX_CADENCE_INTERVAL_SECONDS * 2;",
+    "replace": "const IDLE_GAP_SECONDS: i64 = MAX_CADENCE_INTERVAL_SECONDS + 1;",
+    "package": "screenpipe-cli",
+    "claim": "the idle gap keeps a real margin above the slowest cadence",
+    "note": "predicted survivor - idle_gap_stays_above_the_slowest_cadence_interval asserts only a strict `>`, which +1 satisfies while destroying the margin the doc comment claims"
+  },
+  {
+    "id": "windows-task-scheduler-status-is-fabricated",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "        parse_status_output(&output)\n",
+    "replace": "        let _ = parse_status_output(&output);\n        Ok(ServiceStatus {\n            task_state: TaskState::Ready,\n            process_running: true,\n        })\n",
+    "package": "screenpipe-cli",
+    "claim": "`service status` reports the real task/process state",
+    "note": "predicted survivor - service_status_reads_the_native_task_and_process_state only greps stdout for \"task=\" and \"process=\", which a hardcoded ready/running answer prints just as well"
+  }
+]

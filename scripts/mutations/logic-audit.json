@@ -1,0 +1,106 @@
+[
+  {
+    "id": "merge-scroll-threshold-has-no-lower-bound",
+    "file": "crates/screenpipe-memory/src/merge.rs",
+    "find": ">= self.config.scroll_overlap",
+    "replace": ">= self.config.scroll_overlap * 0.001",
+    "package": "screenpipe-memory",
+    "claim": "the scroll-overlap threshold is the value in MergeConfig, pinned from below"
+  },
+  {
+    "id": "merge-latest-exact-ocr-hash-never-refreshed",
+    "file": "crates/screenpipe-memory/src/merge.rs",
+    "find": "        open.latest_exact_ocr_hash = identity.exact_hash.clone();\n",
+    "replace": "",
+    "package": "screenpipe-memory",
+    "claim": "a merged event carries the newest sample's exact OCR hash, not the first sample's"
+  },
+  {
+    "id": "merge-last-decision-never-set",
+    "file": "crates/screenpipe-memory/src/merge.rs",
+    "find": "        open.last_decision = MergeDecisionKind::Merge;\n",
+    "replace": "",
+    "package": "screenpipe-memory",
+    "claim": "a merged event records that its last decision was a merge"
+  },
+  {
+    "id": "merge-latest-cadence-never-set",
+    "file": "crates/screenpipe-memory/src/merge.rs",
+    "find": "        open.latest_cadence = cadence;\n",
+    "replace": "",
+    "package": "screenpipe-memory",
+    "claim": "a merged event records the cadence of its newest sample"
+  },
+  {
+    "id": "merge-start-reason-hardcoded",
+    "file": "crates/screenpipe-memory/src/merge.rs",
+    "find": "            start_reason: reason,",
+    "replace": "            start_reason: SplitReason::Initial,",
+    "package": "screenpipe-memory",
+    "claim": "the stored start_reason is the reason the split actually fired for"
+  },
+  {
+    "id": "cadence-or-becomes-xor",
+    "file": "crates/screenpipe-memory/src/cadence.rs",
+    "find": "if input.foreground_changed || input.frame_changed {",
+    "replace": "if input.foreground_changed != input.frame_changed {",
+    "package": "screenpipe-memory",
+    "claim": "a change in EITHER foreground or frame forces the fast cadence, including both at once"
+  },
+  {
+    "id": "cadence-record-ignores-policy",
+    "file": "crates/screenpipe-memory/src/cadence.rs",
+    "find": "            next_interval: CadencePolicy::next_interval(input),",
+    "replace": "            next_interval: Duration::zero(),",
+    "package": "screenpipe-memory",
+    "claim": "CadenceRecord::from_input actually applies the cadence policy"
+  },
+  {
+    "id": "texthash-leading-nfkc-deleted",
+    "file": "crates/screenpipe-memory/src/text_hash.rs",
+    "find": "    text.nfkc()\n        .default_case_fold()",
+    "replace": "    text.chars()\n        .default_case_fold()",
+    "package": "screenpipe-memory",
+    "claim": "OCR identity is NFKC -> case fold -> NFKC; the leading NFKC is required"
+  },
+  {
+    "id": "texthash-grams-from-raw-text",
+    "file": "crates/screenpipe-memory/src/text_hash.rs",
+    "find": "let words = normalized.split_whitespace().collect::<Vec<_>>();",
+    "replace": "let words = text.split_whitespace().collect::<Vec<_>>();",
+    "package": "screenpipe-memory",
+    "claim": "five-grams are built from normalized text, so case and whitespace flicker cannot break scroll overlap"
+  },
+  {
+    "id": "fingerprint-drops-green-channel",
+    "file": "crates/screenpipe-screen/src/types.rs",
+    "find": "digest.update(&pixel[..3]);",
+    "replace": "digest.update(&[pixel[0], pixel[2]]);",
+    "package": "screenpipe-screen",
+    "claim": "the frame fingerprint digests every colour channel, so any visual change forces re-OCR"
+  },
+  {
+    "id": "capture-no-console-session-guard-deleted",
+    "file": "crates/screenpipe-screen/src/windows_capture.rs",
+    "find": "    ensure!(\n        active_session_id != u32::MAX,\n        \"Windows has no active console session\"\n    );\n",
+    "replace": "",
+    "package": "screenpipe-screen",
+    "claim": "a machine with no active console session is rejected before capture"
+  },
+  {
+    "id": "browserurl-identity-check-deleted-select",
+    "file": "crates/screenpipe-screen/src/browser_url.rs",
+    "find": "            || !looks_like_address_bar(element)\n",
+    "replace": "",
+    "package": "screenpipe-screen",
+    "claim": "only the trusted address-bar element is read, not any URL-valued edit in the browser chrome"
+  },
+  {
+    "id": "browserurl-identity-check-deleted-provenance",
+    "file": "crates/screenpipe-screen/src/browser_url.rs",
+    "find": "        || !looks_like_address_bar(&snapshot)\n",
+    "replace": "",
+    "package": "screenpipe-screen",
+    "claim": "the UIA Value pattern is only read for the trusted address bar, never for arbitrary chrome edits"
+  }
+]

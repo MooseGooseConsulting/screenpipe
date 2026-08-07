@@ -1,0 +1,38 @@
+[
+  {
+    "id": "ocr-returns-nothing",
+    "file": "crates/screenpipe-screen/src/windows_ocr.rs",
+    "find": "        Ok(result.Text()?.to_string())",
+    "replace": "        let _ = result;\n        Ok(String::new())",
+    "package": "screenpipe-screen",
+    "test": "capture_content",
+    "claim": "OCR returns the text actually drawn on the captured window"
+  },
+  {
+    "id": "ocr-returns-unrelated-text",
+    "file": "crates/screenpipe-screen/src/windows_ocr.rs",
+    "find": "        Ok(result.Text()?.to_string())",
+    "replace": "        let _ = result;\n        Ok(\"lorem ipsum dolor sit amet\".to_string())",
+    "package": "screenpipe-screen",
+    "test": "capture_content",
+    "claim": "OCR text corresponds to the real screen, not a fabricated string"
+  },
+  {
+    "id": "capture-transposes-frame-dimensions",
+    "file": "crates/screenpipe-screen/src/windows_capture.rs",
+    "find": "    let width = image.width();\n    let height = image.height();",
+    "replace": "    let width = image.height();\n    let height = image.width();",
+    "package": "screenpipe-screen",
+    "test": "capture_content",
+    "claim": "the captured frame keeps the window's real width and height, untransposed"
+  },
+  {
+    "id": "attribution-uses-the-capturing-process",
+    "file": "crates/screenpipe-screen/src/windows_metadata.rs",
+    "find": "    let process_path = process_image_path(process_id)?;",
+    "replace": "    let _ = process_id;\n    let process_path = process_image_path(std::process::id())?;",
+    "package": "screenpipe-screen",
+    "test": "capture_content",
+    "claim": "app attribution names the foreground window's process, not whichever process captured it"
+  }
+]

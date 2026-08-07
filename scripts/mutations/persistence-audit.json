@@ -1,0 +1,100 @@
+[
+  {
+    "id": "start-binds-started_at-for-both-window-ends",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "        .bind(event.started_at)\n        .bind(event.ended_at)",
+    "replace": "        .bind(event.started_at)\n        .bind(event.started_at)",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "claim": "a started event persists its real start and end instants, not the same value twice"
+  },
+  {
+    "id": "start-sample-count-hardcoded-to-one",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "        .bind(sample_count)\n        .bind(merge_meta)\n        .execute(&mut *transaction)\n        .await\n        .context(\"insert allocated screen event\")?;",
+    "replace": "        .bind(1_i32)\n        .bind(merge_meta)\n        .execute(&mut *transaction)\n        .await\n        .context(\"insert allocated screen event\")?;",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "claim": "a started event persists its own sample_count rather than relying on the column default"
+  },
+  {
+    "id": "merge-drops-machine-scoping",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "WHERE id = $9 AND machine_id = $10",
+    "replace": "WHERE id = $9 AND $10 = $10",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "claim": "a merge can only ever update a row belonging to this writer's own machine"
+  },
+  {
+    "id": "merge-meta-swaps-capture-and-ocr-gap-counters",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "            \"capture_unavailable\": event.capture_gaps.capture_unavailable,\n            \"ocr_unavailable\": event.capture_gaps.ocr_unavailable,",
+    "replace": "            \"capture_unavailable\": event.capture_gaps.ocr_unavailable,\n            \"ocr_unavailable\": event.capture_gaps.capture_unavailable,",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "claim": "each persisted capture-gap counter carries its own kind"
+  },
+  {
+    "id": "merge-meta-swaps-merge-and-latest-hash",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "        \"merge_hash\": event.merge_hash,\n        \"latest_exact_ocr_hash\": event.latest_exact_ocr_hash,",
+    "replace": "        \"merge_hash\": event.latest_exact_ocr_hash,\n        \"latest_exact_ocr_hash\": event.merge_hash,",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "claim": "the stable merge hash and the latest exact OCR hash are persisted to their own keys"
+  },
+  {
+    "id": "merge-meta-hardcodes-start-reason",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "let merge_meta = merge_meta(event, event.start_reason);",
+    "replace": "let merge_meta = merge_meta(event, SplitReason::Initial);",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "claim": "a merged row keeps the reason its event actually started for"
+  },
+  {
+    "id": "merge-meta-drops-latest-cadence",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "            \"next_interval_ms\": event.latest_cadence.next_interval.num_milliseconds(),",
+    "replace": "            \"next_interval_ms\": 0,",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "claim": "the persisted cadence record carries the real selected interval"
+  },
+  {
+    "id": "schema-expected-constraint-list-silently-shortened",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "        ('events_window_order', 'events', 'c', ARRAY['started_at', 'ended_at']::text[], '', 'CHECK ((ended_at >= started_at))'),\n",
+    "replace": "",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "claim": "the schema validator's expected-constraint list cannot be silently shortened"
+  },
+  {
+    "id": "schema-expected-index-list-silently-shortened",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "        ('events_started_at_idx', 'events', 'btree', false, ARRAY['started_at']::text[], '3', ''),\n",
+    "replace": "",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "claim": "the schema validator's expected-index list cannot be silently shortened"
+  },
+  {
+    "id": "preflight-drops-postgres-18-requirement",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "server_version_num >= MINIMUM_SERVER_VERSION_NUM",
+    "replace": "server_version_num >= 0",
+    "package": "screenpipe-memory",
+    "claim": "the writer refuses to start against a PostgreSQL older than 18"
+  },
+  {
+    "id": "upsert-app-destroys-first-seen-semantics",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "app_title = EXCLUDED.app_title",
+    "replace": "app_title = EXCLUDED.app_title, first_seen_at = EXCLUDED.first_seen_at",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "claim": "first_seen_at records when an app was FIRST seen and is never overwritten"
+  }
+]
