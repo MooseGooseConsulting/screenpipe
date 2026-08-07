@@ -13,6 +13,13 @@ use screenpipe_screen::{
 
 const RETRY_CADENCE: Duration = Duration::from_secs(2);
 
+/// Emitted when the browser-URL boundary itself failed, as opposed to the
+/// reader deciding no URL was available - the reader emits its own
+/// stage/reason categories for that. Fixed text, matching the reader's wire
+/// format: it must never carry the app, the window title, or the URL.
+const BROWSER_URL_BOUNDARY_UNAVAILABLE: &str =
+    "event=browser_url_unavailable stage=boundary reason=reader_error";
+
 fn cadence_record(
     input_idle: Duration,
     frame_stable_for: Duration,
@@ -233,7 +240,20 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
             metadata.app_key.to_ascii_lowercase().as_str(),
             "chrome.exe" | "msedge.exe"
         ) {
-            self.ops.browser_url(&metadata).await.unwrap_or(None)
+            match self.ops.browser_url(&metadata).await {
+                Ok(url) => url,
+                Err(_) => {
+                    // A URL is optional metadata, never a capture precondition:
+                    // this must not gap, must not retry, and must not change
+                    // cadence. It must not vanish either. `unwrap_or(None)`
+                    // made a run that had silently lost every browser URL
+                    // externally indistinguishable from one where no page had
+                    // one, which is the same class of defect as the run loop
+                    // discarding its errors with no category.
+                    eprintln!("{}", BROWSER_URL_BOUNDARY_UNAVAILABLE);
+                    None
+                }
+            }
         } else {
             None
         };
@@ -864,6 +884,17 @@ mod tests {
         );
         assert_eq!(second.browser_url, None);
         assert_eq!(harness.calls.lock().unwrap().browser_url, 2);
+    }
+
+    #[test]
+    fn the_browser_url_boundary_diagnostic_carries_only_a_fixed_category() {
+        // The line is printed on a path that has the URL, the window title and
+        // the app key in scope. Pinning its exact text is what stops any of
+        // them being interpolated into it later.
+        assert_eq!(
+            super::BROWSER_URL_BOUNDARY_UNAVAILABLE,
+            "event=browser_url_unavailable stage=boundary reason=reader_error"
+        );
     }
 
     #[tokio::test]

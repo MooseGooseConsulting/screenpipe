@@ -257,73 +257,81 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
                 println!("event=shutdown reason=ctrl_c");
                 return Ok(());
             }
-            outcome = run_iteration(&mut runner, &mut source, &writer) => {
-                match outcome {
-                    Ok(outcome) => {
-                        print_run_outcome(&outcome);
-                        let kind = match &outcome {
-                            RunOutcome::GapRecorded {
-                                gap: screenpipe_memory::CaptureGap::DesktopLocked,
-                            } => IterationKind::DesktopLocked,
-                            RunOutcome::GapRecorded { .. } => IterationKind::Gap,
-                            _ => IterationKind::Persisted,
-                        };
-                        match next_step(kind, &mut consecutive_failures, &mut consecutive_gaps) {
-                            LoopStep::Continue => {}
-                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
-                            LoopStep::AbortGaps => {
-                                return Err(anyhow::anyhow!(
-                                    "aborting after {MAX_CONSECUTIVE_GAPS} consecutive capture gaps"
-                                ));
-                            }
-                            LoopStep::AbortFailures => unreachable!("no failure was recorded"),
-                        }
-                    }
-                    Err(error) => {
-                        // `Runner::run_once` deliberately RETAINS the
-                        // unpersisted observation and the gap counters when a
-                        // sink write fails, so the caller can retry the exact
-                        // sample. Propagating with `?` here threw that away and
-                        // ended the whole run on the first transient PostgreSQL
-                        // blip - the single largest risk to an unattended
-                        // 24-hour capture.
-                        let step = next_step(
-                            IterationKind::Failure,
-                            &mut consecutive_failures,
-                            &mut consecutive_gaps,
-                        );
-                        let category = failure_category(&error);
-                        println!(
-                            "event=capture_error category={category} consecutive={consecutive_failures}"
-                        );
-                        match step {
-                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
-                            LoopStep::AbortFailures => {
-                                // Do not spin forever on a permanent fault.
-                                // Exiting hands off to the service wrapper's
-                                // restart loop, which re-runs preflight from a
-                                // clean process.
-                                //
-                                // The raw error is deliberately NOT propagated.
-                                // `main` returns `anyhow::Result`, so Rust's
-                                // Termination impl prints the whole `{:?}`
-                                // chain to stderr - and the service wrapper now
-                                // persists stderr to a dated log file that
-                                // `uninstall` preserves. The redaction that
-                                // `failure_category` exists to guarantee would
-                                // have been abandoned on the one path that
-                                // exits.
-                                return Err(anyhow::anyhow!(
-                                    "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive capture failures (category={category})"
-                                ));
-                            }
-                            LoopStep::Continue | LoopStep::AbortGaps => {
-                                unreachable!("a failure never yields a gap decision")
-                            }
-                        }
-                    }
+            step = record_one_observation(
+                &mut runner,
+                &mut source,
+                &writer,
+                &mut consecutive_failures,
+                &mut consecutive_gaps,
+            ) => match step {
+                LoopStep::Continue => {}
+                LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                LoopStep::AbortGaps => {
+                    return Err(anyhow::anyhow!(
+                        "aborting after {MAX_CONSECUTIVE_GAPS} consecutive capture gaps"
+                    ));
                 }
-            }
+                LoopStep::AbortFailures(category) => {
+                    // Do not spin forever on a permanent fault. Exiting hands
+                    // off to the service wrapper's restart loop, which re-runs
+                    // preflight from a clean process.
+                    //
+                    // The raw error is deliberately NOT propagated. `main`
+                    // returns `anyhow::Result`, so Rust's Termination impl
+                    // prints the whole `{:?}` chain to stderr - and the service
+                    // wrapper persists stderr to a dated log file that
+                    // `uninstall` preserves. The redaction that
+                    // `failure_category` exists to guarantee would have been
+                    // abandoned on the one path that exits.
+                    return Err(anyhow::anyhow!(
+                        "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive capture failures (category={category})"
+                    ));
+                }
+            },
+        }
+    }
+}
+
+/// One turn of the run loop: take an observation, log it, and decide what the
+/// loop does next.
+///
+/// The iteration's `Result` is consumed here and never handed back. That is the
+/// point. Inline in the `tokio::select!` arm, `outcome?` and the full retry arm
+/// were indistinguishable to every test in this crate, because nothing could
+/// call the arm - and `outcome?` is what shipped. It discarded the unpersisted
+/// observation and the gap counters that `Runner::run_once` deliberately
+/// RETAINS on a sink failure so the exact sample can be retried, and it ended
+/// the whole run on the first transient PostgreSQL blip. Returning `LoopStep`
+/// rather than `Result` makes that mistake unwritable rather than merely
+/// corrected.
+async fn record_one_observation(
+    runner: &mut Runner,
+    source: &mut dyn SampleSource,
+    sink: &dyn EventSink,
+    consecutive_failures: &mut u32,
+    consecutive_gaps: &mut u32,
+) -> LoopStep {
+    match run_iteration(runner, source, sink).await {
+        Ok(outcome) => {
+            print_run_outcome(&outcome);
+            let kind = match &outcome {
+                RunOutcome::GapRecorded {
+                    gap: screenpipe_memory::CaptureGap::DesktopLocked,
+                } => IterationKind::DesktopLocked,
+                RunOutcome::GapRecorded { .. } => IterationKind::Gap,
+                _ => IterationKind::Persisted,
+            };
+            next_step(kind, consecutive_failures, consecutive_gaps)
+        }
+        Err(error) => {
+            let category = failure_category(&error);
+            let step = next_step(
+                IterationKind::Failure(category),
+                consecutive_failures,
+                consecutive_gaps,
+            );
+            println!("event=capture_error category={category} consecutive={consecutive_failures}");
+            step
         }
     }
 }
@@ -345,8 +353,10 @@ enum IterationKind {
     /// a normal night. Backs off, never aborts, and never touches either
     /// streak.
     DesktopLocked,
-    /// The iteration returned an error.
-    Failure,
+    /// The iteration returned an error, already reduced to its redacted
+    /// category. The category travels with the kind so the abort message can
+    /// name it without the error text ever reaching a log line.
+    Failure(&'static str),
 }
 
 /// What the run loop should do next.
@@ -355,7 +365,7 @@ enum LoopStep {
     Continue,
     Retry(std::time::Duration),
     AbortGaps,
-    AbortFailures,
+    AbortFailures(&'static str),
 }
 
 /// The restart policy, extracted from the loop so it can be driven directly.
@@ -394,10 +404,10 @@ fn next_step(
                 LoopStep::Retry(failure_backoff(*consecutive_gaps))
             }
         }
-        IterationKind::Failure => {
+        IterationKind::Failure(category) => {
             *consecutive_failures = consecutive_failures.saturating_add(1);
             if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                LoopStep::AbortFailures
+                LoopStep::AbortFailures(category)
             } else {
                 LoopStep::Retry(failure_backoff(*consecutive_failures))
             }
@@ -675,6 +685,102 @@ mod tests {
         }
     }
 
+    /// Fails the first durable write and accepts the second, recording what it
+    /// was handed each time.
+    #[derive(Default)]
+    struct FlakyStartSink {
+        events: Mutex<Vec<OpenEvent>>,
+    }
+
+    #[async_trait]
+    impl EventSink for FlakyStartSink {
+        async fn start(&self, event: &OpenEvent, _reason: SplitReason) -> Result<EventId> {
+            let mut events = self.events.lock().unwrap();
+            events.push(event.clone());
+            if events.len() == 1 {
+                return Err(anyhow::anyhow!("PostgreSQL pool timed out"));
+            }
+            EventId::try_from("icarus_1".to_owned())
+        }
+
+        async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> Result<()> {
+            unreachable!("a start that never succeeded cannot merge")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_write_failure_retries_the_exact_sample_instead_of_ending_the_run() {
+        // The defect this pins is not `next_step`, which was always testable -
+        // it is the loop body around it. `outcome?` sat inside a
+        // `tokio::select!` arm that no test could call, so the `?` and the full
+        // retry arm were indistinguishable to the whole suite. The `?` is what
+        // shipped: one transient PostgreSQL blip ended a 24-hour run and took
+        // the unpersisted observation `Runner::run_once` had deliberately
+        // retained with it.
+        //
+        // `record_one_observation` returns a LoopStep and never a Result, so
+        // there is no `?` left to write. The source below panics if asked for a
+        // second sample, which is what proves the retry re-presented the same
+        // observation rather than skipping it.
+        let captured_at = Utc.with_ymd_and_hms(2026, 8, 4, 12, 0, 0).single().unwrap();
+        let mut source = OneSample(Some(SampleRead::Sample {
+            sample: ObservationSample {
+                captured_at,
+                app_key: "notepad.exe".to_owned(),
+                app_title: "Notepad".to_owned(),
+                window_title: "Goal 1".to_owned(),
+                ocr_text: "an observation worth not losing".to_owned(),
+                readable_text: "an observation worth not losing".to_owned(),
+                browser_url: None,
+            },
+            cadence: CadenceRecord::from_input(CadenceInput {
+                input_idle: Duration::zero(),
+                frame_stable_for: Duration::zero(),
+                foreground_changed: false,
+                frame_changed: false,
+            }),
+        }));
+        let sink = FlakyStartSink::default();
+        let mut runner = super::default_runner();
+        let mut failures = 0;
+        let mut gaps = 0;
+
+        let first = super::record_one_observation(
+            &mut runner,
+            &mut source,
+            &sink,
+            &mut failures,
+            &mut gaps,
+        )
+        .await;
+        assert!(
+            matches!(first, super::LoopStep::Retry(_)),
+            "a transient write failure must back off and stay in the loop, got {first:?}"
+        );
+        assert_eq!(failures, 1);
+
+        let second = super::record_one_observation(
+            &mut runner,
+            &mut source,
+            &sink,
+            &mut failures,
+            &mut gaps,
+        )
+        .await;
+        assert_eq!(second, super::LoopStep::Continue);
+        assert_eq!(
+            failures, 0,
+            "a persisted observation must clear the failure streak"
+        );
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2, "the retry never reached the sink");
+        assert_eq!(
+            events[0], events[1],
+            "the retry must re-present the exact observation, not a later one"
+        );
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         starts: Mutex<Vec<SplitReason>>,
@@ -928,8 +1034,8 @@ mod tests {
         // producing gaps would never reach its ceiling either.
         let mut failures = 0;
         let mut gaps = 0;
-        next_step(IterationKind::Failure, &mut failures, &mut gaps);
-        next_step(IterationKind::Failure, &mut failures, &mut gaps);
+        next_step(IterationKind::Failure("postgres"), &mut failures, &mut gaps);
+        next_step(IterationKind::Failure("postgres"), &mut failures, &mut gaps);
         assert_eq!(failures, 2);
 
         next_step(IterationKind::Gap, &mut failures, &mut gaps);
@@ -951,13 +1057,15 @@ mod tests {
         let mut gaps = 0;
         for _ in 1..super::MAX_CONSECUTIVE_FAILURES {
             assert!(matches!(
-                next_step(IterationKind::Failure, &mut failures, &mut gaps),
+                next_step(IterationKind::Failure("postgres"), &mut failures, &mut gaps),
                 LoopStep::Retry(_)
             ));
         }
+        // The category survives to the abort, which is the only line the
+        // wrapper's log keeps once the process is gone.
         assert_eq!(
-            next_step(IterationKind::Failure, &mut failures, &mut gaps),
-            LoopStep::AbortFailures
+            next_step(IterationKind::Failure("postgres"), &mut failures, &mut gaps),
+            LoopStep::AbortFailures("postgres")
         );
     }
 
