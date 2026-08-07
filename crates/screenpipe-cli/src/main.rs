@@ -456,6 +456,24 @@ fn failure_category(error: &anyhow::Error) -> &'static str {
         "capture"
     } else if detail.contains("session") || detail.contains("desktop") {
         "session"
+    // Everything below was reaching the log as `other`, which is the category
+    // that says nothing. Twelve consecutive `category=other` lines were
+    // observed on this machine and told us nothing whatsoever about what was
+    // wrong - and `other` is exactly what someone would be reading at 3am if a
+    // 24-hour run started failing.
+    //
+    // These are not guesses. They are the only errors that can actually reach
+    // the run loop: capture, OCR and browser-URL failures are converted to
+    // typed gaps before they get there, so what remains is the clock, the
+    // cadence arithmetic, and the event-id bookkeeping.
+    } else if detail.contains("clock") {
+        "clock"
+    } else if detail.contains("cadence") || detail.contains("chrono range") {
+        "cadence"
+    } else if detail.contains("event id") {
+        "event_id"
+    } else if detail.contains("ctrl-c") || detail.contains("signal") {
+        "shutdown"
     } else {
         "other"
     }
@@ -941,6 +959,47 @@ mod tests {
             next_step(IterationKind::Failure, &mut failures, &mut gaps),
             LoopStep::AbortFailures
         );
+    }
+
+    #[test]
+    fn every_error_the_run_loop_can_see_has_a_category_of_its_own() {
+        use super::failure_category;
+
+        // `other` is the category that says nothing, and twelve consecutive
+        // `category=other` lines were observed on this machine telling us
+        // nothing about what was wrong. Capture, OCR and browser-URL failures
+        // never reach the loop - they become typed gaps first - so this list is
+        // the complete set of errors that CAN, taken from the `.context()`
+        // strings on those paths.
+        let cases = [
+            (anyhow::anyhow!("monotonic clock moved backwards"), "clock"),
+            (
+                anyhow::anyhow!("cadence interval must be nonnegative and in range"),
+                "cadence",
+            ),
+            (
+                anyhow::anyhow!("input-idle duration exceeds chrono range"),
+                "cadence",
+            ),
+            (
+                anyhow::anyhow!("frame-stability duration exceeds chrono range"),
+                "cadence",
+            ),
+            (
+                anyhow::anyhow!("merger produced merge without a durable event id"),
+                "event_id",
+            ),
+            (anyhow::anyhow!("listen for Ctrl-C"), "shutdown"),
+        ];
+
+        for (error, expected) in cases {
+            let actual = failure_category(&error);
+            assert_eq!(
+                actual, expected,
+                "{error:#} was categorised {actual}, which tells an operator nothing"
+            );
+            assert_ne!(actual, "other", "{error:#} fell through to `other`");
+        }
     }
 
     #[test]

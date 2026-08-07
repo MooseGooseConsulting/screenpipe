@@ -174,5 +174,13 @@
     "replace": "                    CaptureGap::DesktopLocked\n                } else {\n                    CaptureGap::DesktopLocked\n                };",
     "package": "screenpipe-cli",
     "claim": "a genuine capture fault on a live desktop is not excused as a lock"
+  },
+  {
+    "id": "clock-and-cadence-errors-fall-through-to-other",
+    "file": "crates/screenpipe-cli/src/main.rs",
+    "find": "    } else if detail.contains(\"clock\") {\n        \"clock\"",
+    "replace": "    } else if false {\n        \"clock\"",
+    "package": "screenpipe-cli",
+    "claim": "every error the run loop can see has a category of its own, not `other`"
   }
 ]
