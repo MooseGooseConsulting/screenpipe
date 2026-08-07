@@ -117,6 +117,7 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
     let mut runner = default_runner();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+    let mut consecutive_failures: u32 = 0;
     println!("event=runtime_ready machine_slug={machine_slug}");
 
     loop {
@@ -127,9 +128,72 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
                 return Ok(());
             }
             outcome = run_iteration(&mut runner, &mut source, &writer) => {
-                print_run_outcome(&outcome?);
+                match outcome {
+                    Ok(outcome) => {
+                        consecutive_failures = 0;
+                        print_run_outcome(&outcome);
+                    }
+                    Err(error) => {
+                        // `Runner::run_once` deliberately RETAINS the
+                        // unpersisted observation and the gap counters when a
+                        // sink write fails, so the caller can retry the exact
+                        // sample. Propagating with `?` here threw that away and
+                        // ended the whole run on the first transient PostgreSQL
+                        // blip - the single largest risk to an unattended
+                        // 24-hour capture.
+                        consecutive_failures += 1;
+                        println!(
+                            "event=capture_error category={} consecutive={consecutive_failures}",
+                            failure_category(&error)
+                        );
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                            // Do not spin forever on a permanent fault. Exiting
+                            // hands off to the service wrapper's restart loop,
+                            // which re-runs preflight from a clean process.
+                            return Err(error).context(format!(
+                                "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive capture failures"
+                            ));
+                        }
+                        tokio::time::sleep(failure_backoff(consecutive_failures)).await;
+                    }
+                }
             }
         }
+    }
+}
+
+/// Consecutive failures tolerated before the process exits and lets the service
+/// wrapper restart it from a clean state.
+const MAX_CONSECUTIVE_FAILURES: u32 = 20;
+
+/// Exponential backoff, capped. Without this, a deterministically failing
+/// capture or OCR path retried every two seconds forever - roughly 43,000
+/// attempts a day, each one a wasted capture, OCR, and log line.
+fn failure_backoff(consecutive_failures: u32) -> std::time::Duration {
+    let seconds = 2_u64.saturating_pow(consecutive_failures.min(5)).min(60);
+    std::time::Duration::from_secs(seconds)
+}
+
+/// Bounded, redacted failure category.
+///
+/// Never includes the error text: capture, OCR, and browser-URL errors can
+/// carry window titles, file paths, and URLs. Previously these errors were
+/// discarded with no category at all, so a run that silently lost every browser
+/// URL was externally indistinguishable from a healthy one.
+fn failure_category(error: &anyhow::Error) -> &'static str {
+    let detail = format!("{error:#}").to_ascii_lowercase();
+    if detail.contains("postgres") || detail.contains("pool") || detail.contains("connection") {
+        "postgres"
+    } else if detail.contains("schema") {
+        "schema"
+    } else if detail.contains("ocr") {
+        "ocr"
+    } else if detail.contains("capture") || detail.contains("foreground") {
+        "capture"
+    } else if detail.contains("session") || detail.contains("desktop") {
+        "session"
+    } else {
+        "other"
     }
 }
 
@@ -221,15 +285,97 @@ mod tests {
     use super::{Cli, Command, IDLE_GAP_SECONDS, run_iteration};
 
     #[test]
-    fn idle_gap_stays_above_the_slowest_cadence_interval() {
-        // If these are equal, the max-backoff sleep alone reaches the split
-        // threshold and every sample of a long idle window becomes its own
-        // one-sample event - collapsing the merge ratio that Goal 1 measures.
+    fn idle_gap_keeps_a_full_cadence_of_margin_above_the_slowest_cadence() {
+        // A strictly-greater threshold is not enough. At max backoff the sleep
+        // alone is MAX_CADENCE_INTERVAL_SECONDS, and the capture, the OCR pass,
+        // and the sink write all land on top of it, so consecutive idle samples
+        // are routinely several seconds further apart than the sleep. A
+        // one-second margin is inside that overhead: every sample of a long
+        // idle window would clear the threshold and open its own one-sample
+        // event, collapsing the merge ratio Goal 1 measures. A full extra
+        // cadence interval is the smallest margin that absorbs it.
         assert!(
-            IDLE_GAP_SECONDS > screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS,
-            "idle gap {IDLE_GAP_SECONDS}s must exceed the slowest cadence {}s",
+            IDLE_GAP_SECONDS >= screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS * 2,
+            "idle gap {IDLE_GAP_SECONDS}s leaves no room above the slowest cadence {}s",
             screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS
         );
+    }
+
+    struct QueuedSamples(std::collections::VecDeque<SampleRead>);
+
+    #[async_trait]
+    impl SampleSource for QueuedSamples {
+        async fn next_sample(&mut self) -> Result<SampleRead> {
+            Ok(self.0.pop_front().expect("another queued sample"))
+        }
+    }
+
+    #[derive(Default)]
+    struct MergeCountingSink {
+        starts: Mutex<Vec<SplitReason>>,
+        merges: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl EventSink for MergeCountingSink {
+        async fn start(&self, _event: &OpenEvent, reason: SplitReason) -> Result<EventId> {
+            self.starts.lock().unwrap().push(reason);
+            EventId::try_from("icarus_1".to_owned())
+        }
+
+        async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> Result<()> {
+            *self.merges.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idle_window_sampled_at_max_backoff_merges_under_the_default_runner() {
+        // The observable consequence of the margin above: samples arriving one
+        // max-backoff sleep plus two seconds of capture and OCR overhead apart
+        // must stay in one event. This drives the real `default_runner`, so it
+        // fails if IDLE_GAP_SECONDS is ever trimmed to something the overhead
+        // can cross.
+        let overhead = 2;
+        let spacing = screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS + overhead;
+        let base = Utc.with_ymd_and_hms(2026, 8, 4, 12, 0, 0).single().unwrap();
+        let idle_cadence = CadenceRecord::from_input(CadenceInput {
+            input_idle: Duration::seconds(600),
+            frame_stable_for: Duration::seconds(600),
+            foreground_changed: false,
+            frame_changed: false,
+        });
+        let mut source = QueuedSamples(
+            (0..4)
+                .map(|index| SampleRead::Sample {
+                    sample: ObservationSample {
+                        captured_at: base + Duration::seconds(index * spacing),
+                        app_key: "notepad.exe".to_owned(),
+                        app_title: "Notepad".to_owned(),
+                        window_title: "Goal 1".to_owned(),
+                        ocr_text: "an unchanged idle window".to_owned(),
+                        readable_text: "an unchanged idle window".to_owned(),
+                        browser_url: None,
+                    },
+                    cadence: idle_cadence.clone(),
+                })
+                .collect(),
+        );
+        let sink = MergeCountingSink::default();
+        let mut runner = super::default_runner();
+
+        for _ in 0..4 {
+            run_iteration(&mut runner, &mut source, &sink)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            *sink.starts.lock().unwrap(),
+            [SplitReason::Initial],
+            "an unchanged idle window must open exactly one event, not fragment"
+        );
+        assert_eq!(*sink.merges.lock().unwrap(), 3);
     }
 
     struct OneSample(Option<SampleRead>);
@@ -311,5 +457,88 @@ mod tests {
             }
         );
         assert_eq!(*sink.starts.lock().unwrap(), [SplitReason::Initial]);
+    }
+
+    #[test]
+    fn failure_backoff_grows_then_caps_and_is_never_zero() {
+        // A zero or flat backoff turns a deterministic failure into ~43,000
+        // wasted capture+OCR attempts a day.
+        let delays: Vec<u64> = (1..=8)
+            .map(|attempt| super::failure_backoff(attempt).as_secs())
+            .collect();
+
+        assert!(
+            delays.iter().all(|seconds| *seconds > 0),
+            "backoff must never be zero: {delays:?}"
+        );
+        assert!(
+            delays.windows(2).all(|pair| pair[1] >= pair[0]),
+            "backoff must be monotonically non-decreasing: {delays:?}"
+        );
+        assert!(
+            delays[1] > delays[0],
+            "backoff must actually grow, not stay flat: {delays:?}"
+        );
+        assert!(
+            delays.iter().all(|seconds| *seconds <= 60),
+            "backoff must stay capped so a restart is never delayed unboundedly: {delays:?}"
+        );
+        // The cap must be reached, or a long outage backs off toward hours.
+        assert_eq!(*delays.last().expect("delays"), 32);
+    }
+
+    #[test]
+    fn failure_categories_are_fixed_codes_that_never_echo_error_text() {
+        // The category is printed to the service log. Window titles, file
+        // paths, and URLs must never reach it.
+        let secret = "https://private.example.test/token?value=hunter2";
+        let cases = [
+            (
+                anyhow::anyhow!("PostgreSQL pool timed out")
+                    .context("insert allocated screen event"),
+                "postgres",
+            ),
+            (anyhow::anyhow!("windows OCR engine unavailable"), "ocr"),
+            (
+                anyhow::anyhow!("capture foreground window through Windows Graphics Capture"),
+                "capture",
+            ),
+            (
+                anyhow::anyhow!("process is not running in the active interactive Windows session"),
+                "session",
+            ),
+            (anyhow::anyhow!("something else entirely"), "other"),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(super::failure_category(&error), expected, "for {error:#}");
+        }
+
+        // Whatever the error carries, the category is one of a fixed set and
+        // contains none of it.
+        let leaky = anyhow::anyhow!("failed reading {secret}");
+        let category = super::failure_category(&leaky);
+        assert!(
+            ["postgres", "schema", "ocr", "capture", "session", "other"].contains(&category),
+            "unexpected category {category}"
+        );
+        assert!(!category.contains("hunter2") && !category.contains("example.test"));
+    }
+
+    #[test]
+    fn consecutive_failure_ceiling_allows_recovery_but_still_terminates() {
+        // High enough that ordinary transients (a PostgreSQL restart, a lock
+        // screen) are ridden out, low enough that a permanent fault reaches the
+        // wrapper restart in minutes rather than never.
+        assert!(super::MAX_CONSECUTIVE_FAILURES >= 10);
+        assert!(super::MAX_CONSECUTIVE_FAILURES <= 100);
+
+        let total: u64 = (1..=super::MAX_CONSECUTIVE_FAILURES)
+            .map(|attempt| super::failure_backoff(attempt).as_secs())
+            .sum();
+        assert!(
+            (120..=3600).contains(&total),
+            "total retry window before handing off to the wrapper was {total}s"
+        );
     }
 }

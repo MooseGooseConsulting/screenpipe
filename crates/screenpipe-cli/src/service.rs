@@ -116,11 +116,25 @@ impl ServiceSpec {
             run_level: TaskRunLevel::Limited,
         };
         let escaped_agent = binary_path.to_string_lossy().replace('\'', "''");
+        let escaped_log_directory = root_path.join("logs").to_string_lossy().replace('\'', "''");
+        // Task Scheduler runs this wrapper hidden, so without redirection every
+        // `screen_started`, `capture_gap`, and `capture_error` line the agent
+        // prints goes to a console nobody can read and dies with the process -
+        // leaving a 24-hour unattended run with no diagnostic record at all.
+        // `*>>` captures every stream, appending so a wrapper restart never
+        // truncates the evidence from the run that just failed.
         let wrapper_contents = format!(
             r#"$ErrorActionPreference = 'Continue'
 $agent = '{escaped_agent}'
+$logDirectory = '{escaped_log_directory}'
+if (-not (Test-Path -LiteralPath $logDirectory)) {{
+    New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+}}
 while ($true) {{
-    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop
+    $log = Join-Path $logDirectory ('screenpipe-agent-{{0:yyyy-MM-dd}}.log' -f (Get-Date))
+    "=== agent start {{0:o}} ===" -f (Get-Date).ToUniversalTime() | Out-File -LiteralPath $log -Append -Encoding utf8
+    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop *>> $log
+    "=== agent exited {{0:o}} exit={{1}} ===" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE | Out-File -LiteralPath $log -Append -Encoding utf8
     Start-Sleep -Seconds 10
 }}
 "#
@@ -611,6 +625,77 @@ mod tests {
         (temp, ServiceRoot::for_test(local_app_data), source)
     }
 
+    /// Sorted recursive `relative-path=contents` listing of `root`.
+    ///
+    /// A test that only re-reads the one file it expects to be protected cannot
+    /// see a write that lands somewhere else in the tree, so failure paths that
+    /// must be filesystem-inert compare a whole snapshot instead.
+    fn directory_snapshot(root: &Path) -> Vec<String> {
+        fn walk(root: &Path, directory: &Path, entries: &mut Vec<String>) {
+            let Ok(children) = fs::read_dir(directory) else {
+                return;
+            };
+            for child in children {
+                let child = child.unwrap();
+                let path = child.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                if child.file_type().unwrap().is_dir() {
+                    entries.push(format!("{relative}\\"));
+                    walk(root, &path, entries);
+                } else {
+                    entries.push(format!(
+                        "{relative}={}",
+                        String::from_utf8_lossy(&fs::read(&path).unwrap())
+                    ));
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        walk(root, root, &mut entries);
+        entries.sort();
+        entries
+    }
+
+    /// Parse-error messages Windows PowerShell reports for `script`.
+    ///
+    /// Parsing is the only cheap way to prove a generated script is not
+    /// silently broken by quoting, so both the wrapper and the scheduler
+    /// scripts go through it.
+    #[cfg(windows)]
+    fn powershell_parse_errors(script: &str) -> Vec<String> {
+        let parser_script = r#"
+$tokens = $null
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseInput(
+    $env:SCREENPIPE_SCRIPT_TO_PARSE,
+    [ref]$tokens,
+    [ref]$parseErrors
+) | Out-Null
+[Console]::Out.Write((($parseErrors | ForEach-Object Message) -join [Environment]::NewLine))
+"#;
+
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", parser_script])
+            .env("SCREENPIPE_SCRIPT_TO_PARSE", script)
+            .output()
+            .expect("Windows PowerShell should be available for syntax validation");
+        assert!(
+            output.status.success(),
+            "PowerShell parser failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|message| !message.trim().is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
     #[cfg(windows)]
     fn create_junction(link: &Path, target: &Path) {
         let output = Command::new("powershell.exe")
@@ -649,6 +734,25 @@ mod tests {
             None => unsafe { std::env::remove_var("LOCALAPPDATA") },
         }
         assert!(!actual.local_app_data.starts_with(override_root.path()));
+        // Ignoring the override is not the same as resolving the right folder:
+        // the Roaming known folder also fails the check above, and installing
+        // there ships the copied binary and the wrapper into a profile that
+        // roams between machines and is synced by folder redirection.
+        assert!(
+            actual
+                .local_app_data
+                .ends_with(Path::new("AppData").join("Local")),
+            "resolved service root {} is not the Local known folder",
+            actual.local_app_data.display()
+        );
+        assert!(
+            !actual
+                .local_app_data
+                .components()
+                .any(|component| component.as_os_str().eq_ignore_ascii_case("Roaming")),
+            "resolved service root {} must never sit under Roaming",
+            actual.local_app_data.display()
+        );
     }
 
     #[test]
@@ -737,8 +841,15 @@ mod tests {
             concat!(
                 "$ErrorActionPreference = 'Continue'\n",
                 "$agent = 'C:\\Users\\pmacl\\AppData\\Local\\screen-memory\\bin\\screenpipe.exe'\n",
+                "$logDirectory = 'C:\\Users\\pmacl\\AppData\\Local\\screen-memory\\logs'\n",
+                "if (-not (Test-Path -LiteralPath $logDirectory)) {\n",
+                "    New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null\n",
+                "}\n",
                 "while ($true) {\n",
-                "    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop\n",
+                "    $log = Join-Path $logDirectory ('screenpipe-agent-{0:yyyy-MM-dd}.log' -f (Get-Date))\n",
+                "    \"=== agent start {0:o} ===\" -f (Get-Date).ToUniversalTime() | Out-File -LiteralPath $log -Append -Encoding utf8\n",
+                "    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop *>> $log\n",
+                "    \"=== agent exited {0:o} exit={1} ===\" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE | Out-File -LiteralPath $log -Append -Encoding utf8\n",
                 "    Start-Sleep -Seconds 10\n",
                 "}\n",
             )
@@ -764,35 +875,58 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn generated_wrapper_has_no_powershell_parse_errors() {
-        let root = ServiceRoot::for_test(Path::new(r"C:\Users\pmacl\AppData\Local").to_owned());
-        let spec = ServiceSpec::for_current_user(&root);
-        let parser_script = r#"
-$tokens = $null
-$parseErrors = $null
-[System.Management.Automation.Language.Parser]::ParseInput(
-    $env:SCREENPIPE_WRAPPER_TO_PARSE,
-    [ref]$tokens,
-    [ref]$parseErrors
-) | Out-Null
-if ($parseErrors.Count -ne 0) {
-    [Console]::Error.Write(($parseErrors | ForEach-Object Message) -join [Environment]::NewLine)
-    exit 1
-}
-[Console]::Out.Write($parseErrors.Count)
-"#;
+        // The second root is the case the escaper exists for: an apostrophe in
+        // the user folder closes the single-quoted $agent literal early and the
+        // rest of the wrapper stops being a parseable script.
+        for local_app_data in [
+            r"C:\Users\pmacl\AppData\Local",
+            r"C:\Users\O'Brien\AppData\Local",
+        ] {
+            let root = ServiceRoot::for_test(Path::new(local_app_data).to_owned());
+            let spec = ServiceSpec::for_current_user(&root);
 
-        let output = Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", parser_script])
-            .env("SCREENPIPE_WRAPPER_TO_PARSE", &spec.wrapper_contents)
-            .output()
-            .expect("Windows PowerShell should be available for syntax validation");
+            let errors = powershell_parse_errors(&spec.wrapper_contents);
+
+            assert!(
+                errors.is_empty(),
+                "wrapper generated for {local_app_data} does not parse: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_doubles_an_apostrophe_in_the_service_root_path() {
+        // Every other fixture uses C:\Users\pmacl, so nothing ever fed the
+        // escaper a quote. A real user folder such as C:\Users\O'Brien would
+        // terminate the single-quoted literal mid-path, and the task would
+        // launch a wrapper that dies on a syntax error at every logon instead
+        // of starting the agent.
+        let root = ServiceRoot::for_test(Path::new(r"C:\Users\O'Brien\AppData\Local").to_owned());
+        let spec = ServiceSpec::for_current_user(&root);
+
+        let agent_line = spec
+            .wrapper_contents
+            .lines()
+            .find(|line| line.starts_with("$agent = "))
+            .expect("wrapper must assign the agent path");
 
         assert!(
-            output.status.success(),
-            "PowerShell parser failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            agent_line.contains(r"O''Brien"),
+            "apostrophe was not doubled: {agent_line}"
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "0");
+        assert_eq!(
+            agent_line,
+            r"$agent = 'C:\Users\O''Brien\AppData\Local\screen-memory\bin\screenpipe.exe'"
+        );
+        // Every interpolated path shares the escaper, so the balance check
+        // covers the whole wrapper rather than only the agent assignment.
+        for line in spec.wrapper_contents.lines() {
+            assert_eq!(
+                line.matches('\'').count() % 2,
+                0,
+                "single-quoted literal is unbalanced: {line}"
+            );
+        }
     }
 
     #[test]
@@ -920,6 +1054,7 @@ if ($parseErrors.Count -ne 0) {
         let spec = ServiceSpec::for_current_user(&local_app_data);
         fs::create_dir_all(spec.binary_path.parent().unwrap()).unwrap();
         fs::write(&spec.binary_path, b"still-running-binary").unwrap();
+        let before = directory_snapshot(&spec.root_path);
         let scheduler = FakeTaskScheduler {
             status: Some(ServiceStatus {
                 task_state: TaskState::Running,
@@ -936,6 +1071,25 @@ if ($parseErrors.Count -ne 0) {
         assert_eq!(
             fs::read(&spec.binary_path).unwrap(),
             b"still-running-binary"
+        );
+        // A stop that failed means the previous instance may still be running
+        // and holding these paths, so install must be entirely inert until the
+        // process tree is confirmed dead - not just leave the binary alone.
+        // Re-reading one file cannot see a wrapper, a directory, or a leftover
+        // `.installing` temp file written before the failing stop, so the whole
+        // root is compared instead.
+        assert!(
+            !spec.wrapper_path.exists(),
+            "a wrapper was written before the stop succeeded"
+        );
+        let after = directory_snapshot(&spec.root_path);
+        assert!(
+            !after.iter().any(|entry| entry.contains(".installing")),
+            "a half-written install temp file was left behind: {after:?}"
+        );
+        assert_eq!(
+            after, before,
+            "a failed stop must leave the service root untouched"
         );
     }
 
@@ -1015,7 +1169,19 @@ if ($parseErrors.Count -ne 0) {
 
     #[test]
     fn scheduler_status_parser_rejects_ambiguous_or_malformed_output() {
-        for invalid in ["", "Ready", "Ready|maybe", "Ready|False|extra"] {
+        // Every case must reach the branch it is meant to exercise. The first
+        // four all fail on the process field or the field count, so nothing
+        // covered the empty-state branch: a scheduler that emits "|False"
+        // would otherwise be reported as a task in state "" rather than as
+        // output we refuse to trust.
+        for invalid in [
+            "",
+            "Ready",
+            "Ready|maybe",
+            "Ready|False|extra",
+            "|False",
+            "  |False",
+        ] {
             assert!(
                 parse_status_output(invalid).is_err(),
                 "unexpectedly accepted {invalid:?}"
@@ -1032,32 +1198,33 @@ if ($parseErrors.Count -ne 0) {
             uninstall_task_script(),
             status_task_script(),
         ];
-        let parser_script = r#"
-$tokens = $null
-$parseErrors = $null
-[System.Management.Automation.Language.Parser]::ParseInput(
-    $env:SCREENPIPE_TASK_SCRIPT_TO_PARSE,
-    [ref]$tokens,
-    [ref]$parseErrors
-) | Out-Null
-if ($parseErrors.Count -ne 0) {
-    [Console]::Error.Write(($parseErrors | ForEach-Object Message) -join [Environment]::NewLine)
-    exit 1
-}
-"#;
 
         for script in scripts {
-            let output = Command::new("powershell.exe")
-                .args(["-NoProfile", "-NonInteractive", "-Command", parser_script])
-                .env("SCREENPIPE_TASK_SCRIPT_TO_PARSE", script)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "PowerShell parser failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let errors = powershell_parse_errors(script);
+
+            assert!(errors.is_empty(), "script does not parse: {errors:?}");
         }
+    }
+
+    #[test]
+    fn install_script_registers_a_limited_logon_task_not_an_elevated_startup_one() {
+        // `ParseInput` does not resolve cmdlet parameter sets, so parsing the
+        // script proves nothing about which switches it passes, and the
+        // ServiceSpec principal is only a Rust-side mirror that
+        // Register-ScheduledTask never sees. This string is what actually
+        // registers the task. `Highest` would hand a capture loop an elevated
+        // token it has no use for, and `-AtStartup` would run it in session 0
+        // where there is no foreground window to capture at all.
+        let script = install_task_script();
+
+        assert!(script.contains("-RunLevel Limited"), "{script}");
+        assert!(script.contains("-LogonType Interactive"), "{script}");
+        assert!(
+            script.contains("New-ScheduledTaskTrigger -AtLogOn"),
+            "{script}"
+        );
+        assert!(!script.contains("-RunLevel Highest"), "{script}");
+        assert!(!script.contains("-AtStartup"), "{script}");
     }
 
     #[test]
@@ -1105,6 +1272,89 @@ if ($parseErrors.Count -ne 0) {
         assert!(
             decoy_state.is_none(),
             "stop script terminated an unrelated process"
+        );
+    }
+
+    /// Spawn a real, long-lived process whose executable path is exactly
+    /// `path`. `ping` is used because it runs for a controllable duration
+    /// without needing a console, stdin, or a window.
+    #[cfg(test)]
+    fn spawn_process_at(path: &std::path::Path) -> std::process::Child {
+        std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+        let system_ping = std::path::Path::new(&std::env::var("SystemRoot").unwrap())
+            .join(r"System32\PING.EXE");
+        std::fs::copy(&system_ping, path).unwrap();
+        Command::new(path)
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn stop_script_terminates_the_exact_installed_binary_and_spares_near_misses() {
+        // The decoy test above is a pure NEGATIVE control: it only proves the
+        // script spares something. A matcher that owns nothing at all - or one
+        // that prefix-matches and would over-kill - passes it trivially, and
+        // both of those mutations were empirically confirmed to survive the
+        // whole suite. Terminating the right process is the entire purpose of
+        // this script, and nothing asserted it.
+        //
+        // `owned` must die. The two near misses must live:
+        //   - `screenpipe.exe.bak` is a strict PREFIX extension of the owned
+        //     path, so a `StartsWith`/`-like "$binary*"` matcher kills it.
+        //   - `bin2\screenpipe.exe` shares the file name under a sibling
+        //     directory, so a file-name-only matcher kills it.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let owned_path = root.join(r"bin\screenpipe.exe");
+        let prefix_path = root.join(r"bin\screenpipe.exe.bak");
+        let sibling_path = root.join(r"bin2\screenpipe.exe");
+
+        let mut owned = spawn_process_at(&owned_path);
+        let mut prefix_decoy = spawn_process_at(&prefix_path);
+        let mut sibling_decoy = spawn_process_at(&sibling_path);
+        std::thread::sleep(std::time::Duration::from_millis(900));
+
+        let result = super::run_powershell(
+            stop_task_script(),
+            &[
+                (
+                    "SCREENPIPE_TASK_NAME",
+                    "MooseGoose Goal 1 Missing Positive Control".to_owned(),
+                ),
+                (
+                    "SCREENPIPE_SERVICE_BINARY",
+                    owned_path.to_string_lossy().into_owned(),
+                ),
+            ],
+        );
+
+        // Sample every process's state before any cleanup, so the assertions
+        // below describe the state the script actually left behind.
+        let owned_state = owned.try_wait().unwrap();
+        let prefix_state = prefix_decoy.try_wait().unwrap();
+        let sibling_state = sibling_decoy.try_wait().unwrap();
+        for child in [&mut owned, &mut prefix_decoy, &mut sibling_decoy] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        result.expect("stop script failed");
+        assert!(
+            owned_state.is_some(),
+            "the stop script did not terminate the exact installed binary - \
+             its whole purpose is unperformed"
+        );
+        assert!(
+            prefix_state.is_none(),
+            "the stop script killed screenpipe.exe.bak: it is prefix-matching \
+             the binary path instead of comparing it exactly"
+        );
+        assert!(
+            sibling_state.is_none(),
+            "the stop script killed bin2\\screenpipe.exe: it is matching on file \
+             name instead of the full executable path"
         );
     }
 }

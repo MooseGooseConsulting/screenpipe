@@ -760,19 +760,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_supported_browser_app_key_crosses_the_boundary_case_insensitively() {
+        // The app key comes from the process image name, whose case is
+        // whatever the launching shell or shortcut recorded - a case-sensitive
+        // match silently drops URL capture for the same browser started a
+        // different way. Edge needs its own case: it was only ever exercised
+        // through chrome.exe, so dropping it from the match was invisible.
+        for app_key in ["chrome.exe", "CHROME.EXE", "msedge.exe", "MsEdge.exe"] {
+            let harness = Harness::new();
+            let mut source = harness.source(
+                [Ok((frame(1), metadata(10, app_key, "tab")))],
+                [Ok("page".to_owned())],
+                [Ok(Duration::ZERO)],
+                [Ok(Some("https://example.test/path".to_owned()))],
+            );
+
+            let (actual, _) = sample(source.next_sample().await.unwrap());
+
+            assert_eq!(
+                harness.calls.lock().unwrap().browser_url,
+                1,
+                "{app_key} did not reach the browser-URL boundary"
+            );
+            assert_eq!(
+                actual.browser_url.as_deref(),
+                Some("https://example.test/path"),
+                "{app_key}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn non_browser_sample_never_crosses_browser_url_boundary() {
-        let harness = Harness::new();
-        let mut source = harness.source(
-            [Ok((frame(1), metadata(10, "notepad.exe", "notes")))],
-            [Ok("notes".to_owned())],
-            [Ok(Duration::ZERO)],
-            [],
-        );
+        // chromium.exe and brave.exe are the near misses: Chromium-family
+        // browsers whose URL bar this build does not know how to read. An
+        // empty browser-URL queue turns any boundary call into a panic, so
+        // reaching it at all fails the case.
+        for app_key in ["chromium.exe", "brave.exe", "notepad.exe"] {
+            let harness = Harness::new();
+            let mut source = harness.source(
+                [Ok((frame(1), metadata(10, app_key, "notes")))],
+                [Ok("notes".to_owned())],
+                [Ok(Duration::ZERO)],
+                [],
+            );
 
-        let (actual, _) = sample(source.next_sample().await.unwrap());
+            let (actual, _) = sample(source.next_sample().await.unwrap());
 
-        assert_eq!(actual.browser_url, None);
-        assert_eq!(harness.calls.lock().unwrap().browser_url, 0);
+            assert_eq!(actual.browser_url, None, "{app_key}");
+            assert_eq!(harness.calls.lock().unwrap().browser_url, 0, "{app_key}");
+        }
     }
 
     #[tokio::test]
