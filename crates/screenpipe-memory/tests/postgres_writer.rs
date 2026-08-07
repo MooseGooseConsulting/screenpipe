@@ -1,4 +1,6 @@
 use std::env;
+use std::io::Write;
+use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, ensure};
@@ -108,6 +110,66 @@ struct TestDatabase {
 /// database is disposable.
 const TEST_DATABASE_SUFFIX: &str = "_test";
 
+/// The connection string this suite runs against.
+///
+/// Deliberately NOT the agent's `SCREEN_MEMORY_DATABASE_URL`, and deliberately
+/// without a fallback to it. Doppler injects that variable and it names the
+/// LIVE capture database, so any suite that reads it issues CREATE SCHEMA and
+/// DROP SCHEMA CASCADE wherever the agent happens to be pointed - which had
+/// already happened once. Two separate names make "run the tests" and "run the
+/// agent" impossible to confuse, and make an unconfigured `cargo test
+/// --workspace` a skip rather than a hard failure.
+const TEST_DATABASE_URL_ENV: &str = "SCREEN_MEMORY_TEST_DATABASE_URL";
+
+/// What the suite should do with the value of [`TEST_DATABASE_URL_ENV`].
+#[derive(Debug, PartialEq, Eq)]
+enum TestDatabaseUrl {
+    Use(String),
+    Skip,
+}
+
+/// Split out as a pure function so the set/unset/blank decision is testable.
+///
+/// Reading the variable inside a test instead would mean mutating the process
+/// environment, which every test in this binary shares and runs against
+/// concurrently.
+fn resolve_test_database_url(value: Option<String>) -> TestDatabaseUrl {
+    match value {
+        // A variable set to whitespace is how a shell passes "unset" by
+        // accident; treating it as a URL fails later with a parse error that
+        // says nothing about the real cause.
+        Some(url) if !url.trim().is_empty() => TestDatabaseUrl::Use(url),
+        _ => TestDatabaseUrl::Skip,
+    }
+}
+
+/// Announce - exactly once per test binary - that no database test ran.
+fn announce_skip() {
+    static ANNOUNCED: Once = Once::new();
+    ANNOUNCED.call_once(|| {
+        // libtest captures stdout per test and prints it only for FAILING
+        // tests, so a skip announced with `println!` is discarded and the run
+        // is byte-for-byte identical to one that exercised PostgreSQL. Writing
+        // to the process stdout handle bypasses that capture, which is the only
+        // way this line survives a plain `cargo test --workspace`.
+        let _ = writeln!(
+            std::io::stdout(),
+            "SKIPPED postgres_writer: {TEST_DATABASE_URL_ENV} is not set, so no PostgreSQL integration test ran."
+        );
+    });
+}
+
+/// `None` means every caller must return early without failing.
+fn test_database_url() -> Option<String> {
+    match resolve_test_database_url(env::var(TEST_DATABASE_URL_ENV).ok()) {
+        TestDatabaseUrl::Use(url) => Some(url),
+        TestDatabaseUrl::Skip => {
+            announce_skip();
+            None
+        }
+    }
+}
+
 fn database_name(database_url: &str) -> Option<&str> {
     let after_scheme = database_url.split("://").nth(1)?;
     let path = after_scheme.split_once('/')?.1;
@@ -116,16 +178,48 @@ fn database_name(database_url: &str) -> Option<&str> {
 }
 
 fn ensure_test_database(database_url: &str) -> Result<()> {
-    let name =
-        database_name(database_url).context("SCREEN_MEMORY_DATABASE_URL has no database name")?;
+    let name = database_name(database_url)
+        .with_context(|| format!("{TEST_DATABASE_URL_ENV} has no database name"))?;
     ensure!(
         name.ends_with(TEST_DATABASE_SUFFIX),
         "refusing to run schema-mutating tests against database {name:?}: \
          this suite issues CREATE SCHEMA and DROP SCHEMA CASCADE, so it will \
          only run against a database whose name ends in {TEST_DATABASE_SUFFIX:?}. \
-         Point SCREEN_MEMORY_DATABASE_URL at {name}{TEST_DATABASE_SUFFIX}."
+         Point {TEST_DATABASE_URL_ENV} at {name}{TEST_DATABASE_SUFFIX}."
     );
     Ok(())
+}
+
+#[test]
+fn an_absent_test_database_url_is_a_skip_and_a_present_one_is_still_guarded() {
+    // Two properties, and both have to hold at once.
+    //
+    // Skipping is what lets `cargo test --workspace` pass with no environment
+    // at all. That must not become "the suite never runs": a URL that IS
+    // supplied has to come back as a URL, or every database test would skip
+    // forever and report `ok` while asserting nothing.
+    assert_eq!(resolve_test_database_url(None), TestDatabaseUrl::Skip);
+    assert_eq!(
+        resolve_test_database_url(Some(String::new())),
+        TestDatabaseUrl::Skip
+    );
+    assert_eq!(
+        resolve_test_database_url(Some("   ".to_owned())),
+        TestDatabaseUrl::Skip
+    );
+
+    let supplied = "postgresql://u:p@127.0.0.1:5432/screen_memory_test";
+    assert_eq!(
+        resolve_test_database_url(Some(supplied.to_owned())),
+        TestDatabaseUrl::Use(supplied.to_owned())
+    );
+
+    // Skipping must not become an escape from the `_test` guard. Whatever URL
+    // is supplied still goes through it - a skip is the reward for supplying
+    // nothing, not for supplying the production database.
+    ensure_test_database(supplied).expect("a test database must still be accepted");
+    ensure_test_database("postgresql://u:p@127.0.0.1:5432/screen_memory")
+        .expect_err("the guard must still reject a non-test database that was supplied");
 }
 
 #[test]
@@ -155,13 +249,15 @@ fn the_production_capture_database_is_refused() {
 }
 
 impl TestDatabase {
-    async fn create() -> Result<Self> {
+    /// `Ok(None)` means the suite is unconfigured and the caller must skip.
+    async fn create() -> Result<Option<Self>> {
         Self::create_with_schema(AUTHORITATIVE_SCHEMA).await
     }
 
-    async fn create_with_schema(schema_sql: &str) -> Result<Self> {
-        let database_url = env::var("SCREEN_MEMORY_DATABASE_URL")
-            .context("SCREEN_MEMORY_DATABASE_URL must be injected for PostgreSQL tests")?;
+    async fn create_with_schema(schema_sql: &str) -> Result<Option<Self>> {
+        let Some(database_url) = test_database_url() else {
+            return Ok(None);
+        };
         // Refuse to run anywhere that is not obviously a test database.
         //
         // Doppler injects the PRODUCTION url, and the redirect to
@@ -196,12 +292,12 @@ impl TestDatabase {
             .execute(&pool)
             .await
             .context("apply authoritative schema in disposable search_path")?;
-        Ok(Self {
+        Ok(Some(Self {
             admin_pool,
             pool,
             scoped_url,
             schema,
-        })
+        }))
     }
 
     async fn cleanup(self) -> Result<()> {
@@ -281,7 +377,9 @@ fn event(
 }
 
 async fn assert_preflight_rejects_single_mutation(mutation: &str, invariant: &str) -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
         sqlx::raw_sql(mutation).execute(&db.pool).await?;
@@ -297,7 +395,9 @@ async fn assert_preflight_rejects_single_mutation(mutation: &str, invariant: &st
 
 #[tokio::test]
 async fn starts_allocate_icarus_ids_and_persist_authoritative_event_fields() -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
     let first = event(0, "notepad.exe", "Notepad", "notes", "first text", None);
     let mut second = event(
@@ -391,7 +491,9 @@ async fn starts_allocate_icarus_ids_and_persist_authoritative_event_fields() -> 
 
 #[tokio::test]
 async fn concurrent_starts_allocate_each_machine_sequence_once() -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
     let left = event(0, "notepad.exe", "Notepad", "left", "left text", None);
     let right = event(1, "notepad.exe", "Notepad", "right", "right text", None);
@@ -413,7 +515,9 @@ async fn concurrent_starts_allocate_each_machine_sequence_once() -> Result<()> {
 
 #[tokio::test]
 async fn merge_refreshes_app_title_latest_text_and_domain_metadata() -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
     let started = event(0, "msedge.exe", "Edge", "old title", "old text", None);
     let event_id = writer.write_start(&started, SplitReason::Initial).await?;
@@ -540,7 +644,9 @@ async fn repeated_app_sightings_preserve_first_seen_and_advance_last_seen() -> R
     // and last_seen_at. Nothing read either timestamp back, so adding
     // `first_seen_at = EXCLUDED.first_seen_at` - which destroys the whole
     // meaning of "first seen" - passed the entire suite.
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
         let first = event(0, "notepad.exe", "Notepad", "notes", "first text", None);
@@ -607,7 +713,9 @@ async fn merge_never_reaches_an_event_owned_by_another_machine() -> Result<()> {
     // machine's writer would happily overwrite another machine's event row -
     // silently corrupting rows it does not own. Two machines share the
     // disposable schema here, exactly as they would share a real database.
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let icarus = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
         let daedalus =
@@ -643,7 +751,9 @@ async fn merge_never_reaches_an_event_owned_by_another_machine() -> Result<()> {
 
 #[tokio::test]
 async fn preflight_verifies_postgres_schema_and_machine_identity() -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
         let report = writer.preflight().await?;
@@ -659,7 +769,9 @@ async fn preflight_verifies_postgres_schema_and_machine_identity() -> Result<()>
 
 #[tokio::test]
 async fn preflight_rejects_named_tables_without_writer_columns() -> Result<()> {
-    let db = TestDatabase::create_with_schema(MALFORMED_WRITER_SCHEMA).await?;
+    let Some(db) = TestDatabase::create_with_schema(MALFORMED_WRITER_SCHEMA).await? else {
+        return Ok(());
+    };
     let test_result = async {
         let accepted = match PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await
         {
@@ -886,7 +998,9 @@ async fn preflight_rejects_swapped_readable_and_ocr_search_weights() -> Result<(
 
 #[tokio::test]
 async fn explicit_postgres_writer_creates_no_sqlite_or_file_backend() -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let temp = tempfile::tempdir()?;
     let sqlite_path = temp.path().join("screen-memory.sqlite");
     unsafe {
@@ -910,8 +1024,9 @@ async fn explicit_postgres_writer_creates_no_sqlite_or_file_backend() -> Result<
 #[tokio::test]
 #[ignore = "post-suite audit for disposable PostgreSQL schema cleanup"]
 async fn no_disposable_writer_schemas_remain() -> Result<()> {
-    let database_url = env::var("SCREEN_MEMORY_DATABASE_URL")
-        .context("SCREEN_MEMORY_DATABASE_URL must be injected for PostgreSQL tests")?;
+    let Some(database_url) = test_database_url() else {
+        return Ok(());
+    };
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)
@@ -941,7 +1056,9 @@ async fn connect_refuses_an_unsupported_server_before_touching_it() -> Result<()
     // can override: there was no way to present an old server without owning
     // one. `connect_with_server_version` takes the number as a parameter for
     // exactly this reason.
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let pool = PgPoolOptions::new()
             .max_connections(2)
@@ -1002,7 +1119,9 @@ async fn search_finds_by_words_by_time_and_by_both() -> Result<()> {
     // The read path. Until it existed this system was write-only: it recorded
     // continuously and offered no way to ask it anything, which made every
     // other property of it unverifiable by a person.
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
 

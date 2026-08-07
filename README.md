@@ -36,6 +36,22 @@ The three interactive Windows tests remain ignored by default. They require an
 unlocked desktop with a controlled foreground window and must not be treated as
 live proof merely because the normal workspace tests pass.
 
+The PostgreSQL integration suite (`postgres_writer`) reads its own variable,
+`SCREEN_MEMORY_TEST_DATABASE_URL`, and skips with a single `SKIPPED
+postgres_writer:` line when it is unset - so the command above passes with no
+environment at all, and a skipped run is never mistaken for a run that
+exercised the database. The variable is separate from the agent's
+`SCREEN_MEMORY_DATABASE_URL`, with no fallback to it, because the suite issues
+`CREATE SCHEMA` and `DROP SCHEMA CASCADE` and Doppler injects the live capture
+database. Whatever URL is supplied must still name a database whose name ends
+in `_test`; anything else is refused. To run it against the disposable
+database:
+
+```powershell
+$env:SCREEN_MEMORY_TEST_DATABASE_URL = 'postgresql://<user>:<password>@127.0.0.1:5432/screen_memory_test'
+cargo test --workspace
+```
+
 ## Runtime and secrets contract
 
 PostgreSQL is the only canonical store. The runtime reads the connection string
