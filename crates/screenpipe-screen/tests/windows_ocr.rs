@@ -177,6 +177,44 @@ async fn recognizes_a_real_windows_drawn_bitmap() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn a_frame_wider_than_the_engine_accepts_is_still_recognized() {
+    // Windows OCR refuses a bitmap whose longest side exceeds
+    // `OcrEngine::MaxImageDimension`, and a display wide enough to produce one
+    // produces it on every tick - so the refusal never clears and the recorder
+    // recognises nothing for the life of the run while still paying for the
+    // capture, the conversion and the encode each time.
+    //
+    // This drives the real engine, not the arithmetic: it is the assertion
+    // that the scaled frame is actually accepted, which no unit test of the
+    // scaling function can make.
+    const WIDTH: u32 = 10_400;
+    const HEIGHT: u32 = 160;
+    // The fixture has to actually exceed the limit or this test passes
+    // vacuously. 10,000 is the documented `MaxImageDimension` and what this
+    // machine's engine reports; a compile-time bound means trimming WIDTH
+    // fails the build rather than quietly emptying the test.
+    const {
+        assert!(
+            WIDTH > 10_000,
+            "the fixture no longer exceeds the OCR limit"
+        );
+    }
+    let mut pixels = vec![0xFF_u8; (WIDTH * HEIGHT * 4) as usize];
+    // One dark row, so the bitmap is not uniform and the encode has something
+    // to do. The text this frame carries is irrelevant - being accepted at all
+    // is the property under test.
+    for pixel in pixels[..(WIDTH * 4) as usize].chunks_exact_mut(4) {
+        pixel[..3].fill(0);
+    }
+    let frame = TransientFrame::from_bgra(WIDTH, HEIGHT, WIDTH * 4, pixels).unwrap();
+
+    WindowsOcr
+        .recognize(&frame)
+        .await
+        .expect("an oversized frame must be scaled to fit rather than failing forever");
+}
+
 #[test]
 fn transient_frame_rejects_invalid_bgra_layouts() {
     assert!(TransientFrame::from_bgra(0, 1, 0, Vec::new()).is_err());
