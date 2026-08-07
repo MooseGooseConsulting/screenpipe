@@ -119,17 +119,26 @@ available without rendering the connection value.
 
 ### TLS
 
-The database is a CloudNativePG cluster reached over the LAN by IP, so the
-connection is TLS. `sqlx` is built with `tls-native-tls`, and the connection
-string uses `sslmode=verify-ca` plus `sslrootcert`. SQLx adds that CA directly to
-the connector, validates the server certificate chain, and skips only hostname
-verification. No machine-wide Windows trust-store change is required.
+The database is the CloudNativePG cluster reached over the LAN at
+`pg18-core-db.moosegoose.xyz`, which resolves to `192.168.30.205`. `sqlx` is
+built with `tls-native-tls`, and the live connection string uses
+`sslmode=verify-full` plus `sslrootcert`. SQLx adds that CA directly to the
+connector and validates both the server certificate chain and the hostname.
+No machine-wide Windows trust-store change is required.
 
-The server certificate carries in-cluster DNS SANs and no IP SAN, so
-`sslmode=verify-full` cannot work while the recorder reaches the LoadBalancer by
-IP. Do not replace `verify-ca` with `require`: that would keep encryption but
-remove server-certificate validation. Once the LAN service has a real DNS name
-covered by the certificate, move the shared connection URL to `verify-full`.
+The hostname is covered by the CNPG server certificate's SANs. Connecting with
+`verify-full` to the bare `192.168.30.205` is intentionally rejected because
+the certificate does not contain that IP, so the hostname check is not merely
+configured but enforced. The CNPG CA expires on `2026-10-21`; re-export it
+before then with the homelab repository's `ops/Sync-ClusterDbTrust.ps1`
+procedure.
+
+The previous IP-only configuration used `sslmode=verify-ca`, which validates
+the CA chain while skipping only hostname verification. That remains valid
+compatibility behavior for deployments without a certificate-covered DNS name,
+but do not replace it with `require`: `require` would keep encryption while
+removing certificate validation. The live endpoint now supports the stronger
+`verify-full` mode.
 
 ## Per-user service contract
 
