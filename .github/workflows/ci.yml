@@ -1,0 +1,85 @@
+name: CI
+
+# The headless strip deleted every upstream workflow, including secret
+# scanning, and left the fork with no automated coverage at all - on the
+# branch that introduces database credential handling and a service installer.
+# This is the replacement, scoped to what the pruned workspace actually is: a
+# Windows-only capture agent.
+
+on:
+  push:
+    branches: [main, "feat/**", "fix/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    name: Build and test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the channel, the msvc target, and the
+      # rustfmt/clippy components, so this needs no version arguments.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: none
+      - run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # Two classes of test are deliberately excluded here, and each is
+      # excluded for a reason that a hosted runner cannot satisfy:
+      #
+      #   postgres_writer  needs a live PostgreSQL 18 server and an injected
+      #                    SCREEN_MEMORY_DATABASE_URL.
+      #   the live-desktop targets (capture_content, merge_boundary_live,
+      #                    foreground_capture, browser_url_live, windows_ocr,
+      #                    wgc_timeout_ab) need an unlocked interactive
+      #                    desktop. Their capability probe would skip them on a
+      #                    runner, and a skip that is invisible in CI is the
+      #                    same lie #[ignore] was.
+      #
+      # Both are run locally on the qualification machine. CI covers the
+      # deterministic remainder; it is not a substitute for that run.
+      - name: Test (deterministic targets)
+        run: >
+          cargo test --workspace
+          --lib --bins
+          --test cadence
+          --test merge_contract
+          --test text_hash
+          --test debug_redaction
+          --test browser_url
+          --test cli_surface
+
+      - name: Verify the workspace stayed pruned
+        shell: pwsh
+        run: ./scripts/verify-pruned.ps1

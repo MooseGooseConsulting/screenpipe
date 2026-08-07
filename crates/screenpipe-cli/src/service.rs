@@ -1281,8 +1281,8 @@ $parseErrors = $null
     #[cfg(test)]
     fn spawn_process_at(path: &std::path::Path) -> std::process::Child {
         std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
-        let system_ping = std::path::Path::new(&std::env::var("SystemRoot").unwrap())
-            .join(r"System32\PING.EXE");
+        let system_ping =
+            std::path::Path::new(&std::env::var("SystemRoot").unwrap()).join(r"System32\PING.EXE");
         std::fs::copy(&system_ping, path).unwrap();
         Command::new(path)
             .args(["-n", "60", "127.0.0.1"])

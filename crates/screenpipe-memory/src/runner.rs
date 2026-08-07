@@ -6,6 +6,12 @@ use crate::{
     OpenEvent, SplitReason, TextIdentity,
 };
 
+// The `Sample` variant is ~216 bytes against `Gap`'s 1. Boxing to even that
+// out would buy an allocation per capture on a path that produces at most one
+// value every two seconds, and would put an indirection between the runner and
+// the sample it immediately destructures. The size difference is real and
+// deliberate, not an oversight.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SampleRead {
     Sample {

@@ -294,11 +294,17 @@ mod tests {
         // idle window would clear the threshold and open its own one-sample
         // event, collapsing the merge ratio Goal 1 measures. A full extra
         // cadence interval is the smallest margin that absorbs it.
-        assert!(
-            IDLE_GAP_SECONDS >= screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS * 2,
-            "idle gap {IDLE_GAP_SECONDS}s leaves no room above the slowest cadence {}s",
-            screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS
-        );
+        // A `const` block, not a runtime assert: both operands are constants,
+        // so this is an invariant of the build rather than an observation about
+        // a run. Evaluating it at compile time means trimming the margin fails
+        // `cargo build`, not merely `cargo test` - it cannot be missed by
+        // anyone who skips the suite.
+        const {
+            assert!(
+                IDLE_GAP_SECONDS >= screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS * 2,
+                "idle gap leaves no room above the slowest cadence"
+            );
+        }
     }
 
     struct QueuedSamples(std::collections::VecDeque<SampleRead>);
@@ -357,7 +363,7 @@ mod tests {
                         readable_text: "an unchanged idle window".to_owned(),
                         browser_url: None,
                     },
-                    cadence: idle_cadence.clone(),
+                    cadence: idle_cadence,
                 })
                 .collect(),
         );
@@ -530,8 +536,12 @@ mod tests {
         // High enough that ordinary transients (a PostgreSQL restart, a lock
         // screen) are ridden out, low enough that a permanent fault reaches the
         // wrapper restart in minutes rather than never.
-        assert!(super::MAX_CONSECUTIVE_FAILURES >= 10);
-        assert!(super::MAX_CONSECUTIVE_FAILURES <= 100);
+        // Compile-time, for the same reason as the idle-gap invariant above:
+        // this bounds a constant, so it should fail the build.
+        const {
+            assert!(super::MAX_CONSECUTIVE_FAILURES >= 10);
+            assert!(super::MAX_CONSECUTIVE_FAILURES <= 100);
+        }
 
         let total: u64 = (1..=super::MAX_CONSECUTIVE_FAILURES)
             .map(|attempt| super::failure_backoff(attempt).as_secs())

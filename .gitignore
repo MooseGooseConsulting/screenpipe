@@ -7,3 +7,13 @@
 *.pdb
 *.exe
 *.dll
+
+# Restored from the pre-strip .gitignore. The headless refactor dropped this
+# rule on the same branch that introduced database credential handling, so an
+# untracked .secrets file was one `git add -A` away from being committed.
+.secrets
+
+# Working state of scripts/Test-Mutation.ps1. It holds verbatim copies of
+# source files taken before each mutation; a run killed mid-flight leaves them
+# behind, and they must never be mistaken for source.
+.mutation-backup/
