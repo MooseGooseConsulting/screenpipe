@@ -244,19 +244,39 @@ impl PgEventWriter {
             .connect(database_url)
             .await
             .context("connect PostgreSQL event writer")?;
-        // The version floor is enforced HERE, not only in `preflight`.
-        //
-        // `run_capture` calls `connect` and never `preflight` - only `doctor`
-        // does - so the guard was unreachable on the one path that actually
-        // writes for 24 hours. Pointed at an older server holding the
-        // authoritative schema, `validate_authoritative_schema` passes and the
-        // agent would have run against a server the writer declares
-        // unsupported.
         let server_version_num =
             sqlx::query_scalar::<_, i32>("SELECT current_setting('server_version_num')::integer")
                 .fetch_one(&pool)
                 .await
                 .context("read PostgreSQL server version")?;
+        Self::connect_with_server_version(pool, server_version_num, slug, display_name).await
+    }
+
+    /// Everything `connect` does after it has learned the server version.
+    ///
+    /// Split out so the version floor can actually be TESTED on the write
+    /// path. It is enforced here and not only in `preflight`, because
+    /// `run_capture` calls `connect` and never `preflight` - only `doctor`
+    /// does - so the guard was unreachable on the one path that writes for 24
+    /// hours. Pointed at an older server holding the authoritative schema,
+    /// `validate_authoritative_schema` passes and the agent would have run
+    /// against a server the writer declares unsupported.
+    ///
+    /// Moving the guard there fixed the hole but left it unprotected: a
+    /// mutation deleting the call survived the whole suite, because
+    /// `server_version_num` comes from `current_setting('server_version_num')`,
+    /// a preset GUC no test can override. Taking it as a parameter is what
+    /// makes the check drivable without a PostgreSQL 15 server to point at.
+    ///
+    /// The order matters and is asserted: the version check runs BEFORE any
+    /// schema validation or write, so an unsupported server is rejected
+    /// without this writer having touched it.
+    pub async fn connect_with_server_version(
+        pool: PgPool,
+        server_version_num: i32,
+        slug: &str,
+        display_name: &str,
+    ) -> Result<Self> {
         ensure_supported_server_version(server_version_num)?;
         validate_authoritative_schema(&pool).await?;
         let machine_id = sqlx::query_scalar::<_, i64>(
@@ -451,7 +471,7 @@ fn checked_sample_count(event: &OpenEvent) -> Result<i32> {
 /// Minimum `server_version_num` the writer will run against. The authoritative
 /// schema uses a generated `search_tsv` column, so an older server cannot hold
 /// it.
-const MINIMUM_SERVER_VERSION_NUM: i32 = 180_000;
+pub const MINIMUM_SERVER_VERSION_NUM: i32 = 180_000;
 
 /// Extracted from `preflight` so it can be proven without a second PostgreSQL
 /// installation. Inline, the guard was untestable: every integration test runs

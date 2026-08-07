@@ -1,0 +1,130 @@
+[
+  {
+    "id": "hash-ledger-bound-removed",
+    "file": "crates/screenpipe-memory/src/merge.rs",
+    "find": "if self.counts.len() >= MAX_TRACKED_HASHES",
+    "replace": "if self.counts.len() >= usize::MAX",
+    "package": "screenpipe-memory",
+    "claim": "the per-event hash ledger is bounded, so one event cannot accumulate a key per sample"
+  },
+  {
+    "id": "hash-ledger-eviction-uncounted",
+    "file": "crates/screenpipe-memory/src/merge.rs",
+    "find": "self.evicted = self.evicted.saturating_add(1);",
+    "replace": "self.evicted = self.evicted;",
+    "package": "screenpipe-memory",
+    "claim": "evicted hashes are counted, so merge_meta distinguishes a truncated ledger from a complete census"
+  },
+  {
+    "id": "hash-ledger-evicts-newest-instead-of-oldest",
+    "file": "crates/screenpipe-memory/src/merge.rs",
+    "find": "&& let Some(oldest) = self.order.pop_front()",
+    "replace": "&& let Some(oldest) = self.order.pop_back()",
+    "package": "screenpipe-memory",
+    "claim": "eviction is oldest-first, so `contains` answers \"seen recently\""
+  },
+  {
+    "id": "gap-clears-the-failure-streak",
+    "file": "crates/screenpipe-cli/src/main.rs",
+    "find": "        IterationKind::Gap => {\n            *consecutive_gaps = consecutive_gaps.saturating_add(1);",
+    "replace": "        IterationKind::Gap => {\n            *consecutive_failures = 0;\n            *consecutive_gaps = consecutive_gaps.saturating_add(1);",
+    "package": "screenpipe-cli",
+    "claim": "only a persisted observation clears the failure streak; a gap is not a success"
+  },
+  {
+    "id": "gaps-never-reach-a-ceiling",
+    "file": "crates/screenpipe-cli/src/main.rs",
+    "find": "            if *consecutive_gaps >= MAX_CONSECUTIVE_GAPS {\n                LoopStep::AbortGaps",
+    "replace": "            if *consecutive_gaps >= u32::MAX {\n                LoopStep::AbortGaps",
+    "package": "screenpipe-cli",
+    "claim": "an endless run of capture gaps terminates instead of spinning until logoff"
+  },
+  {
+    "id": "gap-retries-at-full-speed",
+    "file": "crates/screenpipe-cli/src/main.rs",
+    "find": "                LoopStep::Retry(failure_backoff(*consecutive_gaps))",
+    "replace": "                LoopStep::Continue",
+    "package": "screenpipe-cli",
+    "claim": "a gap backs off rather than retrying immediately"
+  },
+  {
+    "id": "failure-backoff-goes-flat",
+    "file": "crates/screenpipe-cli/src/main.rs",
+    "find": "    let seconds = 2_u64.saturating_pow(consecutive_failures.min(5));",
+    "replace": "    let seconds = 2_u64;",
+    "package": "screenpipe-cli",
+    "claim": "the failure backoff actually grows and reaches its documented 32s ceiling"
+  },
+  {
+    "id": "failure-ceiling-never-aborts",
+    "file": "crates/screenpipe-cli/src/main.rs",
+    "find": "            if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {\n                LoopStep::AbortFailures",
+    "replace": "            if *consecutive_failures >= u32::MAX {\n                LoopStep::AbortFailures",
+    "package": "screenpipe-cli",
+    "claim": "a persistent failure reaches the ceiling and hands off to the wrapper restart"
+  },
+  {
+    "id": "stop-script-kills-its-own-caller",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "                $_.ProcessId -ne $callerPid -and\n                [string]::Equals(\n                    $_.ExecutablePath,",
+    "replace": "                [string]::Equals(\n                    $_.ExecutablePath,",
+    "package": "screenpipe-cli",
+    "claim": "the stop script spares the process managing it, so restart reaches task registration"
+  },
+  {
+    "id": "stop-script-accepts-a-missing-caller-pid",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "if (-not [int]::TryParse($env:SCREENPIPE_CALLER_PID, [ref]$callerPid)) {\n    throw \"SCREENPIPE_CALLER_PID was not supplied as an integer.\"\n}\nfunction Get-ScreenpipeOwnedProcess {",
+    "replace": "[void][int]::TryParse($env:SCREENPIPE_CALLER_PID, [ref]$callerPid)\nfunction Get-ScreenpipeOwnedProcess {",
+    "package": "screenpipe-cli",
+    "claim": "a missing caller PID is rejected loudly rather than defaulting to 0 and killing the caller"
+  },
+  {
+    "id": "status-counts-the-process-asking",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "            $_.ProcessId -ne $callerPid -and\n            [string]::Equals(\n                $_.ExecutablePath,",
+    "replace": "            [string]::Equals(\n                $_.ExecutablePath,",
+    "package": "screenpipe-cli",
+    "claim": "`service status` reports the agent's state, not the state of the process asking"
+  },
+  {
+    "id": "task-registration-drops-battery-settings",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "-Principal $principal -Settings $settings -Force | Out-Null",
+    "replace": "-Principal $principal -Force | Out-Null",
+    "package": "screenpipe-cli",
+    "claim": "the registered task overrides the scheduler defaults that stop it on battery"
+  },
+  {
+    "id": "task-settings-allow-battery-stop",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "    -DontStopIfGoingOnBatteries `\n",
+    "replace": "",
+    "package": "screenpipe-cli",
+    "claim": "a running capture task is not stopped when the machine switches to battery"
+  },
+  {
+    "id": "task-settings-reinstate-the-three-day-kill",
+    "file": "crates/screenpipe-cli/src/service.rs",
+    "find": "    -ExecutionTimeLimit ([TimeSpan]::Zero) `\n",
+    "replace": "",
+    "package": "screenpipe-cli",
+    "claim": "the capture task has no execution time limit, so it survives past three days"
+  },
+  {
+    "id": "connect-skips-the-postgres-18-floor",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "        ensure_supported_server_version(server_version_num)?;\n        validate_authoritative_schema(&pool).await?;\n        let machine_id",
+    "replace": "        let _ = server_version_num;\n        validate_authoritative_schema(&pool).await?;\n        let machine_id",
+    "package": "screenpipe-memory",
+    "claim": "the PostgreSQL 18 floor is enforced on the path that actually writes, not only in doctor"
+  },
+  {
+    "id": "upsert-app-freezes-last-seen-at",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "             app_title = EXCLUDED.app_title, last_seen_at = EXCLUDED.last_seen_at \\",
+    "replace": "             app_title = EXCLUDED.app_title \\",
+    "package": "screenpipe-memory",
+    "claim": "a repeat app sighting advances apps.last_seen_at"
+  }
+]

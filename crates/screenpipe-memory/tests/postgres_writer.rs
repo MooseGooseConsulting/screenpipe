@@ -5,7 +5,8 @@ use anyhow::{Context, Result, ensure};
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
     CadenceInput, CadenceRecord, CaptureGapSummary, HashLedger, MERGE_CONTRACT_VERSION,
-    MergeDecisionKind, ObservationSample, OpenEvent, PgEventWriter, SplitReason,
+    MINIMUM_SERVER_VERSION_NUM, MergeDecisionKind, ObservationSample, OpenEvent, PgEventWriter,
+    SplitReason,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -99,6 +100,60 @@ struct TestDatabase {
     schema: String,
 }
 
+/// The database name this suite is allowed to create and drop schemas in.
+///
+/// Deliberately an exact suffix rather than a substring: `screen_memory`
+/// contains no `_test`, but a substring rule would also accept something like
+/// `test_screen_memory_live`, and the point is to be unambiguous about which
+/// database is disposable.
+const TEST_DATABASE_SUFFIX: &str = "_test";
+
+fn database_name(database_url: &str) -> Option<&str> {
+    let after_scheme = database_url.split("://").nth(1)?;
+    let path = after_scheme.split_once('/')?.1;
+    let name = path.split(['?', '#']).next()?;
+    (!name.is_empty()).then_some(name)
+}
+
+fn ensure_test_database(database_url: &str) -> Result<()> {
+    let name =
+        database_name(database_url).context("SCREEN_MEMORY_DATABASE_URL has no database name")?;
+    ensure!(
+        name.ends_with(TEST_DATABASE_SUFFIX),
+        "refusing to run schema-mutating tests against database {name:?}: \
+         this suite issues CREATE SCHEMA and DROP SCHEMA CASCADE, so it will \
+         only run against a database whose name ends in {TEST_DATABASE_SUFFIX:?}. \
+         Point SCREEN_MEMORY_DATABASE_URL at {name}{TEST_DATABASE_SUFFIX}."
+    );
+    Ok(())
+}
+
+#[test]
+fn the_production_capture_database_is_refused() {
+    // The exact URL Doppler injects must be rejected. Without this the suite
+    // silently ran DDL inside the live capture database.
+    let production = "postgresql://screen_memory:secret@127.0.0.1:5432/screen_memory";
+    let error = ensure_test_database(production).unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("refusing to run schema-mutating tests"),
+        "expected a refusal, got: {rendered}"
+    );
+    // The refusal must not echo the credential it was handed.
+    assert!(
+        !rendered.contains("secret"),
+        "the refusal leaked the connection secret: {rendered}"
+    );
+
+    ensure_test_database("postgresql://u:p@127.0.0.1:5432/screen_memory_test")
+        .expect("the test database must be accepted");
+    ensure_test_database("postgresql://u:p@127.0.0.1:5432/screen_memory_test?sslmode=disable")
+        .expect("query parameters must not defeat the check");
+    // A name that merely CONTAINS the marker is not the test database.
+    ensure_test_database("postgresql://u:p@127.0.0.1:5432/test_screen_memory")
+        .expect_err("a substring match must not be accepted");
+}
+
 impl TestDatabase {
     async fn create() -> Result<Self> {
         Self::create_with_schema(AUTHORITATIVE_SCHEMA).await
@@ -107,6 +162,15 @@ impl TestDatabase {
     async fn create_with_schema(schema_sql: &str) -> Result<Self> {
         let database_url = env::var("SCREEN_MEMORY_DATABASE_URL")
             .context("SCREEN_MEMORY_DATABASE_URL must be injected for PostgreSQL tests")?;
+        // Refuse to run anywhere that is not obviously a test database.
+        //
+        // Doppler injects the PRODUCTION url, and the redirect to
+        // screen_memory_test lived only in whatever shell command happened to
+        // invoke cargo. Nothing stopped this suite from issuing CREATE SCHEMA
+        // and DROP SCHEMA CASCADE inside the live capture database - and it
+        // had already done so. The guard belongs here, next to the DDL, because
+        // it must hold however the tests are invoked.
+        ensure_test_database(&database_url)?;
         let schema = format!(
             "goal1_writer_{}_{}",
             std::process::id(),
@@ -849,4 +913,71 @@ async fn no_disposable_writer_schemas_remain() -> Result<()> {
     println!("goal1_writer_schema_count={schema_count}");
     ensure!(schema_count == 0, "disposable writer schemas remain");
     Ok(())
+}
+
+#[tokio::test]
+async fn connect_refuses_an_unsupported_server_before_touching_it() -> Result<()> {
+    // The PostgreSQL 18 floor was moved into `connect` because `run_capture`
+    // never calls `preflight` - only `doctor` does - so the guard was
+    // unreachable on the one path that writes for 24 hours.
+    //
+    // That fix then survived a mutation deleting the call, because the version
+    // comes from `current_setting('server_version_num')`, a preset GUC no test
+    // can override: there was no way to present an old server without owning
+    // one. `connect_with_server_version` takes the number as a parameter for
+    // exactly this reason.
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&db.scoped_url)
+            .await
+            .context("connect a pool for the version guard")?;
+
+        // One below the floor. PostgreSQL 17.9 would report 170_009.
+        let rejected = PgEventWriter::connect_with_server_version(
+            pool.clone(),
+            MINIMUM_SERVER_VERSION_NUM - 1,
+            "icarus",
+            "Icarus-Laptop",
+        )
+        .await;
+        let error = rejected
+            .err()
+            .context("an unsupported server version must be refused")?;
+        ensure!(
+            format!("{error:#}").contains("PostgreSQL 18 or newer"),
+            "expected a version refusal, got: {error:#}"
+        );
+
+        // The refusal must land BEFORE any write. A guard that rejects after
+        // upserting the machine row has already touched a server it declared
+        // unsupported.
+        let machines: i64 = sqlx::query_scalar("SELECT count(*) FROM machines")
+            .fetch_one(&pool)
+            .await
+            .context("count machines after the refusal")?;
+        ensure!(
+            machines == 0,
+            "the writer wrote to an unsupported server before rejecting it: {machines} machine row(s)"
+        );
+
+        // Positive control: at the floor exactly, the same call must succeed.
+        // Without this the guard could reject everything and still pass.
+        let accepted = PgEventWriter::connect_with_server_version(
+            pool.clone(),
+            MINIMUM_SERVER_VERSION_NUM,
+            "icarus",
+            "Icarus-Laptop",
+        )
+        .await;
+        ensure!(
+            accepted.is_ok(),
+            "a server at the minimum supported version must be accepted: {:#}",
+            accepted.err().expect("checked is_ok")
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
 }

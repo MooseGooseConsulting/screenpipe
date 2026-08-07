@@ -1589,4 +1589,37 @@ $parseErrors = $null
             );
         }
     }
+    #[test]
+    #[cfg(windows)]
+    fn real_scheduler_status_reports_an_absent_task_as_absent() {
+        // The ONLY test that exercises `WindowsTaskScheduler` itself.
+        //
+        // Every other scheduler test drives `FakeTaskScheduler`, so the real
+        // implementation could return a hardcoded `Ready`/`running` and the
+        // whole suite stayed green - a mutation that did exactly that survived
+        // the audit. `service status` is the one command whose entire purpose
+        // is to report reality, and reality was the one thing nothing checked.
+        //
+        // An absent task is the deterministic fixture: it needs no
+        // registration, no process, and no cleanup, and no fabricated answer
+        // can produce it. A binary path that does not exist pins the process
+        // half for the same reason.
+        let mut scheduler = super::WindowsTaskScheduler;
+        let absent_task = "MooseGoose Goal 1 Task That Must Not Exist";
+        let absent_binary = Path::new(r"C:\screenpipe-goal-1-nonexistentin\screenpipe.exe");
+
+        let status = scheduler
+            .status(absent_task, absent_binary)
+            .expect("status must succeed for an absent task");
+
+        assert_eq!(
+            status.task_state,
+            TaskState::Absent,
+            "status fabricated a task state for a task that is not registered"
+        );
+        assert!(
+            !status.process_running,
+            "status fabricated a running process for a binary path that does not exist"
+        );
+    }
 }
