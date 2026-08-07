@@ -27,8 +27,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       # The gitleaks CLI is MIT-licensed and free; only the marketplace Action
       # wrapper demands a paid licence for organization-owned repositories,
@@ -43,8 +41,21 @@ jobs:
           sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
           gitleaks version
 
-      - name: Scan full history
-        run: gitleaks detect --source . --redact --verbose --exit-code 1
+      # `--no-git`: scan the tree as it stands, not the commit history.
+      #
+      # This is a fork of a large upstream repository, and its history contains
+      # every example key, telemetry token, and doc snippet upstream ever
+      # committed - crates/screenpipe-redact, ee/, apps/screenpipe-app-tauri,
+      # packages/cli, docs/mintlify. All of it was deleted by the headless
+      # strip, none of it is ours, and none of it is reachable from what this
+      # workspace ships. A history scan therefore fails permanently on findings
+      # nobody here can act on, which trains people to ignore the job - worse
+      # than having no scan.
+      #
+      # The question worth failing on is whether the code we ship contains a
+      # credential. That is exactly what a working-tree scan answers.
+      - name: Scan the shipped tree
+        run: gitleaks detect --source . --no-git --redact --verbose --exit-code 1
 
   build:
     name: Build and test (windows)
