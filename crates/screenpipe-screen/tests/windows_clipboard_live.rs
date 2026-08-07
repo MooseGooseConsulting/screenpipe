@@ -228,6 +228,35 @@ fn current_text(owner: &OwnerWindow) -> Option<String> {
     Some(text)
 }
 
+/// Poll until the watcher gives an answer other than `Unavailable`.
+///
+/// A poll landing microseconds after another process wrote to the clipboard
+/// races every clipboard listener on the machine - clipboard history, cloud
+/// sync, any clipboard manager - and Windows answers `ERROR_ACCESS_DENIED`
+/// while one of them holds it. Measured here: the poll immediately after this
+/// test's own write is refused often enough to make a single-shot assertion
+/// flaky.
+///
+/// The production channel polls every two seconds and simply looks again, so
+/// it never sees this; this test writes and polls in the same microsecond, so
+/// it has to do the same thing on a tighter loop.
+///
+/// What the loop assumes is itself a property worth having: an `Unavailable`
+/// poll does NOT consume the generation, so the answer returned here is still
+/// the answer for the write that preceded it. If it consumed it, every
+/// assertion below would come back `Unchanged` instead.
+fn settled(watcher: &mut ClipboardWatcher) -> ClipboardRead {
+    for _ in 0..100 {
+        match watcher.poll() {
+            ClipboardRead::Unavailable => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            read => return read,
+        }
+    }
+    panic!("the clipboard stayed unopenable for two seconds after a write");
+}
+
 #[test]
 fn the_exclusion_formats_stop_a_capture_before_the_text_is_read() {
     let _serialized = CLIPBOARD.lock().unwrap_or_else(|error| error.into_inner());
@@ -247,7 +276,7 @@ fn the_exclusion_formats_stop_a_capture_before_the_text_is_read() {
     // every service restart.
     write_clipboard(&owner, "SCREENPIPE CLIPBOARD FIXTURE BASELINE", &[]);
     assert_eq!(
-        watcher.poll(),
+        settled(&mut watcher),
         ClipboardRead::Unchanged,
         "the first poll read the clipboard instead of learning where it was"
     );
@@ -255,10 +284,10 @@ fn the_exclusion_formats_stop_a_capture_before_the_text_is_read() {
     // Plain text is captured verbatim.
     let plain = "SCREENPIPE CLIPBOARD FIXTURE PLAIN TEXT";
     write_clipboard(&owner, plain, &[]);
-    assert_eq!(watcher.poll(), ClipboardRead::Text(plain.to_owned()));
+    assert_eq!(settled(&mut watcher), ClipboardRead::Text(plain.to_owned()));
 
     // Nothing new: the sequence has not moved, so nothing is read again.
-    assert_eq!(watcher.poll(), ClipboardRead::Unchanged);
+    assert_eq!(settled(&mut watcher), ClipboardRead::Unchanged);
 
     // Each refusal, alone, on a clipboard that also carries perfectly readable
     // text. Alone is what matters: tested together, deleting any single check
@@ -292,7 +321,7 @@ fn the_exclusion_formats_stop_a_capture_before_the_text_is_read() {
         let secret = format!("SCREENPIPE CLIPBOARD FIXTURE SECRET {index}");
         write_clipboard(&owner, &secret, &formats);
 
-        let read = watcher.poll();
+        let read = settled(&mut watcher);
 
         assert_eq!(read, ClipboardRead::Excluded, "{name} did not exclude");
         assert!(
@@ -312,7 +341,10 @@ fn the_exclusion_formats_stop_a_capture_before_the_text_is_read() {
             (can_upload_cloud, 1_u32.to_le_bytes().to_vec()),
         ],
     );
-    assert_eq!(watcher.poll(), ClipboardRead::Text(allowed.to_owned()));
+    assert_eq!(
+        settled(&mut watcher),
+        ClipboardRead::Text(allowed.to_owned())
+    );
 
     // A generation with no Unicode text in it is ignored rather than recorded
     // as an empty observation.
@@ -321,11 +353,11 @@ fn the_exclusion_formats_stop_a_capture_before_the_text_is_read() {
         unsafe { EmptyClipboard() }.expect("EmptyClipboard");
         set_format(can_upload_cloud, &1_u32.to_le_bytes());
     }
-    assert_eq!(watcher.poll(), ClipboardRead::NoText);
+    assert_eq!(settled(&mut watcher), ClipboardRead::NoText);
 
     // Neither is whitespace.
     write_clipboard(&owner, "   \t\r\n ", &[]);
-    assert_eq!(watcher.poll(), ClipboardRead::NoText);
+    assert_eq!(settled(&mut watcher), ClipboardRead::NoText);
 
     // Give the operator their clipboard back.
     match operators_text {
