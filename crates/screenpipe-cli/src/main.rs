@@ -46,6 +46,13 @@ enum Command {
         #[arg(long, default_value = DEFAULT_DISPLAY_NAME)]
         display_name: String,
     },
+    /// Search recorded screen memory.
+    Search {
+        /// Words to look for. Ranked, not literal.
+        query: Vec<String>,
+        #[arg(long, default_value_t = 10)]
+        limit: i64,
+    },
     /// Manage the per-user headless service.
     Service {
         #[command(subcommand)]
@@ -77,8 +84,56 @@ async fn main() -> anyhow::Result<()> {
             let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
             run_doctor(&database_url, &machine_slug, &display_name).await
         }
+        Command::Search { query, limit } => {
+            let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
+            run_search(&database_url, &query.join(" "), limit).await
+        }
         Command::Service { action } => run_service_action(action),
     }
+}
+
+async fn run_search(database_url: &str, query: &str, limit: i64) -> Result<()> {
+    // Connects with the same writer used by `run`, so search is subject to the
+    // identical schema and server-version guards. A read path that accepts a
+    // database the writer would refuse could show results from a shape nothing
+    // else in this system agrees with.
+    let writer =
+        PgEventWriter::connect(database_url, DEFAULT_MACHINE_SLUG, DEFAULT_DISPLAY_NAME).await?;
+    let hits = writer.search(query, limit).await?;
+
+    if hits.is_empty() {
+        println!("no matches for {query:?}");
+        return Ok(());
+    }
+
+    for hit in &hits {
+        let minutes = (hit.ended_at - hit.started_at).num_minutes();
+        let label = hit
+            .title
+            .as_deref()
+            .or(hit.app_title.as_deref())
+            .unwrap_or("(untitled)");
+        println!(
+            "{}  {}  ({} samples, {} min)",
+            hit.started_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M"),
+            label,
+            hit.sample_count,
+            minutes.max(0)
+        );
+        if let Some(url) = hit.browser_url.as_deref() {
+            println!("    {url}");
+        }
+        let snippet = hit.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !snippet.is_empty() {
+            println!("    {snippet}");
+        }
+        println!("    {}", hit.event_id);
+        println!();
+    }
+    println!("{} match(es)", hits.len());
+    Ok(())
 }
 
 fn required_database_url(value: Option<OsString>) -> Result<String> {

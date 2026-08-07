@@ -356,8 +356,8 @@ impl PgEventWriter {
         sqlx::query(
             "INSERT INTO events (\
                  id, machine_id, seq, kind, started_at, ended_at, app_id, window_title, \
-                 ocr_text, readable_text, ocr_text_hash, sample_count, merge_meta\
-             ) VALUES ($1, $2, $3, 'screen', $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                 ocr_text, readable_text, ocr_text_hash, sample_count, merge_meta, title\
+             ) VALUES ($1, $2, $3, 'screen', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&event_id)
         .bind(machine_id)
@@ -371,6 +371,7 @@ impl PgEventWriter {
         .bind(&event.latest_exact_ocr_hash)
         .bind(sample_count)
         .bind(merge_meta)
+        .bind(event_title(event))
         .execute(&mut *transaction)
         .await
         .context("insert allocated screen event")?;
@@ -387,8 +388,8 @@ impl PgEventWriter {
             "UPDATE events SET \
                  ended_at = $1, app_id = $2, window_title = $3, ocr_text = $4, \
                  readable_text = $5, ocr_text_hash = $6, sample_count = $7, \
-                 merge_meta = $8, updated_at = now() \
-             WHERE id = $9 AND machine_id = $10",
+                 merge_meta = $8, title = $9, updated_at = now() \
+             WHERE id = $10 AND machine_id = $11",
         )
         .bind(event.ended_at)
         .bind(app_id)
@@ -398,6 +399,7 @@ impl PgEventWriter {
         .bind(&event.latest_exact_ocr_hash)
         .bind(sample_count)
         .bind(merge_meta)
+        .bind(event_title(event))
         .bind(event_id)
         .bind(self.machine_id)
         .execute(&mut *transaction)
@@ -486,6 +488,33 @@ fn ensure_supported_server_version(server_version_num: i32) -> Result<()> {
     Ok(())
 }
 
+/// The weight-A search term for an event.
+///
+/// `title` was NULL on every row this system had ever written - 784 of 784 -
+/// so the highest-weighted branch of `search_tsv` was empty everywhere and
+/// ranking could not distinguish "the window I worked in" from "a word that
+/// happened to be on screen". Every event ranked purely on its OCR body.
+///
+/// There is no summarizer yet, so this is the best honest label available: the
+/// application and the window it was showing. It is deliberately NOT the raw
+/// window title alone, which already carries weight D - the point is to give
+/// ranking the app name too, since "Notepad" is how a person remembers where
+/// they were.
+///
+/// Whitespace-collapsed, and `None` rather than an empty string when there is
+/// nothing to say, so a blank title never outranks a real one.
+fn event_title(event: &OpenEvent) -> Option<String> {
+    let app = event.latest.app_title.trim();
+    let window = event.latest.window_title.trim();
+    let joined = match (app.is_empty(), window.is_empty()) {
+        (true, true) => return None,
+        (true, false) => window.to_owned(),
+        (false, true) => app.to_owned(),
+        (false, false) => format!("{app} - {window}"),
+    };
+    Some(joined.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
     json!({
         "merge_contract_version": event.merge_contract_version,
@@ -542,5 +571,89 @@ mod tests {
             ensure_supported_server_version(accepted)
                 .unwrap_or_else(|error| panic!("{accepted} must be accepted: {error:#}"));
         }
+    }
+}
+
+/// One search hit, shaped for a human reading a terminal.
+///
+/// Deliberately does NOT carry `ocr_text`. A search result is displayed, and
+/// the full OCR of a screen is the most sensitive thing this system holds; a
+/// snippet around the match is what a person needs to recognise the moment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub event_id: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: chrono::DateTime<chrono::Utc>,
+    pub sample_count: i32,
+    pub title: Option<String>,
+    pub app_title: Option<String>,
+    pub browser_url: Option<String>,
+    /// PostgreSQL `ts_headline` output: the matching words in context, with
+    /// the matches wrapped in `[` and `]`.
+    pub snippet: String,
+}
+
+impl PgEventWriter {
+    /// Full-text search over recorded events, newest-and-best first.
+    ///
+    /// This is the read path. Until it existed the system was write-only: it
+    /// recorded continuously and offered no way to ask it anything, which made
+    /// every other property of it unverifiable by a person.
+    ///
+    /// Ranking is `ts_rank_cd` over the weighted `search_tsv`, so a match in
+    /// the event title outranks one buried in the OCR body - which is the
+    /// entire reason the weights exist.
+    pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<SearchHit>> {
+        ensure!(!query.trim().is_empty(), "search query is blank");
+        ensure!((1..=200).contains(&limit), "limit must be 1..=200");
+
+        let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i32, Option<String>, Option<String>, Option<String>, String)>(
+            "SELECT e.id, e.started_at, e.ended_at, e.sample_count, e.title, a.app_title, \
+                    e.merge_meta ->> 'browser_url', \
+                    ts_headline('english', \
+                                left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 20000), \
+                                plainto_tsquery('english', $1), \
+                                'StartSel=[, StopSel=], MaxFragments=2, FragmentDelimiter= ... , MaxWords=18, MinWords=6') \
+             FROM events e \
+             LEFT JOIN apps a ON a.id = e.app_id \
+             WHERE e.machine_id = $2 \
+               AND e.search_tsv @@ plainto_tsquery('english', $1) \
+             ORDER BY ts_rank_cd(e.search_tsv, plainto_tsquery('english', $1)) DESC, \
+                      e.started_at DESC \
+             LIMIT $3",
+        )
+        .bind(query)
+        .bind(self.machine_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("search recorded events")?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    event_id,
+                    started_at,
+                    ended_at,
+                    sample_count,
+                    title,
+                    app_title,
+                    browser_url,
+                    snippet,
+                )| {
+                    SearchHit {
+                        event_id,
+                        started_at,
+                        ended_at,
+                        sample_count,
+                        title,
+                        app_title,
+                        browser_url,
+                        snippet,
+                    }
+                },
+            )
+            .collect())
     }
 }

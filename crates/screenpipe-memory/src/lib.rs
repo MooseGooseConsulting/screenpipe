@@ -12,7 +12,7 @@ pub use merge::{
     CaptureGap, CaptureGapSummary, HashLedger, MAX_TRACKED_HASHES, MERGE_CONTRACT_VERSION,
     MergeConfig, MergeDecision, MergeDecisionKind, Merger, OpenEvent, SplitReason,
 };
-pub use postgres::{MINIMUM_SERVER_VERSION_NUM, PgEventWriter, PgPreflight};
+pub use postgres::{MINIMUM_SERVER_VERSION_NUM, PgEventWriter, PgPreflight, SearchHit};
 pub use runner::{EventId, EventSink, RunOutcome, Runner, SampleRead, SampleSource};
 pub use sample::ObservationSample;
 pub use text_hash::{TextIdentity, jaccard_overlap};

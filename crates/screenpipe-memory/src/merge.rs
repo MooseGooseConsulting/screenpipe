@@ -10,7 +10,7 @@ use crate::text_hash::{TextIdentity, jaccard_overlap, normalize_text};
 /// recorded every distinct OCR hash they ever saw; version 2 events record at
 /// most `MAX_TRACKED_HASHES` and carry an eviction count, so `hashes_seen` is
 /// no longer a complete census and must not be read as one.
-pub const MERGE_CONTRACT_VERSION: u32 = 2;
+pub const MERGE_CONTRACT_VERSION: u32 = 3;
 
 /// Upper bound on distinct OCR hashes remembered inside one open event.
 ///
@@ -250,25 +250,47 @@ impl Merger {
             );
         };
 
+        // CONTENT DECIDES. The window title is a hint, not the authority.
+        //
+        // This used to test the title second, before content was consulted at
+        // all, and a title change short-circuited straight to a split. A window
+        // title is a presentation surface: apps put spinners, unsaved-change
+        // markers, notification counts and download percentages in it. Every
+        // one of those became a semantic event boundary.
+        //
+        // Measured on 784 real events from this machine: 690 of them - 88% -
+        // started because of a title change, averaging 3.2 samples each. The
+        // control was in the same table. Events that started from an app change
+        // - an unambiguous, real change of activity - averaged 24.1 samples,
+        // 7.5x longer. Nothing about the underlying activity was that
+        // fragmented; the segmentation was. Content only ever got a vote 59
+        // times, because the title check ran first and almost always fired.
+        //
+        // So the order is inverted. If the text is continuous - the same screen
+        // seen before, or enough five-gram overlap to be a scroll - this is the
+        // same activity and the title is decoration. A title change still
+        // splits, but only when the content changed too, and it keeps its own
+        // reason code because "the title changed" is the more informative
+        // description of what happened.
         let reason = if sample.app_key != open.latest.app_key {
             Some(SplitReason::AppChange)
-        } else if normalize_text(&sample.window_title) != normalize_text(&open.latest.window_title)
-        {
-            Some(SplitReason::WindowTitleChange)
         } else if sample.captured_at - open.ended_at > self.config.idle_gap {
             Some(SplitReason::IdleGap)
         } else {
             let previous_identity = TextIdentity::from_ocr(&open.latest.ocr_text);
-            let resolved_merge_hash = if open.hash_counts.contains(&identity.exact_hash)
+            let content_continues = open.hash_counts.contains(&identity.exact_hash)
                 || jaccard_overlap(&previous_identity.five_grams, &identity.five_grams)
-                    >= self.config.scroll_overlap
-            {
-                open.merge_hash.clone()
-            } else {
-                identity.exact_hash.clone()
-            };
+                    >= self.config.scroll_overlap;
 
-            (resolved_merge_hash != open.merge_hash).then_some(SplitReason::TextHashChange)
+            if content_continues {
+                None
+            } else if normalize_text(&sample.window_title)
+                != normalize_text(&open.latest.window_title)
+            {
+                Some(SplitReason::WindowTitleChange)
+            } else {
+                Some(SplitReason::TextHashChange)
+            }
         };
 
         if let Some(reason) = reason {

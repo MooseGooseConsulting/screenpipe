@@ -317,7 +317,7 @@ async fn starts_allocate_icarus_ids_and_persist_authoritative_event_fields() -> 
     let second_id = writer.write_start(&second, SplitReason::AppChange).await?;
     let row = sqlx::query(
         "SELECT e.id, e.seq, e.kind, e.started_at, e.ended_at, e.window_title, e.ocr_text, \
-                e.readable_text, e.ocr_text_hash, e.sample_count, e.merge_meta, \
+                e.readable_text, e.ocr_text_hash, e.sample_count, e.merge_meta, e.title, \
                 m.slug, m.display_name, a.app_key, a.app_title \
          FROM events e JOIN machines m ON m.id = e.machine_id \
          JOIN apps a ON a.id = e.app_id WHERE e.id = $1",
@@ -340,6 +340,16 @@ async fn starts_allocate_icarus_ids_and_persist_authoritative_event_fields() -> 
     ensure!(row.try_get::<String, _>("ocr_text")? == "second text");
     ensure!(row.try_get::<String, _>("readable_text")? == "readable second text");
     ensure!(row.try_get::<String, _>("ocr_text_hash")? == "hash-1");
+    // `title` is the weight-A branch of search_tsv and was NULL on every row
+    // this system had ever written - 784 of 784 - so ranking could not tell the
+    // window someone worked in from a word that happened to be on screen.
+    // Nothing asserted it, so an INSERT that omitted the column entirely passed
+    // the whole suite.
+    ensure!(
+        row.try_get::<Option<String>, _>("title")? == Some("Microsoft Edge - browser".to_owned()),
+        "title was not persisted: {:?}",
+        row.try_get::<Option<String>, _>("title")?
+    );
     ensure!(row.try_get::<i32, _>("sample_count")? == 9);
     ensure!(row.try_get::<String, _>("slug")? == "icarus");
     ensure!(row.try_get::<String, _>("display_name")? == "Icarus-Laptop");
