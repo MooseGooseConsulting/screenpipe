@@ -197,6 +197,14 @@ impl TaskScheduler for WindowsTaskScheduler {
                     "SCREENPIPE_SERVICE_BINARY",
                     spec.binary_path.to_string_lossy().into_owned(),
                 ),
+                // `service stop` is normally invoked *from* the installed
+                // binary, so this process's own ExecutablePath equals the one
+                // the script hunts for. Without this exclusion the child
+                // PowerShell terminates its own Rust parent: `restart` never
+                // reaches install, and `uninstall` never unregisters the task
+                // or removes artifacts. Exact-path matching made this worse,
+                // not better - the caller matches exactly.
+                ("SCREENPIPE_CALLER_PID", std::process::id().to_string()),
             ],
         )?;
         Ok(())
@@ -237,6 +245,7 @@ impl TaskScheduler for WindowsTaskScheduler {
                     "SCREENPIPE_SERVICE_BINARY",
                     binary_path.to_string_lossy().into_owned(),
                 ),
+                ("SCREENPIPE_CALLER_PID", std::process::id().to_string()),
             ],
         )?;
         parse_status_output(&output)
@@ -408,7 +417,28 @@ $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $action = New-ScheduledTaskAction -Execute $env:SCREENPIPE_TASK_EXECUTABLE -Argument $env:SCREENPIPE_TASK_ARGUMENTS
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
 $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName $env:SCREENPIPE_TASK_NAME -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+# Every one of these overrides a Task Scheduler default that is wrong for a
+# always-on capture agent, and the defaults are what a 24-hour run would have
+# silently died to:
+#   AllowStartIfOnBatteries / DontStopIfGoingOnBatteries - by default a task
+#     will not start on battery and is STOPPED when the machine unplugs. On a
+#     laptop that is an entire unplugged session with no capture at all.
+#   ExecutionTimeLimit 0 - the default kills a running task after three days.
+#   MultipleInstances IgnoreNew - without it a second logon can start a second
+#     agent writing to the same database.
+#   StartWhenAvailable - run a trigger that was missed while powered off.
+#   RestartCount/RestartInterval - the run loop already rides out transient
+#     capture failure and exits only on a persistent fault; this is the layer
+#     that brings it back when it does.
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -MultipleInstances IgnoreNew `
+    -StartWhenAvailable `
+    -RestartCount 3 `
+    -RestartInterval ([TimeSpan]::FromMinutes(1))
+Register-ScheduledTask -TaskName $env:SCREENPIPE_TASK_NAME -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 "#
 }
 
@@ -427,10 +457,21 @@ if ($null -ne $task) {
         throw "Exact screenpipe scheduled task did not leave Running within five seconds."
     }
 }
+$callerPid = 0
+if (-not [int]::TryParse($env:SCREENPIPE_CALLER_PID, [ref]$callerPid)) {
+    throw "SCREENPIPE_CALLER_PID was not supplied as an integer."
+}
 function Get-ScreenpipeOwnedProcess {
+    # The caller is excluded by PID, not by path. `service stop` and
+    # `service restart` are normally run from the installed binary itself, so
+    # the managing process's ExecutablePath is byte-identical to the one being
+    # hunted. Terminating it kills the operation midway - restart never
+    # reaches registration. Only the *managing* process is spared; a second
+    # copy of the agent at the same path is still a legitimate target.
     @(
         Get-CimInstance Win32_Process |
             Where-Object {
+                $_.ProcessId -ne $callerPid -and
                 [string]::Equals(
                     $_.ExecutablePath,
                     $env:SCREENPIPE_SERVICE_BINARY,
@@ -467,9 +508,20 @@ fn status_task_script() -> &'static str {
     r#"$ErrorActionPreference = 'Stop'
 $task = Get-ScheduledTask -TaskName $env:SCREENPIPE_TASK_NAME -ErrorAction SilentlyContinue
 $taskState = if ($null -eq $task) { 'Absent' } else { $task.State.ToString() }
+$callerPid = 0
+if (-not [int]::TryParse($env:SCREENPIPE_CALLER_PID, [ref]$callerPid)) {
+    throw "SCREENPIPE_CALLER_PID was not supplied as an integer."
+}
+# Same caller-exclusion as the stop script, for a different failure. Running
+# `service status` from the installed binary made this process match its own
+# path test, so the answer was `Running: True` whenever it was asked from the
+# service directory - regardless of whether the agent was up. A status check
+# that reports the health of the process asking the question is exactly the
+# fabricated status this is meant to rule out.
 $processRunning = @(
     Get-CimInstance Win32_Process -Filter "Name = 'screenpipe.exe'" |
         Where-Object {
+            $_.ProcessId -ne $callerPid -and
             [string]::Equals(
                 $_.ExecutablePath,
                 $env:SCREENPIPE_SERVICE_BINARY,
@@ -1260,6 +1312,7 @@ $parseErrors = $null
                     "SCREENPIPE_SERVICE_WRAPPER",
                     wrapper.to_string_lossy().into_owned(),
                 ),
+                ("SCREENPIPE_CALLER_PID", std::process::id().to_string()),
             ],
         );
         let decoy_state = decoy.try_wait().unwrap();
@@ -1281,9 +1334,15 @@ $parseErrors = $null
     #[cfg(test)]
     fn spawn_process_at(path: &std::path::Path) -> std::process::Child {
         std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
-        let system_ping =
-            std::path::Path::new(&std::env::var("SystemRoot").unwrap()).join(r"System32\PING.EXE");
-        std::fs::copy(&system_ping, path).unwrap();
+        // Calling this twice for the same path is deliberate - it is how a
+        // second agent at the owned path is simulated. Windows holds an
+        // exclusive lock on a running image, so the copy must not be repeated
+        // once the first process is up.
+        if !path.exists() {
+            let system_ping = std::path::Path::new(&std::env::var("SystemRoot").unwrap())
+                .join(r"System32\PING.EXE");
+            std::fs::copy(&system_ping, path).unwrap();
+        }
         Command::new(path)
             .args(["-n", "60", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
@@ -1327,6 +1386,9 @@ $parseErrors = $null
                     "SCREENPIPE_SERVICE_BINARY",
                     owned_path.to_string_lossy().into_owned(),
                 ),
+                // The test binary's own path is nowhere near the owned path,
+                // so this exclusion cannot mask a failure to kill `owned`.
+                ("SCREENPIPE_CALLER_PID", std::process::id().to_string()),
             ],
         );
 
@@ -1356,5 +1418,164 @@ $parseErrors = $null
             "the stop script killed bin2\\screenpipe.exe: it is matching on file \
              name instead of the full executable path"
         );
+    }
+
+    #[test]
+    fn stop_script_spares_the_managing_process_but_still_kills_a_second_agent() {
+        // `service stop` and `service restart` are normally invoked FROM the
+        // installed binary, so the managing process's executable path is
+        // byte-identical to the one the script hunts for. Tightening the match
+        // from prefix to exact made this worse rather than better: the caller
+        // is now guaranteed to match. The child PowerShell would terminate its
+        // own Rust parent, so `restart` never reached registration.
+        //
+        // Both halves matter. Sparing the caller must not become "spare
+        // everything at that path" - a second agent left over from a previous
+        // logon lives at exactly the same path and is still a valid target.
+        let temp = tempfile::tempdir().unwrap();
+        let owned_path = temp.path().join(r"bin\screenpipe.exe");
+
+        let mut manager = spawn_process_at(&owned_path);
+        let mut stale_agent = spawn_process_at(&owned_path);
+        std::thread::sleep(std::time::Duration::from_millis(900));
+
+        let result = super::run_powershell(
+            stop_task_script(),
+            &[
+                (
+                    "SCREENPIPE_TASK_NAME",
+                    "MooseGoose Goal 1 Missing Caller Control".to_owned(),
+                ),
+                (
+                    "SCREENPIPE_SERVICE_BINARY",
+                    owned_path.to_string_lossy().into_owned(),
+                ),
+                ("SCREENPIPE_CALLER_PID", manager.id().to_string()),
+            ],
+        );
+
+        let manager_state = manager.try_wait().unwrap();
+        let stale_state = stale_agent.try_wait().unwrap();
+        for child in [&mut manager, &mut stale_agent] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        result.expect("stop script failed");
+        assert!(
+            manager_state.is_none(),
+            "the stop script terminated the process managing it - `service \
+             restart` would die before reaching task registration"
+        );
+        assert!(
+            stale_state.is_some(),
+            "the stop script spared a second agent at the owned path: it is \
+             excluding by path rather than by caller PID"
+        );
+    }
+
+    #[test]
+    fn stop_script_refuses_to_run_without_a_caller_pid() {
+        // Defaulting a missing PID to 0 would silently restore the self-kill:
+        // no real process has PID 0, so every match would proceed. This must
+        // fail loudly instead.
+        let temp = tempfile::tempdir().unwrap();
+        let error = super::run_powershell(
+            stop_task_script(),
+            &[
+                (
+                    "SCREENPIPE_TASK_NAME",
+                    "MooseGoose Goal 1 Missing PID Control".to_owned(),
+                ),
+                (
+                    "SCREENPIPE_SERVICE_BINARY",
+                    temp.path()
+                        .join(r"bin\screenpipe.exe")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ],
+        )
+        .expect_err("stop script ran without a caller PID");
+        assert!(
+            format!("{error:#}").contains("SCREENPIPE_CALLER_PID"),
+            "expected a caller-PID rejection, got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn status_script_does_not_count_the_process_asking_the_question() {
+        // Running `service status` from the installed binary made the asking
+        // process match its own path test, so the answer was `Running: True`
+        // whenever it was asked from the service directory - whether or not the
+        // agent was up. That is a status that reports its own health.
+        //
+        // The same fixture is queried twice with only the caller PID changed,
+        // so a script that ignores the PID entirely fails the first assertion
+        // and a script that suppresses everything fails the second.
+        let temp = tempfile::tempdir().unwrap();
+        let owned_path = temp.path().join(r"bin\screenpipe.exe");
+        let mut agent = spawn_process_at(&owned_path);
+        std::thread::sleep(std::time::Duration::from_millis(900));
+
+        let environment = |caller: u32| {
+            [
+                (
+                    "SCREENPIPE_TASK_NAME",
+                    "MooseGoose Goal 1 Absent Status Control".to_owned(),
+                ),
+                (
+                    "SCREENPIPE_SERVICE_BINARY",
+                    owned_path.to_string_lossy().into_owned(),
+                ),
+                ("SCREENPIPE_CALLER_PID", caller.to_string()),
+            ]
+        };
+
+        let as_self = super::run_powershell(status_task_script(), &environment(agent.id()));
+        let as_other =
+            super::run_powershell(status_task_script(), &environment(std::process::id()));
+
+        let _ = agent.kill();
+        let _ = agent.wait();
+
+        let as_self = parse_status_output(&as_self.expect("status script failed")).unwrap();
+        let as_other = parse_status_output(&as_other.expect("status script failed")).unwrap();
+
+        assert!(
+            !as_self.process_running,
+            "status counted the caller itself as a running agent"
+        );
+        assert!(
+            as_other.process_running,
+            "status missed a genuinely running agent at the owned path"
+        );
+    }
+
+    #[test]
+    fn install_script_registers_settings_that_survive_a_full_day_unplugged() {
+        // Goal 1 requires a 24-hour unattended run. Registering a task without
+        // explicit settings accepts Task Scheduler's defaults, and three of
+        // those defaults end the run on their own: the task will not start on
+        // battery, a running task is stopped when the machine unplugs, and any
+        // task is killed after three days.
+        let script = install_task_script();
+
+        assert!(
+            script.contains("-Settings $settings"),
+            "Register-ScheduledTask ignores the settings object: {script}"
+        );
+        for required in [
+            "-AllowStartIfOnBatteries",
+            "-DontStopIfGoingOnBatteries",
+            "-ExecutionTimeLimit ([TimeSpan]::Zero)",
+            "-MultipleInstances IgnoreNew",
+            "-StartWhenAvailable",
+        ] {
+            assert!(
+                script.contains(required),
+                "install script is missing {required}: {script}"
+            );
+        }
     }
 }

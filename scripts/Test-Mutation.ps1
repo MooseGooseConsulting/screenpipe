@@ -117,12 +117,29 @@ foreach ($mutation in $mutations) {
         $compileFailed = @($output | Where-Object {
                 $_ -match 'error\[E\d+\]' -or $_ -match 'could not compile'
             }).Count -gt 0
+
+        # A KILL requires POSITIVE evidence that tests actually ran.
+        #
+        # Without this floor, any cargo invocation that fails before reaching a
+        # test reports KILLED. Rename a package or delete a `--test` target and
+        # cargo prints "error: package ID specification ... did not match any
+        # packages" or "error: no test target named ...", exits nonzero, and
+        # matches neither compiler pattern - so every entry in the manifest goes
+        # green while zero tests executed. That is strictly worse than a false
+        # SURVIVED: a survivor prompts investigation, a kill is believed.
+        $testsRan = @($output | Where-Object {
+                $_ -match 'running \d+ test' -or $_ -match '^test result:'
+            }).Count -gt 0
+
         if ($compileFailed) {
             $verdict = 'UNCOMPILABLE'
             $colour = 'Magenta'
         } elseif ($exit -eq 0) {
             $verdict = 'SURVIVED'
             $colour = 'Red'
+        } elseif (-not $testsRan) {
+            $verdict = 'HARNESS-ERROR'
+            $colour = 'Magenta'
         } else {
             $verdict = 'KILLED'
             $colour = 'Green'
@@ -158,7 +175,7 @@ Remove-Item -LiteralPath $backupRoot -Recurse -Force -ErrorAction SilentlyContin
 
 $survived = @($results | Where-Object { $_.verdict -eq 'SURVIVED' })
 $killed = @($results | Where-Object { $_.verdict -eq 'KILLED' })
-$invalid = @($results | Where-Object { $_.verdict -in @('INVALID', 'UNCOMPILABLE') })
+$invalid = @($results | Where-Object { $_.verdict -in @('INVALID', 'UNCOMPILABLE', 'HARNESS-ERROR') })
 
 Write-Host ''
 Write-Host "killed=$($killed.Count) survived=$($survived.Count) invalid=$($invalid.Count)"
@@ -166,6 +183,18 @@ if ($survived.Count -gt 0) {
     Write-Host 'SURVIVING MUTATIONS (these tests are lies):' -ForegroundColor Red
     foreach ($s in $survived) { Write-Host "  - $($s.id): $($s.claim)" -ForegroundColor Red }
 }
+if ($invalid.Count -gt 0) {
+    Write-Host 'UNAUDITED MUTATIONS (no evidence was produced):' -ForegroundColor Magenta
+    foreach ($i in $invalid) { Write-Host "  - $($i.id) [$($i.verdict)]: $($i.claim)" -ForegroundColor Magenta }
+}
 
-if ($FailOnSurvivor -and $survived.Count -gt 0) { exit 1 }
+# INVALID counts as failure, not as a pass.
+#
+# Gating on survivors alone meant a manifest whose `find` string no longer
+# matched the source exited 0 - a green audit that tested nothing. That was not
+# hypothetical: `wrapper-path-apostrophe-escaping-deleted` had lost a Rust
+# escape, matched zero times, and its `.Replace()` was a verified no-op, so the
+# apostrophe-escaping claim was reported as audited while the source was never
+# touched.
+if ($FailOnSurvivor -and ($survived.Count + $invalid.Count) -gt 0) { exit 1 }
 exit 0

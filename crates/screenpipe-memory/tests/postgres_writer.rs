@@ -1,12 +1,11 @@
-use std::collections::BTreeMap;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, ensure};
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
-    CadenceInput, CadenceRecord, CaptureGapSummary, MERGE_CONTRACT_VERSION, MergeDecisionKind,
-    ObservationSample, OpenEvent, PgEventWriter, SplitReason,
+    CadenceInput, CadenceRecord, CaptureGapSummary, HashLedger, MERGE_CONTRACT_VERSION,
+    MergeDecisionKind, ObservationSample, OpenEvent, PgEventWriter, SplitReason,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -210,7 +209,7 @@ fn event(
             empty_ocr: 3,
         },
         sample_count: 1,
-        hash_counts: BTreeMap::from([(hash, 1)]),
+        hash_counts: HashLedger::from_hashes([hash]),
     }
 }
 
@@ -291,6 +290,7 @@ async fn starts_allocate_icarus_ids_and_persist_authoritative_event_fields() -> 
             "merge_hash": "stable-merge-hash",
             "latest_exact_ocr_hash": "hash-1",
             "hashes_seen": { "hash-1": 1 },
+            "hashes_seen_evicted": 0,
             "sample_count": 9,
             "latest_cadence": {
                 "input_idle_ms": 1000,
@@ -353,7 +353,7 @@ async fn merge_refreshes_app_title_latest_text_and_domain_metadata() -> Result<(
     // `merge_meta`; with an `Initial` fixture that argument could be hardcoded
     // and every merged row would claim it started for the wrong reason.
     merged.start_reason = SplitReason::AppChange;
-    merged.hash_counts = BTreeMap::from([("hash-0".to_owned(), 1), ("hash-5".to_owned(), 1)]);
+    merged.hash_counts = HashLedger::from_hashes(["hash-0".to_owned(), "hash-5".to_owned()]);
 
     writer.write_merge(&event_id, &merged).await?;
     let row = sqlx::query(
@@ -381,6 +381,7 @@ async fn merge_refreshes_app_title_latest_text_and_domain_metadata() -> Result<(
             "merge_hash": "stable-merge-hash",
             "latest_exact_ocr_hash": "hash-5",
             "hashes_seen": { "hash-0": 1, "hash-5": 1 },
+            "hashes_seen_evicted": 0,
             "sample_count": 2,
             "latest_cadence": {
                 "input_idle_ms": 5000,
@@ -498,9 +499,20 @@ async fn repeated_app_sightings_preserve_first_seen_and_advance_last_seen() -> R
             original.0,
             refreshed.0
         );
+        // Strict, and pinned to the exact expected instant.
+        //
+        // `>=` was vacuous: the fixtures are event(0, ..) then event(5, ..), so
+        // a correct upsert must move last_seen_at from at(0) to at(5). Deleting
+        // `last_seen_at = EXCLUDED.last_seen_at` from the ON CONFLICT clause -
+        // nothing else ever writes the column, since the DEFAULT now() fires
+        // only on INSERT - leaves it frozen at at(0), and at(0) >= at(0) passed
+        // green. The column would have been stuck at first sighting for the
+        // life of the database.
         ensure!(
-            refreshed.1 >= original.1,
-            "last_seen_at went backwards on a repeat sighting"
+            refreshed.1 == at(5),
+            "last_seen_at did not advance to the repeat sighting's timestamp: {:?} (expected {:?})",
+            refreshed.1,
+            at(5)
         );
         ensure!(refreshed.2 == "Notepad Renamed", "app_title must refresh");
         Ok(())

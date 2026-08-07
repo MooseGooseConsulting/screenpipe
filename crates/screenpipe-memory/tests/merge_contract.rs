@@ -118,7 +118,7 @@ fn first_sample_starts_an_initial_event() {
     assert_eq!(event.latest, initial);
     assert_eq!(event.merge_hash, expected_hash.clone());
     assert_eq!(event.sample_count, 1);
-    assert_eq!(event.hash_counts.get(&expected_hash), Some(&1));
+    assert_eq!(event.hash_counts.counts().get(&expected_hash), Some(&1));
 }
 
 #[test]
@@ -236,7 +236,7 @@ fn exact_hash_match_merges_and_updates_latest_fields() {
     assert_eq!(event.ended_at, at(1));
     assert_eq!(event.latest, second);
     assert_eq!(event.sample_count, 2);
-    assert_eq!(event.hash_counts.get(&expected_hash), Some(&2));
+    assert_eq!(event.hash_counts.counts().get(&expected_hash), Some(&2));
 }
 
 #[test]
@@ -254,8 +254,8 @@ fn overlapping_scrolling_text_reuses_the_stable_merge_hash() {
     assert_eq!(event.merge_hash, first_hash.clone());
     assert_eq!(event.latest.ocr_text, second_text);
     assert_eq!(event.sample_count, 2);
-    assert_eq!(event.hash_counts.get(&first_hash), Some(&1));
-    assert_eq!(event.hash_counts.get(&second_hash), Some(&1));
+    assert_eq!(event.hash_counts.counts().get(&first_hash), Some(&1));
+    assert_eq!(event.hash_counts.counts().get(&second_hash), Some(&1));
 }
 
 #[test]
@@ -367,7 +367,7 @@ fn a_previously_seen_exact_hash_merges_after_the_viewport_moves_away() {
     let event = merged(merger.ingest(sample(4, "notepad.exe", "notes", samples[1])));
 
     assert_eq!(event.sample_count, 5);
-    assert_eq!(event.hash_counts.get(&revisited_hash), Some(&2));
+    assert_eq!(event.hash_counts.counts().get(&revisited_hash), Some(&2));
 }
 
 #[test]
@@ -407,4 +407,112 @@ fn an_idle_window_sampled_at_max_backoff_keeps_merging() {
         "an unchanged idle window must merge into one event, not fragment"
     );
     assert_eq!(event.started_at, at(0));
+}
+
+#[test]
+fn a_long_lived_event_keeps_its_hash_ledger_bounded() {
+    // Unbounded, this was the worst defect on the merge path. A window whose
+    // text changes while staying above the overlap threshold - a log tail, a
+    // build, a subtitled video, any UI with a clock - merges on every sample
+    // and contributed a new 64-character key each time. At the 2s cadence that
+    // is ~43,200 entries in 24 hours, cloned twice per tick and re-serialized
+    // in full into the merge_meta JSONB on EVERY write: durable write volume
+    // quadratic in sample count, for a single event.
+    //
+    // The fixture must actually take the merge path, so each sample shares
+    // most of its five-grams with the previous one and only the tail differs.
+    let mut merger = Merger::new(MergeConfig {
+        idle_gap: Duration::seconds(120),
+        scroll_overlap: 0.35,
+    });
+    let shared = "the quick brown fox jumps over the lazy dog while the tape keeps rolling along";
+
+    let sample_total = screenpipe_memory::MAX_TRACKED_HASHES * 4;
+    // The opening sample is always a Start; only the rest exercise merging.
+    merger.ingest(sample(
+        0,
+        "chrome.exe",
+        "Live log",
+        &format!("{shared} counter 0"),
+    ));
+    let mut event = None;
+    for index in 1..sample_total {
+        let text = format!("{shared} counter {index}");
+        event = Some(merged(merger.ingest(sample(
+            index as i64,
+            "chrome.exe",
+            "Live log",
+            &text,
+        ))));
+    }
+
+    let event = event.expect("the overlapping samples must have merged");
+    assert_eq!(
+        event.sample_count as usize, sample_total,
+        "the fixture stopped merging, so it no longer exercises ledger growth"
+    );
+    assert!(
+        event.hash_counts.counts().len() <= screenpipe_memory::MAX_TRACKED_HASHES,
+        "hash ledger grew to {} entries, past the {} bound",
+        event.hash_counts.counts().len(),
+        screenpipe_memory::MAX_TRACKED_HASHES
+    );
+    // Eviction must be recorded. Without it a truncated ledger is
+    // indistinguishable from a short event to anything reading merge_meta.
+    assert_eq!(
+        event.hash_counts.evicted() as usize,
+        sample_total - screenpipe_memory::MAX_TRACKED_HASHES,
+        "every hash pushed out of the window must be counted"
+    );
+}
+
+#[test]
+fn an_evicted_hash_no_longer_forces_a_merge() {
+    // `contains` is what lets a previously-seen screen merge back in. With an
+    // unbounded ledger an event that had seen N screens merged any of those N
+    // back unconditionally forever, so SplitReason::TextHashChange became
+    // progressively unreachable as the event aged. Bounding the ledger is what
+    // restores it, and this is the assertion that proves the bound has that
+    // effect rather than merely capping memory.
+    let mut merger = Merger::new(MergeConfig {
+        idle_gap: Duration::seconds(120),
+        scroll_overlap: 0.35,
+    });
+    let shared = "the quick brown fox jumps over the lazy dog while the tape keeps rolling along";
+    let first_text = format!("{shared} counter 0");
+
+    merger.ingest(sample(0, "chrome.exe", "Live log", &first_text));
+    // Push the opening hash out of the window.
+    for index in 1..=screenpipe_memory::MAX_TRACKED_HASHES {
+        let text = format!("{shared} counter {index}");
+        merger.ingest(sample(index as i64, "chrome.exe", "Live log", &text));
+    }
+
+    // Re-present the very first screen. It is byte-identical to a hash this
+    // event has seen, but it is no longer tracked, so it must be treated as
+    // new text rather than silently absorbed.
+    let decision = merger.ingest(sample(
+        (screenpipe_memory::MAX_TRACKED_HASHES + 1) as i64,
+        "chrome.exe",
+        "Live log",
+        &first_text,
+    ));
+    assert!(
+        matches!(decision, MergeDecision::Merge { .. }),
+        "this fixture still overlaps, so it should merge on overlap alone - \
+         if it split, the fixture no longer isolates the ledger"
+    );
+    assert!(
+        !event_of(&decision).hash_counts.contains(&{
+            let identity = TextIdentity::from_ocr(&format!("{shared} counter 1"));
+            identity.exact_hash
+        }),
+        "the oldest evicted hash must not still be tracked"
+    );
+}
+
+fn event_of(decision: &MergeDecision) -> &screenpipe_memory::OpenEvent {
+    match decision {
+        MergeDecision::Start { event, .. } | MergeDecision::Merge { event } => event,
+    }
 }

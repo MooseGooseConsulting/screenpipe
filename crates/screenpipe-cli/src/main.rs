@@ -118,6 +118,7 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut consecutive_failures: u32 = 0;
+    let mut consecutive_gaps: u32 = 0;
     println!("event=runtime_ready machine_slug={machine_slug}");
 
     loop {
@@ -130,8 +131,22 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
             outcome = run_iteration(&mut runner, &mut source, &writer) => {
                 match outcome {
                     Ok(outcome) => {
-                        consecutive_failures = 0;
                         print_run_outcome(&outcome);
+                        let kind = if matches!(outcome, RunOutcome::GapRecorded { .. }) {
+                            IterationKind::Gap
+                        } else {
+                            IterationKind::Persisted
+                        };
+                        match next_step(kind, &mut consecutive_failures, &mut consecutive_gaps) {
+                            LoopStep::Continue => {}
+                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                            LoopStep::AbortGaps => {
+                                return Err(anyhow::anyhow!(
+                                    "aborting after {MAX_CONSECUTIVE_GAPS} consecutive capture gaps"
+                                ));
+                            }
+                            LoopStep::AbortFailures => unreachable!("no failure was recorded"),
+                        }
                     }
                     Err(error) => {
                         // `Runner::run_once` deliberately RETAINS the
@@ -141,22 +156,104 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
                         // ended the whole run on the first transient PostgreSQL
                         // blip - the single largest risk to an unattended
                         // 24-hour capture.
-                        consecutive_failures += 1;
-                        println!(
-                            "event=capture_error category={} consecutive={consecutive_failures}",
-                            failure_category(&error)
+                        let step = next_step(
+                            IterationKind::Failure,
+                            &mut consecutive_failures,
+                            &mut consecutive_gaps,
                         );
-                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                            // Do not spin forever on a permanent fault. Exiting
-                            // hands off to the service wrapper's restart loop,
-                            // which re-runs preflight from a clean process.
-                            return Err(error).context(format!(
-                                "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive capture failures"
-                            ));
+                        let category = failure_category(&error);
+                        println!(
+                            "event=capture_error category={category} consecutive={consecutive_failures}"
+                        );
+                        match step {
+                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                            LoopStep::AbortFailures => {
+                                // Do not spin forever on a permanent fault.
+                                // Exiting hands off to the service wrapper's
+                                // restart loop, which re-runs preflight from a
+                                // clean process.
+                                //
+                                // The raw error is deliberately NOT propagated.
+                                // `main` returns `anyhow::Result`, so Rust's
+                                // Termination impl prints the whole `{:?}`
+                                // chain to stderr - and the service wrapper now
+                                // persists stderr to a dated log file that
+                                // `uninstall` preserves. The redaction that
+                                // `failure_category` exists to guarantee would
+                                // have been abandoned on the one path that
+                                // exits.
+                                return Err(anyhow::anyhow!(
+                                    "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive capture failures (category={category})"
+                                ));
+                            }
+                            LoopStep::Continue | LoopStep::AbortGaps => {
+                                unreachable!("a failure never yields a gap decision")
+                            }
                         }
-                        tokio::time::sleep(failure_backoff(consecutive_failures)).await;
                     }
                 }
+            }
+        }
+    }
+}
+
+/// What one loop iteration produced, reduced to the only distinction the
+/// restart policy cares about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IterationKind {
+    /// An observation reached PostgreSQL. This is the only genuine success.
+    Persisted,
+    /// A typed capture gap. Ordinary and expected, but NOT a success.
+    Gap,
+    /// The iteration returned an error.
+    Failure,
+}
+
+/// What the run loop should do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopStep {
+    Continue,
+    Retry(std::time::Duration),
+    AbortGaps,
+    AbortFailures,
+}
+
+/// The restart policy, extracted from the loop so it can be driven directly.
+///
+/// Inline, this was untestable, and it was wrong in a way no test could have
+/// caught: the loop reset `consecutive_failures` on ANY `Ok`, and
+/// `WindowsSampleSource` converts every capture and OCR failure into
+/// `Ok(SampleRead::Gap(..))`. The ceiling was therefore unreachable for the
+/// entire capture path. A permanently dead WGC device - GPU driver reset, D3D
+/// device lost - printed `capture_gap` every two seconds until logoff:
+/// ~43,000 futile attempts a day, zero events persisted, and the wrapper's
+/// clean restart never reached. The backoff the ceiling exists to pair with
+/// never applied either.
+fn next_step(
+    kind: IterationKind,
+    consecutive_failures: &mut u32,
+    consecutive_gaps: &mut u32,
+) -> LoopStep {
+    match kind {
+        IterationKind::Persisted => {
+            *consecutive_failures = 0;
+            *consecutive_gaps = 0;
+            LoopStep::Continue
+        }
+        IterationKind::Gap => {
+            *consecutive_gaps = consecutive_gaps.saturating_add(1);
+            if *consecutive_gaps >= MAX_CONSECUTIVE_GAPS {
+                LoopStep::AbortGaps
+            } else {
+                LoopStep::Retry(failure_backoff(*consecutive_gaps))
+            }
+        }
+        IterationKind::Failure => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                LoopStep::AbortFailures
+            } else {
+                LoopStep::Retry(failure_backoff(*consecutive_failures))
             }
         }
     }
@@ -166,11 +263,29 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
 /// wrapper restart it from a clean state.
 const MAX_CONSECUTIVE_FAILURES: u32 = 20;
 
-/// Exponential backoff, capped. Without this, a deterministically failing
-/// capture or OCR path retried every two seconds forever - roughly 43,000
-/// attempts a day, each one a wasted capture, OCR, and log line.
+/// Consecutive capture gaps tolerated before the process exits.
+///
+/// Far higher than `MAX_CONSECUTIVE_FAILURES` because the two describe
+/// different things. A failure is an error the pipeline could not absorb; a gap
+/// is an ordinary, expected outcome - a locked workstation produces nothing
+/// else, and must survive the night. At the 30s backoff ceiling this is a
+/// little over five hours of uninterrupted gaps before handing off to the
+/// wrapper, which is long enough for any legitimate lock and short enough that
+/// a dead capture device does not spin until logoff.
+const MAX_CONSECUTIVE_GAPS: u32 = 640;
+
+/// Exponential backoff, capped at 32s.
+///
+/// Without this, a deterministically failing capture or OCR path retried every
+/// two seconds forever - roughly 43,000 attempts a day, each one a wasted
+/// capture, OCR, and log line.
+///
+/// The exponent clamp is what sets the ceiling: `2^5 = 32`. An additional
+/// `.min(60)` used to sit here and could never bind, so the documented 60s cap
+/// was unreachable and anyone raising the clamp to 6 expecting it to hold would
+/// have got 64s instead.
 fn failure_backoff(consecutive_failures: u32) -> std::time::Duration {
-    let seconds = 2_u64.saturating_pow(consecutive_failures.min(5)).min(60);
+    let seconds = 2_u64.saturating_pow(consecutive_failures.min(5));
     std::time::Duration::from_secs(seconds)
 }
 
@@ -485,12 +600,89 @@ mod tests {
             delays[1] > delays[0],
             "backoff must actually grow, not stay flat: {delays:?}"
         );
+        // Assert the REAL ceiling. The previous bound here was `<= 60`, which
+        // is vacuous against a function that clamps the exponent to 5 and can
+        // never exceed 32 - it agreed with a doc comment that claimed a 60s cap
+        // the code could not produce.
         assert!(
-            delays.iter().all(|seconds| *seconds <= 60),
+            delays.iter().all(|seconds| *seconds <= 32),
             "backoff must stay capped so a restart is never delayed unboundedly: {delays:?}"
         );
         // The cap must be reached, or a long outage backs off toward hours.
         assert_eq!(*delays.last().expect("delays"), 32);
+    }
+
+    #[test]
+    fn an_endless_run_of_gaps_terminates_instead_of_spinning_forever() {
+        use super::{IterationKind, LoopStep, next_step};
+
+        // The defect this pins: `WindowsSampleSource` turns every capture and
+        // OCR failure into `Ok(SampleRead::Gap(..))`, and the loop reset the
+        // failure counter on any `Ok`. A dead capture device therefore never
+        // reached any ceiling - it printed `capture_gap` every two seconds
+        // until logoff and never handed off to the wrapper's clean restart.
+        let mut failures = 0;
+        let mut gaps = 0;
+        let mut steps = 0_u32;
+        loop {
+            let step = next_step(IterationKind::Gap, &mut failures, &mut gaps);
+            steps += 1;
+            if step == LoopStep::AbortGaps {
+                break;
+            }
+            assert!(
+                matches!(step, LoopStep::Retry(_)),
+                "a gap must back off, not continue at full speed: {step:?}"
+            );
+            assert!(steps < 10_000, "gap handling never terminates");
+        }
+        assert_eq!(steps, super::MAX_CONSECUTIVE_GAPS);
+        assert_eq!(
+            failures, 0,
+            "gaps must not be counted as failures - the two ceilings differ on purpose"
+        );
+    }
+
+    #[test]
+    fn a_gap_does_not_clear_an_outstanding_failure_streak() {
+        use super::{IterationKind, LoopStep, next_step};
+
+        // Only a persisted observation is a success. If a gap cleared the
+        // failure streak, a sink that failed on every write while capture kept
+        // producing gaps would never reach its ceiling either.
+        let mut failures = 0;
+        let mut gaps = 0;
+        next_step(IterationKind::Failure, &mut failures, &mut gaps);
+        next_step(IterationKind::Failure, &mut failures, &mut gaps);
+        assert_eq!(failures, 2);
+
+        next_step(IterationKind::Gap, &mut failures, &mut gaps);
+        assert_eq!(failures, 2, "a gap cleared a real failure streak");
+
+        assert_eq!(
+            next_step(IterationKind::Persisted, &mut failures, &mut gaps),
+            LoopStep::Continue
+        );
+        assert_eq!(failures, 0, "a persisted event must clear the streak");
+        assert_eq!(gaps, 0, "a persisted event must clear the gap streak");
+    }
+
+    #[test]
+    fn a_persistent_failure_reaches_the_ceiling_and_aborts() {
+        use super::{IterationKind, LoopStep, next_step};
+
+        let mut failures = 0;
+        let mut gaps = 0;
+        for _ in 1..super::MAX_CONSECUTIVE_FAILURES {
+            assert!(matches!(
+                next_step(IterationKind::Failure, &mut failures, &mut gaps),
+                LoopStep::Retry(_)
+            ));
+        }
+        assert_eq!(
+            next_step(IterationKind::Failure, &mut failures, &mut gaps),
+            LoopStep::AbortFailures
+        );
     }
 
     #[test]

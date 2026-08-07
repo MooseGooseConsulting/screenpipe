@@ -47,7 +47,7 @@
   {
     "id": "wrapper-path-apostrophe-escaping-deleted",
     "file": "crates/screenpipe-cli/src/service.rs",
-    "find": "let escaped_agent = binary_path.to_string_lossy().replace(''', \"''\");",
+    "find": "let escaped_agent = binary_path.to_string_lossy().replace('\\'', \"''\");",
     "replace": "let escaped_agent = binary_path.to_string_lossy().into_owned();",
     "package": "screenpipe-cli",
     "claim": "a path containing an apostrophe still produces a valid wrapper",

@@ -9,8 +9,8 @@ mod text_hash;
 
 pub use cadence::{CadenceInput, CadencePolicy, CadenceRecord, MAX_CADENCE_INTERVAL_SECONDS};
 pub use merge::{
-    CaptureGap, CaptureGapSummary, MERGE_CONTRACT_VERSION, MergeConfig, MergeDecision,
-    MergeDecisionKind, Merger, OpenEvent, SplitReason,
+    CaptureGap, CaptureGapSummary, HashLedger, MAX_TRACKED_HASHES, MERGE_CONTRACT_VERSION,
+    MergeConfig, MergeDecision, MergeDecisionKind, Merger, OpenEvent, SplitReason,
 };
 pub use postgres::{PgEventWriter, PgPreflight};
 pub use runner::{EventId, EventSink, RunOutcome, Runner, SampleRead, SampleSource};

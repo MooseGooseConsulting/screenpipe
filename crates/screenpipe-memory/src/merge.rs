@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -6,7 +6,88 @@ use crate::cadence::CadenceRecord;
 use crate::sample::ObservationSample;
 use crate::text_hash::{TextIdentity, jaccard_overlap, normalize_text};
 
-pub const MERGE_CONTRACT_VERSION: u32 = 1;
+/// Bumped to 2 when the per-event hash ledger became bounded. Version 1 events
+/// recorded every distinct OCR hash they ever saw; version 2 events record at
+/// most `MAX_TRACKED_HASHES` and carry an eviction count, so `hashes_seen` is
+/// no longer a complete census and must not be read as one.
+pub const MERGE_CONTRACT_VERSION: u32 = 2;
+
+/// Upper bound on distinct OCR hashes remembered inside one open event.
+///
+/// Unbounded, this was the worst defect in the merge path. Any window whose
+/// text changes while staying above the five-gram overlap threshold - a log
+/// tail, a build, a subtitled video, any UI with a clock - takes the merge
+/// path on every sample and contributes a new 64-character key. At the 2s
+/// cadence that is ~43,200 entries in 24 hours: several megabytes resident,
+/// cloned twice per tick, and re-serialized in full into the `merge_meta`
+/// JSONB on *every* write. The durable write volume is quadratic in sample
+/// count; one event would rewrite a multi-megabyte JSONB every two seconds.
+///
+/// The cap also restores a behaviour that unbounded growth had quietly
+/// removed. `contains` is what lets a previously-seen screen merge back in, so
+/// with an unbounded ledger an event that had seen N screens would merge any
+/// of those N back unconditionally, forever - `SplitReason::TextHashChange`
+/// became progressively unreachable as the event aged.
+pub const MAX_TRACKED_HASHES: usize = 64;
+
+/// Bounded record of the OCR hashes seen inside one open event.
+///
+/// Eviction is by insertion order (oldest out first), which is what makes
+/// "have I seen this screen recently" the question `contains` answers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HashLedger {
+    counts: BTreeMap<String, u64>,
+    order: VecDeque<String>,
+    evicted: u64,
+}
+
+impl HashLedger {
+    fn with_first(hash: String) -> Self {
+        Self::from_hashes([hash])
+    }
+
+    /// Build a ledger by observing `hashes` in order. Eviction applies, so this
+    /// cannot be used to fabricate a ledger larger than `MAX_TRACKED_HASHES`.
+    pub fn from_hashes(hashes: impl IntoIterator<Item = String>) -> Self {
+        let mut ledger = Self::default();
+        for hash in hashes {
+            ledger.record(hash);
+        }
+        ledger
+    }
+
+    /// True when this hash is still tracked. An evicted hash reads as unseen,
+    /// which is the intended consequence of the bound.
+    pub fn contains(&self, hash: &str) -> bool {
+        self.counts.contains_key(hash)
+    }
+
+    fn record(&mut self, hash: String) {
+        if let Some(count) = self.counts.get_mut(&hash) {
+            *count = count.saturating_add(1);
+            return;
+        }
+        if self.counts.len() >= MAX_TRACKED_HASHES
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.counts.remove(&oldest);
+            self.evicted = self.evicted.saturating_add(1);
+        }
+        self.order.push_back(hash.clone());
+        self.counts.insert(hash, 1);
+    }
+
+    /// The tracked hashes and their observation counts.
+    pub fn counts(&self) -> &BTreeMap<String, u64> {
+        &self.counts
+    }
+
+    /// How many distinct hashes fell out of the window. Persisted alongside
+    /// the counts so a reader can tell a complete census from a truncated one.
+    pub fn evicted(&self) -> u64 {
+        self.evicted
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitReason {
@@ -125,7 +206,7 @@ pub struct OpenEvent {
     pub latest_cadence: CadenceRecord,
     pub capture_gaps: CaptureGapSummary,
     pub sample_count: u32,
-    pub hash_counts: BTreeMap<String, u64>,
+    pub hash_counts: HashLedger,
 }
 
 #[derive(Clone, Debug)]
@@ -165,7 +246,7 @@ impl Merger {
             Some(SplitReason::IdleGap)
         } else {
             let previous_identity = TextIdentity::from_ocr(&open.latest.ocr_text);
-            let resolved_merge_hash = if open.hash_counts.contains_key(&identity.exact_hash)
+            let resolved_merge_hash = if open.hash_counts.contains(&identity.exact_hash)
                 || jaccard_overlap(&previous_identity.five_grams, &identity.five_grams)
                     >= self.config.scroll_overlap
             {
@@ -189,8 +270,7 @@ impl Merger {
         open.latest_cadence = cadence;
         open.capture_gaps = open.capture_gaps.add(capture_gaps);
         open.sample_count = open.sample_count.saturating_add(1);
-        let hash_count = open.hash_counts.entry(identity.exact_hash).or_default();
-        *hash_count = hash_count.saturating_add(1);
+        open.hash_counts.record(identity.exact_hash);
         MergeDecision::Merge {
             event: open.clone(),
         }
@@ -204,8 +284,7 @@ impl Merger {
         capture_gaps: CaptureGapSummary,
         reason: SplitReason,
     ) -> MergeDecision {
-        let mut hash_counts = BTreeMap::new();
-        hash_counts.insert(merge_hash.clone(), 1);
+        let hash_counts = HashLedger::with_first(merge_hash.clone());
         let event = OpenEvent {
             merge_contract_version: MERGE_CONTRACT_VERSION,
             started_at: sample.captured_at,

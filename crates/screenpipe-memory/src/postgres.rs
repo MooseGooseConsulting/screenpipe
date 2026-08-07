@@ -244,6 +244,20 @@ impl PgEventWriter {
             .connect(database_url)
             .await
             .context("connect PostgreSQL event writer")?;
+        // The version floor is enforced HERE, not only in `preflight`.
+        //
+        // `run_capture` calls `connect` and never `preflight` - only `doctor`
+        // does - so the guard was unreachable on the one path that actually
+        // writes for 24 hours. Pointed at an older server holding the
+        // authoritative schema, `validate_authoritative_schema` passes and the
+        // agent would have run against a server the writer declares
+        // unsupported.
+        let server_version_num =
+            sqlx::query_scalar::<_, i32>("SELECT current_setting('server_version_num')::integer")
+                .fetch_one(&pool)
+                .await
+                .context("read PostgreSQL server version")?;
+        ensure_supported_server_version(server_version_num)?;
         validate_authoritative_schema(&pool).await?;
         let machine_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO machines (slug, display_name) VALUES ($1, $2) \
@@ -459,7 +473,11 @@ fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
         "last_decision": event.last_decision.as_code(),
         "merge_hash": event.merge_hash,
         "latest_exact_ocr_hash": event.latest_exact_ocr_hash,
-        "hashes_seen": event.hash_counts,
+        // Bounded by MAX_TRACKED_HASHES. `hashes_seen_evicted` is what tells a
+        // reader this is a window rather than a complete census - without it,
+        // a truncated ledger is indistinguishable from a short event.
+        "hashes_seen": event.hash_counts.counts(),
+        "hashes_seen_evicted": event.hash_counts.evicted(),
         "sample_count": event.sample_count,
         "latest_cadence": {
             "input_idle_ms": event.latest_cadence.input.input_idle.num_milliseconds(),

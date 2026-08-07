@@ -204,21 +204,39 @@ async fn ocr_reads_the_exact_tokens_drawn_on_the_pinned_foreground_window() {
         .expect("Windows OCR failed on the pinned fixture frame");
     let normalized = normalize_ocr(&ocr_text);
 
-    for token in TOKENS {
-        assert!(
-            normalized.contains(token),
-            "OCR did not read the token {token} that was drawn on screen. \
-             Normalized OCR was: {normalized}"
-        );
-    }
+    // NOTHING below may interpolate `normalized` into a message.
+    //
+    // Both of these assertions fire precisely when the captured frame is NOT
+    // the fixture - which means the text in hand is the user's real screen.
+    // Printing it puts private window contents into the test output and into
+    // any CI log, on the exact failure path where it is guaranteed to be
+    // private. `foreground_capture.rs` reduces everything to categories and
+    // `ObservationSample` hand-writes a redacting Debug for the same reason;
+    // this file must not be the hole in that invariant. Report shape only.
+    let missing = TOKENS
+        .iter()
+        .filter(|token| !normalized.contains(*token))
+        .count();
+    assert_eq!(
+        missing,
+        0,
+        "OCR missed {missing} of {} tokens drawn on screen (normalized length {}, frame {}x{})",
+        TOKENS.len(),
+        normalized.len(),
+        frame.width(),
+        frame.height()
+    );
 
-    // A frame of the wrong window, or an empty frame, would fail the loop
+    // A frame of the wrong window, or an empty frame, would fail the check
     // above. This guards the opposite failure: OCR returning a giant blob that
     // happens to contain the tokens among unrelated screen content.
     assert!(
         normalized.len() < 400,
-        "OCR returned far more text than the fixture drew, so the captured \
-         frame probably was not the fixture window: {normalized}"
+        "OCR returned {} characters, far more than the fixture drew, so the \
+         captured frame probably was not the fixture window (frame {}x{})",
+        normalized.len(),
+        frame.width(),
+        frame.height()
     );
 }
 
