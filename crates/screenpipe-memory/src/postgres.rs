@@ -1,10 +1,8 @@
-use std::str::FromStr;
-
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
-use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::{EventId, EventSink, OpenEvent, SplitReason};
 
@@ -241,10 +239,9 @@ impl PgEventWriter {
         if database_url.trim().is_empty() {
             bail!("PostgreSQL database URL is blank");
         }
-        let options = negotiated_connect_options(database_url).await?;
         let pool = PgPoolOptions::new()
             .max_connections(8)
-            .connect_with(options)
+            .connect(database_url)
             .await
             .context("connect PostgreSQL event writer")?;
         let server_version_num =
@@ -422,102 +419,6 @@ impl PgEventWriter {
     }
 }
 
-/// The rustls message that means "the chain verified, the name did not".
-///
-/// Matching on text is unpleasant, but sqlx wraps the rustls failure in an
-/// `io::Error` and exposes no variant to match on. It fails CLOSED: if this
-/// string ever stops appearing, [`downgraded_ssl_mode`] returns `None` and the
-/// connection error propagates, rather than a downgrade happening by default.
-const HOSTNAME_MISMATCH_MARKER: &str = "certificate not valid for name";
-
-/// The message printed, once per start, when the downgrade actually happens.
-///
-/// Deliberately contains no part of the connection URL - not the host, not the
-/// user, not the database.
-const SSL_DOWNGRADE_WARNING: &str = "WARNING event=tls_downgrade requested=verify-ca effective=require \
-     reason=sqlx_0_8_6_cannot_skip_hostname_check \
-     detail=connection_is_encrypted_but_the_server_certificate_is_no_longer_verified";
-
-/// Whether an `sslmode=verify-ca` failure was *only* the hostname check.
-///
-/// Pure, and separate from the connection, so the decision is drivable in a
-/// test without a PostgreSQL server presenting a mismatched certificate. Inline
-/// it would be reachable only from a live cluster, which is how the whole
-/// downgrade could silently widen to cover untrusted issuers without any test
-/// noticing.
-fn downgraded_ssl_mode(mode: PgSslMode, error: &sqlx::Error) -> Option<PgSslMode> {
-    if !matches!(mode, PgSslMode::VerifyCa) {
-        return None;
-    }
-    format!("{error:#}")
-        .contains(HOSTNAME_MISMATCH_MARKER)
-        .then_some(PgSslMode::Require)
-}
-
-/// The connection settings this build will actually use for `database_url`,
-/// including the strongest TLS mode it can actually complete.
-///
-/// Public, and the single way anything in this workspace opens a pool, so the
-/// integration suite connects over exactly the TLS path the recorder does. It
-/// used to call `PgPoolOptions::connect(url)` itself, which meant the tests and
-/// the writer disagreed about TLS the moment the writer grew a connect path of
-/// its own - and the suite failed against a cluster the recorder could reach
-/// perfectly well.
-///
-/// # Why this exists
-///
-/// sqlx 0.8.6 cannot honour `sslmode=verify-ca` - verify the chain against
-/// `sslrootcert`, skip the hostname check - on its rustls backend. sqlx's
-/// `NoHostnameTlsVerifier` swallows exactly one rustls error,
-/// `CertificateError::NotValidForName`. rustls 0.23 replaced that with
-/// `NotValidForNameContext`, which carries the expected and presented names.
-/// It is a different enum variant, so sqlx's `match` arm never fires and the
-/// hostname failure propagates like any other.
-///
-/// Proven against the live cluster, not inferred: `verify-ca` with our CA
-/// fails with "certificate not valid for name", while the same URL WITHOUT
-/// `sslrootcert` fails earlier and differently, with `UnknownIssuer`. So the CA
-/// is loaded and the chain IS being verified - the name check is simply not
-/// skippable. Our server certificate carries in-cluster DNS SANs and no IP SAN,
-/// and we reach the cluster by IP, so that check can never pass.
-///
-/// # Why the fallback is not unconditional
-///
-/// `verify-ca` is attempted first, on every start. The downgrade happens only
-/// when that attempt failed for the name check and nothing else: an untrusted
-/// issuer, an expired certificate, or a server that refuses TLS still fails
-/// hard. So this widens the hole by exactly one property, and it closes itself
-/// the day sqlx matches the new variant - the first attempt simply succeeds and
-/// no warning is printed.
-///
-/// # What is given up
-///
-/// `require` installs sqlx's `DummyTlsVerifier`, which verifies nothing. The
-/// probe proved the certificate chained to our CA on ITS connection; the pool
-/// then opens different connections, so a LAN attacker able to intercept them
-/// is no longer excluded. Traffic stays encrypted. This is a real downgrade and
-/// it announces itself on stderr every time it is taken.
-pub async fn negotiated_connect_options(database_url: &str) -> Result<PgConnectOptions> {
-    let options =
-        PgConnectOptions::from_str(database_url).context("read PostgreSQL connection settings")?;
-    let requested = options.get_ssl_mode();
-    let error = match PgConnection::connect_with(&options).await {
-        Ok(probe) => {
-            // Closing is not politeness: this probe exists only to learn
-            // whether the handshake completes, and a leaked connection would
-            // sit in the server's backend count for the life of the recorder.
-            let _ = probe.close().await;
-            return Ok(options);
-        }
-        Err(error) => error,
-    };
-    let Some(effective) = downgraded_ssl_mode(requested, &error) else {
-        return Err(anyhow::Error::new(error).context("open PostgreSQL TLS connection"));
-    };
-    eprintln!("{SSL_DOWNGRADE_WARNING}");
-    Ok(options.ssl_mode(effective))
-}
-
 async fn validate_authoritative_schema(pool: &PgPool) -> Result<()> {
     for (component, statement) in [
         ("columns", REQUIRED_COLUMNS_SQL),
@@ -666,87 +567,7 @@ fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use sqlx::postgres::PgSslMode;
-
-    use super::{
-        MINIMUM_SERVER_VERSION_NUM, SSL_DOWNGRADE_WARNING, downgraded_ssl_mode,
-        ensure_supported_server_version,
-    };
-
-    fn tls_error(message: &str) -> sqlx::Error {
-        sqlx::Error::Io(std::io::Error::other(message.to_owned()))
-    }
-
-    fn hostname_mismatch() -> sqlx::Error {
-        // The shape the live cluster actually produces: rustls verified the
-        // chain against our CA and then rejected the name, because the
-        // certificate carries in-cluster DNS SANs and we connect by IP.
-        tls_error(
-            "invalid peer certificate: certificate not valid for name \"192.0.2.10\"; \
-             certificate is only valid for DnsName(\"example-rw\")",
-        )
-    }
-
-    #[test]
-    fn only_a_hostname_failure_under_verify_ca_downgrades() {
-        assert!(matches!(
-            downgraded_ssl_mode(PgSslMode::VerifyCa, &hostname_mismatch()),
-            Some(PgSslMode::Require)
-        ));
-    }
-
-    #[test]
-    fn a_broken_chain_is_never_downgraded_away() {
-        // This is the whole reason the fallback is conditional. An untrusted
-        // issuer, an expired certificate, or a server refusing TLS must still
-        // fail hard - a blanket `verify-ca -> require` rewrite would have
-        // turned every one of these into a silently accepted connection.
-        for refused in [
-            tls_error("invalid peer certificate: UnknownIssuer"),
-            tls_error("invalid peer certificate: Expired"),
-            tls_error("invalid peer certificate: BadSignature"),
-            tls_error("server does not support TLS"),
-            sqlx::Error::PoolTimedOut,
-        ] {
-            assert!(
-                downgraded_ssl_mode(PgSslMode::VerifyCa, &refused).is_none(),
-                "a non-hostname failure was downgraded: {refused}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_mode_that_was_not_verify_ca_is_left_alone() {
-        // `verify-full` asks for the hostname check ON PURPOSE, so the same
-        // error under it is the operator getting what they asked for. The
-        // weaker modes never reach the verifier that produces it.
-        for mode in [
-            PgSslMode::VerifyFull,
-            PgSslMode::Require,
-            PgSslMode::Prefer,
-            PgSslMode::Allow,
-            PgSslMode::Disable,
-        ] {
-            assert!(
-                downgraded_ssl_mode(mode, &hostname_mismatch()).is_none(),
-                "{mode:?} was downgraded"
-            );
-        }
-    }
-
-    #[test]
-    fn the_downgrade_warning_names_both_modes_and_carries_no_connection_string() {
-        assert!(SSL_DOWNGRADE_WARNING.contains("requested=verify-ca"));
-        assert!(SSL_DOWNGRADE_WARNING.contains("effective=require"));
-        // The one line that gets printed on a downgrade must not become the
-        // place the connection URL leaks into the agent log.
-        for forbidden in ["postgresql://", "postgres://", "@", "sslrootcert"] {
-            assert!(
-                !SSL_DOWNGRADE_WARNING.contains(forbidden),
-                "the downgrade warning contains {forbidden:?}"
-            );
-        }
-    }
+    use super::{MINIMUM_SERVER_VERSION_NUM, ensure_supported_server_version};
 
     #[test]
     fn server_versions_below_postgres_18_are_rejected() {

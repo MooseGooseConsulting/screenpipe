@@ -117,40 +117,19 @@ present, PostgreSQL is version 18 or newer, the authoritative tables and
 machine identity are ready, and the interactive Windows/OCR prerequisites are
 available without rendering the connection value.
 
-### TLS, and a downgrade you should know about
+### TLS
 
 The database is a CloudNativePG cluster reached over the LAN by IP, so the
-connection is TLS. `sqlx` is built with `tls-rustls-ring`: rustls with the
-`ring` provider and the bundled Mozilla root set, plus whatever `sslrootcert`
-names. Deliberately not `native-tls` and not `tls-rustls-ring-native-roots` -
-both read the Windows certificate store on Windows, so trusting this cluster
-would have meant a machine-wide trust change. Nothing outside this process is
-affected by what it trusts.
+connection is TLS. `sqlx` is built with `tls-native-tls`, and the connection
+string uses `sslmode=verify-ca` plus `sslrootcert`. SQLx adds that CA directly to
+the connector, validates the server certificate chain, and skips only hostname
+verification. No machine-wide Windows trust-store change is required.
 
-**`sslmode=verify-ca` does not work, and the recorder downgrades to `require`
-when it is asked for.** sqlx 0.8.6's `NoHostnameTlsVerifier` skips the hostname
-check by swallowing one rustls error, `CertificateError::NotValidForName`.
-rustls 0.23 replaced that with `NotValidForNameContext` - a different variant -
-so the arm never fires and the name check cannot be skipped. Our server
-certificate carries in-cluster DNS SANs and no IP SAN, and we connect by IP, so
-that check can never pass.
-
-The fallback is conditional, not a rewrite: `verify-ca` is attempted on every
-start, and the downgrade happens only when that attempt failed for the name
-check specifically. An untrusted issuer, an expired certificate, or a server
-refusing TLS still fails hard. When it does downgrade it says so, once, on
-stderr and therefore in the agent log:
-
-```
-WARNING event=tls_downgrade requested=verify-ca effective=require ...
-```
-
-While downgraded, traffic is encrypted but the server certificate is not
-verified, so a LAN attacker able to intercept the connection is not excluded.
-The clean fix is to stop connecting by IP: give the host a name that is already
-in the certificate's SANs, resolvable to the cluster address, and use
-`sslmode=verify-full`, which this build honours fully. That is a change to the
-Doppler secret and to DNS, not to this code.
+The server certificate carries in-cluster DNS SANs and no IP SAN, so
+`sslmode=verify-full` cannot work while the recorder reaches the LoadBalancer by
+IP. Do not replace `verify-ca` with `require`: that would keep encryption but
+remove server-certificate validation. Once the LAN service has a real DNS name
+covered by the certificate, move the shared connection URL to `verify-full`.
 
 ## Per-user service contract
 

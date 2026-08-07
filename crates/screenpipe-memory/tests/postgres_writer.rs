@@ -8,7 +8,7 @@ use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
     CadenceInput, CadenceRecord, CaptureGapSummary, EventKind, HashLedger, MERGE_CONTRACT_VERSION,
     MINIMUM_SERVER_VERSION_NUM, MergeDecisionKind, ObservationSample, OpenEvent, PgEventWriter,
-    SplitReason, negotiated_connect_options,
+    SplitReason,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -272,16 +272,12 @@ impl TestDatabase {
             std::process::id(),
             NEXT_SCHEMA.fetch_add(1, Ordering::Relaxed)
         );
-        // `negotiated_connect_options` rather than `connect(&url)`, here and for
-        // the scoped pool below, because the writer negotiates its TLS mode and
-        // a raw connect does not. Against the cluster - `sslmode=verify-ca`
-        // reaching an IP whose certificate has no IP SAN - every test in this
-        // file failed to connect while the recorder itself was running fine.
-        // The suite must reach the database the same way the thing it is
-        // testing does.
+        // Use the same direct SQLx connection path as the writer. SQLx's
+        // native-TLS backend honors `sslmode=verify-ca`, including
+        // `sslrootcert`, while skipping only hostname verification.
         let admin_pool = PgPoolOptions::new()
             .max_connections(2)
-            .connect_with(negotiated_connect_options(&database_url).await?)
+            .connect(&database_url)
             .await
             .context("connect test schema administrator")?;
         admin_pool
@@ -292,7 +288,7 @@ impl TestDatabase {
         let scoped_url = format!("{database_url}{separator}options=-csearch_path%3D{schema}");
         let pool = PgPoolOptions::new()
             .max_connections(8)
-            .connect_with(negotiated_connect_options(&scoped_url).await?)
+            .connect(&scoped_url)
             .await
             .context("connect disposable PostgreSQL schema")?;
         sqlx::raw_sql(schema_sql)
@@ -1037,7 +1033,7 @@ async fn no_disposable_writer_schemas_remain() -> Result<()> {
     };
     let pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect_with(negotiated_connect_options(&database_url).await?)
+        .connect(&database_url)
         .await
         .context("connect disposable-schema auditor")?;
     let schema_count: i64 = sqlx::query_scalar(
@@ -1070,7 +1066,7 @@ async fn connect_refuses_an_unsupported_server_before_touching_it() -> Result<()
     let test_result = async {
         let pool = PgPoolOptions::new()
             .max_connections(2)
-            .connect_with(negotiated_connect_options(&db.scoped_url).await?)
+            .connect(&db.scoped_url)
             .await
             .context("connect a pool for the version guard")?;
 

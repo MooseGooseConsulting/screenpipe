@@ -15,7 +15,6 @@ pub use merge::{
 };
 pub use postgres::{
     MINIMUM_SERVER_VERSION_NUM, PgEventWriter, PgPreflight, SearchHit, SearchRequest,
-    negotiated_connect_options,
 };
 pub use runner::{EventId, EventSink, RunOutcome, Runner, SampleRead, SampleSource};
 pub use sample::ObservationSample;
