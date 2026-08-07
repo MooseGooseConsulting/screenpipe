@@ -44,19 +44,25 @@ trait WindowsSampleOps: Send {
     async fn recognize(&mut self, frame: &TransientFrame) -> Result<String>;
     async fn input_idle(&mut self) -> Result<Duration>;
     async fn browser_url(&mut self, metadata: &ForegroundMetadata) -> Result<Option<String>>;
-    /// False when there is no unlocked interactive desktop to capture.
-    fn interactive_desktop_available(&mut self) -> bool;
+    /// True when the console session is locked.
+    ///
+    /// Deliberately NOT `probe_interactive_capability`. That probe answers
+    /// `Available` on a demonstrably locked workstation - measured on this
+    /// machine, `OpenInputDesktop` returned a handle and `GetForegroundWindow`
+    /// returned a window while the screen was locked - which is why a real
+    /// lock produced 78 `capture_unavailable` gaps against 1 `desktop_locked`.
+    fn desktop_is_locked(&mut self) -> bool;
 }
 
 struct LiveWindowsOps;
 
 #[async_trait]
 impl WindowsSampleOps for LiveWindowsOps {
-    fn interactive_desktop_available(&mut self) -> bool {
-        matches!(
-            screenpipe_screen::probe_interactive_capability(),
-            screenpipe_screen::InteractiveCapability::Available
-        )
+    fn desktop_is_locked(&mut self) -> bool {
+        // `None` means the state could not be determined, which must not be
+        // read as either answer - defaulting to "locked" would stop capture on
+        // a healthy machine.
+        screenpipe_screen::session_is_locked().unwrap_or(false)
     }
 
     async fn sleep(&mut self, duration: Duration) {
@@ -142,7 +148,7 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
         // an overnight lock from a real fault and would fire on the lock. And
         // the seam runbook had no durable evidence that a lock had happened at
         // all, so seam 2 could only be verified by watching a pid.
-        if !self.ops.interactive_desktop_available() {
+        if self.ops.desktop_is_locked() {
             self.next_sleep = Some(RETRY_CADENCE);
             return Ok(SampleRead::Gap(CaptureGap::DesktopLocked));
         }
@@ -165,10 +171,10 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
                 // Asking again after the failure closes the window: if the
                 // desktop has gone by the time capture failed, the lock is the
                 // explanation, not a fault.
-                let gap = if self.ops.interactive_desktop_available() {
-                    CaptureGap::CaptureUnavailable
-                } else {
+                let gap = if self.ops.desktop_is_locked() {
                     CaptureGap::DesktopLocked
+                } else {
+                    CaptureGap::CaptureUnavailable
                 };
                 return Ok(SampleRead::Gap(gap));
             }
@@ -339,7 +345,7 @@ mod tests {
         ocr: VecDeque<Result<String>>,
         input_idle: VecDeque<Result<Duration>>,
         browser_urls: VecDeque<Result<Option<String>>>,
-        interactive_desktop: bool,
+        desktop_locked: bool,
         desktop_answers: VecDeque<bool>,
     }
 
@@ -359,7 +365,7 @@ mod tests {
                 ocr: ocr.into_iter().collect(),
                 input_idle: input_idle.into_iter().collect(),
                 browser_urls: browser_urls.into_iter().collect(),
-                interactive_desktop: true,
+                desktop_locked: false,
                 desktop_answers: VecDeque::new(),
             }
         }
@@ -371,7 +377,7 @@ mod tests {
         }
 
         fn with_locked_desktop(mut self) -> Self {
-            self.interactive_desktop = false;
+            self.desktop_locked = true;
             self
         }
 
@@ -384,7 +390,7 @@ mod tests {
 
     #[async_trait]
     impl WindowsSampleOps for TestOps {
-        fn interactive_desktop_available(&mut self) -> bool {
+        fn desktop_is_locked(&mut self) -> bool {
             // Every pre-existing test predates the desktop probe and asserts
             // behaviour that only happens on an unlocked desktop. Defaulting to
             // `true` keeps them meaning what they meant; the locked fixtures
@@ -395,7 +401,7 @@ mod tests {
             // and the post-failure one.
             self.desktop_answers
                 .pop_front()
-                .unwrap_or(self.interactive_desktop)
+                .unwrap_or(self.desktop_locked)
         }
 
         async fn sleep(&mut self, duration: Duration) {
@@ -465,7 +471,7 @@ mod tests {
                     [],
                     [],
                 )
-                .with_desktop_answers([true, false]),
+                .with_desktop_answers([false, true]),
             )
         }
 
