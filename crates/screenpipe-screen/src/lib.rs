@@ -8,7 +8,7 @@ mod windows_last_input;
 mod windows_metadata;
 mod windows_ocr;
 
-pub use browser_url::{BrowserUrlReader, UiaElementSnapshot, select_address_bar};
+pub use browser_url::{BrowserUrlReader, UiaElementSnapshot, select_browser_url};
 pub use interactive::{InteractiveCapability, NotInteractive, probe_interactive_capability};
 pub use types::{ForegroundMetadata, FrameFingerprint, TransientFrame};
 pub use windows_capture::WindowsCapture;
