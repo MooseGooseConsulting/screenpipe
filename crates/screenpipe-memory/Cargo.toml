@@ -15,7 +15,25 @@ caseless = "0.2.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 serde_json = "1"
 sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["chrono", "json", "postgres", "runtime-tokio"] }
+# `tls-rustls-ring` is not decoration: without SOME TLS backend compiled in,
+# sqlx answers `sslmode=require`/`verify-ca`/`verify-full` with "TLS upgrade
+# required but SQLx was built without TLS support", so the recorder cannot
+# reach the cluster at all. It resolves to `tls-rustls-ring-webpki` in sqlx
+# 0.8.6: rustls with the `ring` provider and the bundled Mozilla root set.
+#
+# Deliberately NOT `tls-native-tls`, which on Windows is SChannel and would
+# only trust the CloudNativePG CA after installing it machine-wide into the
+# Windows ROOT store. Deliberately NOT `tls-rustls-ring-native-roots` either,
+# for the same reason - it reads that same Windows store. The webpki root set
+# is a fixed bundle the process carries itself, and `sslrootcert` adds our CA
+# on top of it, so trusting this cluster changes nothing outside this process.
+sqlx = { version = "0.8", default-features = false, features = [
+    "chrono",
+    "json",
+    "postgres",
+    "runtime-tokio",
+    "tls-rustls-ring",
+] }
 unicode-normalization = "=0.1.24"
 
 [dev-dependencies]

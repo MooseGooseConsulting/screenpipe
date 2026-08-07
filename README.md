@@ -49,7 +49,7 @@ in `_test`; anything else is refused. To run it against the disposable
 database:
 
 ```powershell
-$env:SCREEN_MEMORY_TEST_DATABASE_URL = 'postgresql://<user>:<password>@127.0.0.1:5432/screen_memory_test'
+$env:SCREEN_MEMORY_TEST_DATABASE_URL = 'postgresql://<user>:<password>@<host>:5432/screen_memory_test'
 cargo test --workspace
 ```
 
@@ -116,6 +116,41 @@ project/config names `homelab/dev_personal`. `doctor` verifies the variable is
 present, PostgreSQL is version 18 or newer, the authoritative tables and
 machine identity are ready, and the interactive Windows/OCR prerequisites are
 available without rendering the connection value.
+
+### TLS, and a downgrade you should know about
+
+The database is a CloudNativePG cluster reached over the LAN by IP, so the
+connection is TLS. `sqlx` is built with `tls-rustls-ring`: rustls with the
+`ring` provider and the bundled Mozilla root set, plus whatever `sslrootcert`
+names. Deliberately not `native-tls` and not `tls-rustls-ring-native-roots` -
+both read the Windows certificate store on Windows, so trusting this cluster
+would have meant a machine-wide trust change. Nothing outside this process is
+affected by what it trusts.
+
+**`sslmode=verify-ca` does not work, and the recorder downgrades to `require`
+when it is asked for.** sqlx 0.8.6's `NoHostnameTlsVerifier` skips the hostname
+check by swallowing one rustls error, `CertificateError::NotValidForName`.
+rustls 0.23 replaced that with `NotValidForNameContext` - a different variant -
+so the arm never fires and the name check cannot be skipped. Our server
+certificate carries in-cluster DNS SANs and no IP SAN, and we connect by IP, so
+that check can never pass.
+
+The fallback is conditional, not a rewrite: `verify-ca` is attempted on every
+start, and the downgrade happens only when that attempt failed for the name
+check specifically. An untrusted issuer, an expired certificate, or a server
+refusing TLS still fails hard. When it does downgrade it says so, once, on
+stderr and therefore in the agent log:
+
+```
+WARNING event=tls_downgrade requested=verify-ca effective=require ...
+```
+
+While downgraded, traffic is encrypted but the server certificate is not
+verified, so a LAN attacker able to intercept the connection is not excluded.
+The clean fix is to stop connecting by IP: give the host a name that is already
+in the certificate's SANs, resolvable to the cluster address, and use
+`sslmode=verify-full`, which this build honours fully. That is a change to the
+Doppler secret and to DNS, not to this code.
 
 ## Per-user service contract
 
