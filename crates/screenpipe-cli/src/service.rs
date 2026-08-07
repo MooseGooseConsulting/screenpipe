@@ -1291,7 +1291,12 @@ $parseErrors = $null
                 "-WindowStyle",
                 "Hidden",
                 "-Command",
-                &format!("Start-Sleep -Seconds 30 # {}", wrapper.display()),
+                // Ten minutes, not thirty seconds. `try_wait` cannot tell "the
+                // stop script killed it" from "it finished on its own", so a
+                // fixture that can expire inside the test window turns a slow
+                // machine into a false accusation. This failed exactly that way
+                // on a two-core CI runner while passing locally.
+                &format!("Start-Sleep -Seconds 600 # {}", wrapper.display()),
             ])
             .spawn()
             .unwrap();
@@ -1344,7 +1349,13 @@ $parseErrors = $null
             std::fs::copy(&system_ping, path).unwrap();
         }
         Command::new(path)
-            .args(["-n", "60", "127.0.0.1"])
+            // Ten minutes. `try_wait` reports "exited" identically whether the
+            // stop script terminated the process or it simply ran to
+            // completion, so the fixture must comfortably outlive the slowest
+            // machine that runs this suite. At 60s these tests passed locally
+            // and failed on CI, accusing the script of killing processes it
+            // never touched.
+            .args(["-n", "600", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap()
