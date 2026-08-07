@@ -1,0 +1,8 @@
+setup:
+  project: homelab
+  config: dev_personal
+
+flags:
+  analytics: false
+  env-warning: false
+  update-check: false
