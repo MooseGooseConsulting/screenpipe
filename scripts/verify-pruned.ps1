@@ -31,6 +31,7 @@ if ($failures.Count -eq 0) {
             ($_ -split '#')[0] -replace '^path\+file:///', ''
         })
         $expectedPackageNames = @(
+            'screenpipe-audio',
             'screenpipe-cli',
             'screenpipe-memory',
             'screenpipe-screen'
@@ -45,8 +46,24 @@ if ($failures.Count -eq 0) {
             $failures.Add("unexpected workspace packages: $($actualPackageNames -join ', ')")
         }
 
+        $expectedDefaultPackageNames = @(
+            'screenpipe-cli',
+            'screenpipe-memory',
+            'screenpipe-screen'
+        )
+        $actualDefaultPackageNames = @(
+            $metadata.packages |
+                Where-Object { $_.id -in $metadata.workspace_default_members } |
+                Select-Object -ExpandProperty name |
+                Sort-Object
+        )
+        if (($actualDefaultPackageNames -join ',') -ne ($expectedDefaultPackageNames -join ',')) {
+            $failures.Add(
+                "unexpected default workspace packages: $($actualDefaultPackageNames -join ', ')"
+            )
+        }
+
         $forbiddenDependencies = @(
-            'screenpipe-audio',
             'screenpipe-db',
             'screenpipe-sync',
             'tauri'
@@ -67,4 +84,4 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 
-Write-Output 'PASS: only the headless Goal 1 workspace remains'
+Write-Output 'PASS: only the headless Goal 1 workspace remains; audio stays opt-in'

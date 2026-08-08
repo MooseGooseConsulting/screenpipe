@@ -19,6 +19,8 @@ The workspace contains only:
   boundary;
 - `screenpipe-memory`: deterministic OCR identity, merge decisions, cadence,
   and capture-to-sink orchestration;
+- `screenpipe-audio`: opt-in WASAPI capture, VAD utterance segmentation, and
+  local transcription;
 - `screenpipe-cli`: the minimal `run`, `doctor`, and `service` command surface.
 
 There is no desktop UI, cloud sync, marketplace, updater, SQLite runtime,
@@ -28,10 +30,19 @@ summarization, embedding, MCP server, or model-based merge decision.
 
 ```powershell
 cargo fmt --all -- --check
-cargo test --workspace
-cargo check --workspace
+cargo test --workspace --exclude screenpipe-audio
+cargo check --workspace --exclude screenpipe-audio
+
+$env:LIBCLANG_PATH = "$env:LOCALAPPDATA\screen-memory\llvm\bin"
+cargo test -p screenpipe-audio
+cargo check -p screenpipe-cli --features audio
 powershell -NoProfile -File .\scripts\verify-pruned.ps1
 ```
+
+Audio is a workspace member but not a default member, so the ordinary build
+stays free of the whisper.cpp toolchain. CI does not omit it: a dedicated
+Windows job installs LLVM/libclang 18.1.8, runs the audio crate tests, and
+checks the CLI with its `audio` feature enabled.
 
 The three interactive Windows tests remain ignored by default. They require an
 unlocked desktop with a controlled foreground window and must not be treated as
@@ -161,13 +172,13 @@ the trigger is kept so the first consonant is not clipped, and the trailing
 silence is cut before the audio reaches the model. Whisper is never asked where
 speech starts.
 
-Each utterance is then its own event, unless its transcript is identical to the
-open one, in which case it merges. That is the same rule the clipboard channel
-uses, and it is load-bearing here for a different reason: the writer replaces
-`ocr_text` on a merge, so merging two different transcripts would keep the
-second and lose the first. What it does merge is repetition - whisper's
-favourite hallucination over a quiet room is the same short phrase over and
-over, and that becomes one row with a higher `sample_count`.
+Each separately closed utterance window is its own event, even when its
+normalized transcript is identical to an earlier one. People can say the same
+thing twice, and both occurrences must remain durable. Deduplication is scoped
+to one VAD identity: only chunks with the same utterance start/end window and
+the same normalized transcript merge. Near-silence hallucinations are rejected
+by the no-speech filters above rather than erased by cross-utterance content
+deduplication.
 
 An audio event has an application, unlike a clipboard event: `audio:loopback`
 or `audio:microphone`, titled `System Audio` or `Microphone`. `window_title` is
