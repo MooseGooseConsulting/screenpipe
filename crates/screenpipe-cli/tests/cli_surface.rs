@@ -42,6 +42,16 @@ fn run_help_says_the_clipboard_channel_is_on_and_how_to_turn_it_off() {
 }
 
 #[test]
+fn service_install_help_exposes_the_clipboard_opt_out() {
+    Command::cargo_bin("screenpipe")
+        .unwrap()
+        .args(["service", "install", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-clipboard"));
+}
+
+#[test]
 fn run_requires_only_the_named_injected_database_variable() {
     Command::cargo_bin("screenpipe")
         .unwrap()
@@ -80,6 +90,9 @@ fn service_status_reads_the_native_task_and_process_state() {
         .args(["service", "status"])
         .assert()
         .success()
+        .stdout(predicate::str::contains(
+            "task_name=MooseGoose Screen Memory",
+        ))
         .stdout(predicate::str::contains("task="))
         .stdout(predicate::str::contains("process="));
 }
@@ -125,6 +138,16 @@ fn the_audio_service_can_be_removed_by_a_build_that_cannot_record() {
         .assert()
         .success()
         .stdout(predicate::str::contains("MooseGoose Screen Memory Audio"));
+}
+
+#[test]
+fn audio_service_install_help_does_not_offer_the_screen_clipboard_opt_out() {
+    Command::cargo_bin("screenpipe")
+        .unwrap()
+        .args(["audio", "service", "install", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-clipboard").not());
 }
 
 #[test]

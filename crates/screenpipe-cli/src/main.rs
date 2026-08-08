@@ -86,7 +86,7 @@ enum Command {
     /// Manage the per-user headless service.
     Service {
         #[command(subcommand)]
-        action: ServiceAction,
+        action: ScreenServiceAction,
     },
     /// Record and transcribe audio. OFF unless you run or install it.
     ///
@@ -100,6 +100,17 @@ enum Command {
         #[command(subcommand)]
         action: AudioAction,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ScreenServiceAction {
+    Install {
+        /// Turn the clipboard channel off for the installed screen service.
+        #[arg(long)]
+        no_clipboard: bool,
+    },
+    Uninstall,
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -195,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
             };
             run_search(&database_url, &machine_slug, &request).await
         }
-        Command::Service { action } => run_service_action(action, ServiceKind::Screen),
+        Command::Service { action } => run_screen_service_action(action),
         Command::Audio { action } => run_audio_action(action).await,
     }
 }
@@ -831,6 +842,27 @@ async fn run_doctor(database_url: &str, machine_slug: &str, display_name: &str) 
         "doctor postgres=available version={} schema=present machine_slug={} display_name={}",
         report.server_version, report.machine_slug, report.display_name
     );
+    Ok(())
+}
+
+fn run_screen_service_action(action: ScreenServiceAction) -> anyhow::Result<()> {
+    let service_root = ServiceRoot::current_user()?;
+    let mut manager = ServiceManager::new(WindowsTaskScheduler);
+    let status = match action {
+        ScreenServiceAction::Install { no_clipboard } => {
+            let current_exe = std::env::current_exe().context("resolve running executable")?;
+            manager.install_with_clipboard(
+                &service_root,
+                ServiceKind::Screen,
+                &current_exe,
+                no_clipboard,
+            )?
+        }
+        ScreenServiceAction::Uninstall => manager.uninstall(&service_root, ServiceKind::Screen)?,
+        ScreenServiceAction::Status => manager.status(&service_root, ServiceKind::Screen)?,
+    };
+    println!("task_name={}", ServiceKind::Screen.task_name());
+    print_service_status(&status);
     Ok(())
 }
 
@@ -2728,6 +2760,13 @@ mod tests {
             panic!("run command expected");
         };
         assert!(no_clipboard);
+    }
+
+    #[test]
+    fn screen_service_install_parser_accepts_the_clipboard_opt_out() {
+        let cli = Cli::try_parse_from(["screenpipe", "service", "install", "--no-clipboard"])
+            .expect("screen service install must accept the clipboard opt-out");
+        assert!(matches!(cli.command, Command::Service { .. }));
     }
 
     #[test]

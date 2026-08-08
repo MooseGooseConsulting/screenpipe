@@ -26,6 +26,11 @@ The workspace contains only:
 There is no desktop UI, cloud sync, marketplace, updater, SQLite runtime,
 summarization, embedding, MCP server, or model-based merge decision.
 
+`screenpipe-memory` 0.2 is a source-breaking compatibility release: its public
+`SplitReason` enum adds `TimestampRegression`, and its persisted merge contract
+is version 7. Exhaustive downstream matches written for 0.1 must handle the new
+variant.
+
 ## Build and offline verification
 
 The audio commands use a one-time online bootstrap for pinned Ninja 1.12.1

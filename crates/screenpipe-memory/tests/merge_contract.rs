@@ -685,6 +685,7 @@ fn every_split_reason_has_its_own_durable_code() {
         SplitReason::AppChange,
         SplitReason::WindowTitleChange,
         SplitReason::IdleGap,
+        SplitReason::TimestampRegression,
         SplitReason::TextHashChange,
         SplitReason::MaxDuration,
         SplitReason::MaxSamples,
@@ -867,6 +868,25 @@ fn a_clipboard_event_is_closed_by_the_shared_idle_gap() {
 
     assert_eq!(event.sample_count, 1);
     assert_eq!(event.started_at, at(TEST_IDLE_GAP_SECONDS * 2 + 1));
+}
+
+#[test]
+fn a_clipboard_timestamp_regression_starts_a_new_valid_event_before_its_content_is_checked() {
+    let mut merger = clipboard_merger();
+    let copied = "synthetic clipboard regression fixture";
+    started(
+        merger.ingest(clipboard_sample(10, copied)),
+        SplitReason::Initial,
+    );
+
+    let MergeDecision::Start { reason, event } = merger.ingest(clipboard_sample(5, copied)) else {
+        panic!("timestamp regression must start a distinct clipboard event");
+    };
+
+    assert_eq!(reason.as_code(), "timestamp_regression");
+    assert_eq!(event.started_at, at(5));
+    assert_eq!(event.ended_at, at(5));
+    assert_eq!(event.sample_count, 1);
 }
 
 // --- The audio contract ----------------------------------------------------
