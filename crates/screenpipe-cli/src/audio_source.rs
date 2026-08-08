@@ -53,6 +53,16 @@ const AUDIO_NO_SPEECH: &str = "event=audio_discarded reason=no_speech";
 const AUDIO_CAPTURE_FAILURE: &str = "event=audio_capture_error category=capture_unavailable";
 const AUDIO_TRANSCRIBE_FAILURE: &str = "event=audio_transcribe_error category=transcription";
 
+fn capture_error_reason_code(error: &CaptureError) -> &'static str {
+    match error {
+        CaptureError::NoDevice => "no_device",
+        CaptureError::DeviceUnavailable => "device_unavailable",
+        CaptureError::FormatUnsupported => "format_unsupported",
+        CaptureError::StreamStalled => "stream_stalled",
+        CaptureError::StreamDiscontinuity => "stream_discontinuity",
+    }
+}
+
 /// Reported when the capture side is gone for good.
 ///
 /// The one failure this channel cannot back off and retry through: the WASAPI
@@ -358,8 +368,8 @@ fn capture_loop<C: FrameSource>(
         let frame = match capture.next_frame() {
             Ok(frame) => frame,
             Err(error) => {
-                let _ = error;
-                println!("{AUDIO_CAPTURE_FAILURE}");
+                let reason = capture_error_reason_code(&error);
+                println!("{AUDIO_CAPTURE_FAILURE} reason={reason}");
                 // The utterance in flight is worth more than the failure: flush
                 // before reporting, so a stream that dies mid-sentence still
                 // writes the sentence.
@@ -504,8 +514,8 @@ mod tests {
 
     use super::{
         AUDIO_BACKLOG, AUDIO_CAPTURE_FAILURE, AUDIO_NO_SPEECH, AUDIO_TRANSCRIBE_FAILURE,
-        CaptureError, CaptureStopped, FrameSource, TRANSCRIBE_QUEUE, WRITE_QUEUE, capture_loop,
-        receive_utterance, to_permille,
+        CaptureError, CaptureStopped, FrameSource, TRANSCRIBE_QUEUE, WRITE_QUEUE,
+        capture_error_reason_code, capture_loop, receive_utterance, to_permille,
     };
     use chrono::{TimeZone, Utc};
     use screenpipe_audio::{CapturedFrame, Utterance, UtteranceEnd, VadAggressiveness};
@@ -633,6 +643,28 @@ mod tests {
         let error = anyhow::Error::new(CaptureStopped).context("audio source read failed");
 
         assert!(error.downcast_ref::<CaptureStopped>().is_some());
+    }
+
+    #[test]
+    fn every_capture_error_has_a_stable_private_safe_reason_code() {
+        let cases = [
+            (CaptureError::NoDevice, "no_device"),
+            (CaptureError::DeviceUnavailable, "device_unavailable"),
+            (CaptureError::FormatUnsupported, "format_unsupported"),
+            (CaptureError::StreamStalled, "stream_stalled"),
+            (CaptureError::StreamDiscontinuity, "stream_discontinuity"),
+        ];
+
+        for (error, expected) in cases {
+            let reason = capture_error_reason_code(&error);
+            assert_eq!(reason, expected);
+            assert!(
+                reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "{reason} is not a fixed reason code"
+            );
+        }
     }
 
     #[test]
