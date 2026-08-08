@@ -860,13 +860,16 @@ fn run_service_action(action: ServiceAction, kind: ServiceKind) -> anyhow::Resul
 #[cfg(feature = "audio")]
 mod audio {
     use anyhow::{Context, Result, ensure};
-    use screenpipe_audio::{Channel, ModelPath, VadAggressiveness, describe_default_endpoint};
+    use screenpipe_audio::{
+        AudioCapture, CaptureError, Channel, DeviceCategory, ModelPath, VadAggressiveness,
+    };
     use screenpipe_memory::{EventKind, MergeConfig, PgEventWriter, Runner};
 
-    use crate::audio_source::{AudioConfig, AudioSampleSource, CAPTURE_STOPPED};
+    use crate::audio_source::{AudioConfig, AudioSampleSource, CaptureStopped};
     use crate::{
-        DEFAULT_MODEL_RELATIVE, IDLE_GAP_SECONDS, WHISPER_MODEL_ENV, failure_backoff,
-        failure_category, print_run_outcome, run_iteration,
+        DEFAULT_MODEL_RELATIVE, IDLE_GAP_SECONDS, IterationKind, LoopStep,
+        MAX_CONSECUTIVE_FAILURES, MAX_CONSECUTIVE_GAPS, WHISPER_MODEL_ENV, failure_category,
+        next_step, print_run_outcome, run_iteration,
     };
 
     /// Most threads transcription may use.
@@ -938,7 +941,52 @@ mod audio {
         (cores / 2).clamp(1, MAX_TRANSCRIBE_THREADS)
     }
 
-    /// Opens nothing that records. Answers "would this work" and stops.
+    fn is_capture_stopped(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<CaptureStopped>().is_some()
+    }
+
+    trait AudioCaptureProbe {
+        fn open(&self, channel: Channel) -> Result<DeviceCategory, CaptureError>;
+    }
+
+    struct WasapiCaptureProbe;
+
+    impl AudioCaptureProbe for WasapiCaptureProbe {
+        fn open(&self, channel: Channel) -> Result<DeviceCategory, CaptureError> {
+            let capture = AudioCapture::open(channel)?;
+            let category = capture.category();
+            drop(capture);
+            Ok(category)
+        }
+    }
+
+    fn probe_audio_stream(
+        channel: Channel,
+        probe: &impl AudioCaptureProbe,
+    ) -> Result<DeviceCategory, CaptureError> {
+        probe.open(channel)
+    }
+
+    fn audio_next_step(
+        outcome: &screenpipe_memory::RunOutcome,
+        consecutive_failures: &mut u32,
+        consecutive_gaps: &mut u32,
+    ) -> LoopStep {
+        let kind = match outcome {
+            screenpipe_memory::RunOutcome::GapRecorded {
+                gap: screenpipe_memory::CaptureGap::OcrUnavailable,
+            } => IterationKind::Failure("transcription"),
+            screenpipe_memory::RunOutcome::GapRecorded {
+                gap: screenpipe_memory::CaptureGap::DesktopLocked,
+            } => IterationKind::DesktopLocked,
+            screenpipe_memory::RunOutcome::GapRecorded { .. } => IterationKind::Gap,
+            screenpipe_memory::RunOutcome::Started { .. }
+            | screenpipe_memory::RunOutcome::Merged { .. } => IterationKind::Persisted,
+        };
+        next_step(kind, consecutive_failures, consecutive_gaps)
+    }
+
+    /// Opens the configured stream, immediately closes it, and records nothing.
     pub(crate) async fn doctor(
         database_url: &str,
         machine_slug: &str,
@@ -949,9 +997,9 @@ mod audio {
         let channel = channel_of(microphone);
         println!("doctor audio_channel={}", channel.as_code());
 
-        let category = describe_default_endpoint(channel)
+        let category = probe_audio_stream(channel, &WasapiCaptureProbe)
             .map_err(anyhow::Error::from)
-            .context("resolve the default audio endpoint for this channel")?;
+            .context("open the default audio endpoint with the configured stream format")?;
         println!(
             "doctor audio_endpoint=available role={}",
             category.as_code()
@@ -985,11 +1033,9 @@ mod audio {
 
     /// Records until interrupted.
     ///
-    /// Unlike the screen loop this does not abort on a run of failures. It has
-    /// no service wrapper of its own to restart it in the ordinary case - and
-    /// more to the point, an audio channel that exits quietly looks exactly
-    /// like an audio channel that is working in a silent room. It backs off and
-    /// says what happened instead.
+    /// Inference and source faults back off and eventually hand control to the
+    /// service wrapper for a clean model/stream restart. Silence produces no
+    /// observation at all, so it never advances either ceiling.
     pub(crate) async fn run(
         database_url: &str,
         machine_slug: &str,
@@ -1023,6 +1069,7 @@ mod audio {
         })?;
         let mut runner = audio_runner();
         let mut consecutive_failures: u32 = 0;
+        let mut consecutive_gaps: u32 = 0;
         println!("event=audio_runtime_ready machine_slug={machine_slug}");
 
         let shutdown = tokio::signal::ctrl_c();
@@ -1037,9 +1084,26 @@ mod audio {
                 step = run_iteration(&mut runner, &mut source, &writer) => match step {
                     Ok(outcome) => {
                         print_run_outcome("audio", &outcome);
-                        consecutive_failures = 0;
+                        match audio_next_step(
+                            &outcome,
+                            &mut consecutive_failures,
+                            &mut consecutive_gaps,
+                        ) {
+                            LoopStep::Continue => {}
+                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                            LoopStep::AbortGaps => {
+                                return Err(anyhow::anyhow!(
+                                    "aborting after {MAX_CONSECUTIVE_GAPS} consecutive audio capture gaps"
+                                ));
+                            }
+                            LoopStep::AbortFailures(category) => {
+                                return Err(anyhow::anyhow!(
+                                    "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive audio processing failures (category={category})"
+                                ));
+                            }
+                        }
                     }
-                    Err(error) if format!("{error:#}").contains(CAPTURE_STOPPED) => {
+                    Err(error) if is_capture_stopped(&error) => {
                         // Not retryable. The WASAPI stream and the model live
                         // on threads that have exited; backing off would print
                         // the same line every second until logoff. Exiting
@@ -1050,11 +1114,25 @@ mod audio {
                     }
                     Err(error) => {
                         let category = failure_category(&error);
-                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        let step = next_step(
+                            IterationKind::Failure(category),
+                            &mut consecutive_failures,
+                            &mut consecutive_gaps,
+                        );
                         println!(
                             "event=audio_error category={category} consecutive={consecutive_failures}"
                         );
-                        tokio::time::sleep(failure_backoff(consecutive_failures)).await;
+                        match step {
+                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                            LoopStep::AbortFailures(category) => {
+                                return Err(anyhow::anyhow!(
+                                    "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive audio processing failures (category={category})"
+                                ));
+                            }
+                            LoopStep::Continue | LoopStep::AbortGaps => unreachable!(
+                                "a failure iteration can only retry or reach its failure ceiling"
+                            ),
+                        }
                     }
                 },
             }
@@ -1063,8 +1141,32 @@ mod audio {
 
     #[cfg(test)]
     mod tests {
-        use super::{MAX_TRANSCRIBE_THREADS, channel_of, resolve_threads};
-        use screenpipe_audio::Channel;
+        use std::cell::Cell;
+
+        use super::{
+            AudioCaptureProbe, MAX_TRANSCRIBE_THREADS, audio_next_step, channel_of,
+            is_capture_stopped, probe_audio_stream, resolve_threads,
+        };
+        use crate::audio_source::CaptureStopped;
+        use crate::{LoopStep, MAX_CONSECUTIVE_FAILURES};
+        use screenpipe_audio::{CaptureError, Channel, DeviceCategory};
+        use screenpipe_memory::{CaptureGap, RunOutcome};
+
+        struct FakeCaptureProbe {
+            opened: Cell<Option<Channel>>,
+            fail: bool,
+        }
+
+        impl AudioCaptureProbe for FakeCaptureProbe {
+            fn open(&self, channel: Channel) -> Result<DeviceCategory, CaptureError> {
+                self.opened.set(Some(channel));
+                if self.fail {
+                    Err(CaptureError::FormatUnsupported)
+                } else {
+                    Ok(DeviceCategory::Communications)
+                }
+            }
+        }
 
         #[test]
         fn the_default_channel_is_loopback() {
@@ -1083,6 +1185,100 @@ mod audio {
             assert_eq!(resolve_threads(Some(7)), 7);
             assert_eq!(resolve_threads(Some(0)), 1);
             assert_eq!(resolve_threads(Some(-3)), 1);
+        }
+
+        #[test]
+        fn capture_shutdown_classification_is_typed_not_message_matched() {
+            let typed = anyhow::Error::new(CaptureStopped).context("read the next observation");
+            let same_text = anyhow::anyhow!("the audio capture threads stopped");
+
+            assert!(is_capture_stopped(&typed));
+            assert!(!is_capture_stopped(&same_text));
+        }
+
+        #[test]
+        fn doctor_probe_opens_the_requested_stream_and_propagates_open_failure() {
+            let available = FakeCaptureProbe {
+                opened: Cell::new(None),
+                fail: false,
+            };
+            assert_eq!(
+                probe_audio_stream(Channel::Microphone, &available).unwrap(),
+                DeviceCategory::Communications
+            );
+            assert_eq!(available.opened.get(), Some(Channel::Microphone));
+
+            let unavailable = FakeCaptureProbe {
+                opened: Cell::new(None),
+                fail: true,
+            };
+            assert_eq!(
+                probe_audio_stream(Channel::Loopback, &unavailable).unwrap_err(),
+                CaptureError::FormatUnsupported
+            );
+            assert_eq!(unavailable.opened.get(), Some(Channel::Loopback));
+        }
+
+        #[test]
+        fn transcription_gaps_back_off_and_reach_the_restart_ceiling() {
+            let transcription_gap = RunOutcome::GapRecorded {
+                gap: CaptureGap::OcrUnavailable,
+            };
+            let mut failures = 0;
+            let mut gaps = 0;
+
+            for expected in 1..MAX_CONSECUTIVE_FAILURES {
+                assert!(matches!(
+                    audio_next_step(&transcription_gap, &mut failures, &mut gaps),
+                    LoopStep::Retry(_)
+                ));
+                assert_eq!(failures, expected);
+                assert_eq!(gaps, 0);
+            }
+            assert_eq!(
+                audio_next_step(&transcription_gap, &mut failures, &mut gaps),
+                LoopStep::AbortFailures("transcription")
+            );
+
+            failures = 7;
+            assert!(matches!(
+                audio_next_step(
+                    &RunOutcome::GapRecorded {
+                        gap: CaptureGap::CaptureUnavailable,
+                    },
+                    &mut failures,
+                    &mut gaps,
+                ),
+                LoopStep::Retry(_)
+            ));
+            assert_eq!(failures, 7, "a source gap is not a transcription result");
+            assert_eq!(gaps, 1);
+
+            failures = 7;
+            gaps = 3;
+            assert!(matches!(
+                audio_next_step(
+                    &RunOutcome::GapRecorded {
+                        gap: CaptureGap::DesktopLocked,
+                    },
+                    &mut failures,
+                    &mut gaps,
+                ),
+                LoopStep::Retry(_)
+            ));
+            assert_eq!((failures, gaps), (7, 3));
+
+            assert_eq!(
+                audio_next_step(
+                    &RunOutcome::Merged {
+                        event_id: "synthetic-event".to_owned(),
+                    },
+                    &mut failures,
+                    &mut gaps,
+                ),
+                LoopStep::Continue
+            );
+            assert_eq!((failures, gaps), (0, 0));
         }
     }
 }

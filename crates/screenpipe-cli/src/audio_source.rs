@@ -1,4 +1,8 @@
-use std::sync::mpsc::{Receiver as SyncReceiver, SyncSender, TrySendError, sync_channel};
+use std::fmt;
+use std::sync::mpsc::{
+    Receiver as SyncReceiver, Sender as UnboundedSyncSender, SyncSender, TrySendError,
+    channel as sync_unbounded_channel, sync_channel,
+};
 use std::thread;
 
 use anyhow::Result;
@@ -49,7 +53,23 @@ const AUDIO_NO_SPEECH: &str = "event=audio_discarded reason=no_speech";
 /// waiting brings them back. The run loop matches on this to exit, so the
 /// service wrapper restarts the process from a clean state instead of printing
 /// the same error every second forever.
-pub(crate) const CAPTURE_STOPPED: &str = "the audio capture threads stopped";
+const CAPTURE_STOPPED: &str = "the audio capture threads stopped";
+
+/// Terminal source state used by the run loop to restart the whole process.
+///
+/// This is deliberately a type rather than a message token. `anyhow` preserves
+/// it through added context, so restart policy never depends on formatted error
+/// text remaining unchanged.
+#[derive(Debug)]
+pub(crate) struct CaptureStopped;
+
+impl fmt::Display for CaptureStopped {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(CAPTURE_STOPPED)
+    }
+}
+
+impl std::error::Error for CaptureStopped {}
 
 /// The message the capture side sends the async run loop.
 enum Observed {
@@ -102,6 +122,7 @@ impl AudioSampleSource {
     /// learns whether the open succeeded.
     pub(crate) fn start(config: AudioConfig) -> Result<Self> {
         let (utterances_tx, utterances_rx) = sync_channel::<Utterance>(TRANSCRIBE_QUEUE);
+        let (terminal_tx, terminal_rx) = sync_unbounded_channel::<Utterance>();
         let (observed_tx, observed_rx) = channel::<Observed>(WRITE_QUEUE);
         let (ready_tx, ready_rx) = sync_channel::<Result<DeviceCategory, CaptureError>>(1);
 
@@ -121,7 +142,13 @@ impl AudioSampleSource {
                         return;
                     }
                 };
-                capture_loop(capture, aggressiveness, &utterances_tx, &capture_reports);
+                capture_loop(
+                    capture,
+                    aggressiveness,
+                    &utterances_tx,
+                    &terminal_tx,
+                    &capture_reports,
+                );
             })?;
 
         let device_category = ready_rx
@@ -160,6 +187,7 @@ impl AudioSampleSource {
                     app_key,
                     app_title,
                     &utterances_rx,
+                    &terminal_rx,
                     &observed_tx,
                 )
             })?;
@@ -196,7 +224,7 @@ impl SampleSource for AudioSampleSource {
             // Both workers are gone. Returning an error rather than parking
             // forever is what lets the run loop exit and the service wrapper
             // restart the process from a clean state.
-            None => Err(anyhow::anyhow!(CAPTURE_STOPPED)),
+            None => Err(CaptureStopped.into()),
         }
     }
 
@@ -215,7 +243,7 @@ impl SampleSource for AudioSampleSource {
                 },
             }),
             Some(Observed::Gap(gap)) => Ok(ObservationRead::Gap(gap)),
-            None => Err(anyhow::anyhow!(CAPTURE_STOPPED)),
+            None => Err(CaptureStopped.into()),
         }
     }
 }
@@ -234,6 +262,7 @@ fn capture_loop(
     mut capture: AudioCapture,
     aggressiveness: VadAggressiveness,
     utterances: &SyncSender<Utterance>,
+    terminal: &UnboundedSyncSender<Utterance>,
     reports: &Sender<Observed>,
 ) {
     let mut segmenter = VadSegmenter::new(aggressiveness);
@@ -246,7 +275,7 @@ fn capture_loop(
                 // before reporting, so a stream that dies mid-sentence still
                 // writes the sentence.
                 if let Some(utterance) = segmenter.flush() {
-                    offer(utterances, utterance);
+                    preserve_terminal_utterance(terminal, utterance);
                 }
                 let _ = reports.blocking_send(Observed::Gap(CaptureGap::CaptureUnavailable));
                 return;
@@ -256,6 +285,23 @@ fn capture_loop(
             offer(utterances, utterance);
         }
     }
+}
+
+/// Preserves the one utterance closed by a terminal capture failure.
+///
+/// This side channel is unbounded but can contain at most one value: the
+/// capture loop returns immediately after sending it. That makes the send
+/// nonblocking even when the ordinary bounded queue is full, while the
+/// transcriber still drains the ordinary queue first to preserve chronology.
+fn preserve_terminal_utterance(terminal: &UnboundedSyncSender<Utterance>, utterance: Utterance) {
+    let _ = terminal.send(utterance);
+}
+
+fn receive_utterance(
+    utterances: &SyncReceiver<Utterance>,
+    terminal: &SyncReceiver<Utterance>,
+) -> Option<Utterance> {
+    utterances.recv().ok().or_else(|| terminal.recv().ok())
 }
 
 /// Hands an utterance to the transcriber, or drops it and says so.
@@ -279,9 +325,10 @@ fn transcribe_loop(
     app_key: &'static str,
     app_title: &'static str,
     utterances: &SyncReceiver<Utterance>,
+    terminal: &SyncReceiver<Utterance>,
     observed: &Sender<Observed>,
 ) {
-    while let Ok(utterance) = utterances.recv() {
+    while let Some(utterance) = receive_utterance(utterances, terminal) {
         let transcript = match engine.transcribe(&utterance.samples) {
             Ok(transcript) => transcript,
             Err(error) => {
@@ -362,7 +409,46 @@ fn to_permille(probability: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AUDIO_BACKLOG, AUDIO_NO_SPEECH, TRANSCRIBE_QUEUE, WRITE_QUEUE, to_permille};
+    use super::{
+        AUDIO_BACKLOG, AUDIO_NO_SPEECH, CaptureStopped, TRANSCRIBE_QUEUE, WRITE_QUEUE,
+        preserve_terminal_utterance, receive_utterance, to_permille,
+    };
+    use chrono::{TimeZone, Utc};
+    use screenpipe_audio::{Utterance, UtteranceEnd};
+
+    fn synthetic_utterance(second: u32) -> Utterance {
+        let started_at = Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, second).unwrap();
+        Utterance {
+            started_at,
+            ended_at: started_at + chrono::Duration::milliseconds(20),
+            samples: vec![0.0],
+            closed_by: UtteranceEnd::StreamClosed,
+        }
+    }
+
+    #[test]
+    fn terminal_flush_bypasses_a_full_capture_queue_without_reordering() {
+        let (queued_tx, queued_rx) = std::sync::mpsc::sync_channel(1);
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
+        let queued = synthetic_utterance(1);
+        let terminal = synthetic_utterance(2);
+        queued_tx.send(queued.clone()).unwrap();
+
+        preserve_terminal_utterance(&terminal_tx, terminal.clone());
+        drop(queued_tx);
+        drop(terminal_tx);
+
+        assert_eq!(receive_utterance(&queued_rx, &terminal_rx), Some(queued));
+        assert_eq!(receive_utterance(&queued_rx, &terminal_rx), Some(terminal));
+        assert_eq!(receive_utterance(&queued_rx, &terminal_rx), None);
+    }
+
+    #[test]
+    fn capture_shutdown_remains_typed_through_anyhow_context() {
+        let error = anyhow::Error::new(CaptureStopped).context("audio source read failed");
+
+        assert!(error.downcast_ref::<CaptureStopped>().is_some());
+    }
 
     #[test]
     fn a_probability_becomes_parts_per_thousand() {

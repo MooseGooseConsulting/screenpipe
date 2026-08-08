@@ -239,7 +239,7 @@ impl WhisperEngine {
             if text.is_empty() {
                 continue;
             }
-            if probability > NO_SPEECH_CEILING {
+            if !is_credible_no_speech_probability(probability) {
                 dropped += 1;
                 continue;
             }
@@ -269,9 +269,23 @@ impl WhisperEngine {
     }
 }
 
+/// Whether a native no-speech probability is both valid and credible.
+///
+/// The value crosses an FFI boundary. Rejecting malformed probabilities here
+/// keeps NaN and out-of-range values from bypassing the ordinary ceiling and
+/// reaching durable confidence metadata.
+fn is_credible_no_speech_probability(probability: f32) -> bool {
+    probability.is_finite()
+        && (0.0..=1.0).contains(&probability)
+        && probability <= NO_SPEECH_CEILING
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MIN_TRANSCRIBABLE_SAMPLES, ModelPath, Transcript, WhisperError};
+    use super::{
+        MIN_TRANSCRIBABLE_SAMPLES, ModelPath, NO_SPEECH_CEILING, Transcript, WhisperError,
+        is_credible_no_speech_probability,
+    };
     use crate::capture::SAMPLE_RATE_HZ;
 
     #[test]
@@ -308,6 +322,26 @@ mod tests {
         assert!(nothing.is_empty());
         assert_eq!(nothing.avg_no_speech_prob, None);
         assert_eq!((nothing.segments, nothing.dropped_segments), (3, 3));
+    }
+
+    #[test]
+    fn invalid_no_speech_probabilities_are_never_credible() {
+        for probability in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -f32::EPSILON,
+            1.0 + f32::EPSILON,
+        ] {
+            assert!(!is_credible_no_speech_probability(probability));
+        }
+
+        assert!(is_credible_no_speech_probability(0.0));
+        assert!(is_credible_no_speech_probability(NO_SPEECH_CEILING));
+        assert!(!is_credible_no_speech_probability(
+            NO_SPEECH_CEILING + f32::EPSILON
+        ));
+        assert!(!is_credible_no_speech_probability(1.0));
     }
 
     #[test]

@@ -614,8 +614,13 @@ if (-not [int]::TryParse($env:SCREENPIPE_CALLER_PID, [ref]$callerPid)) {
 # service directory - regardless of whether the agent was up. A status check
 # that reports the health of the process asking the question is exactly the
 # fabricated status this is meant to rule out.
+$expectedProcessName = [System.IO.Path]::GetFileName($env:SCREENPIPE_SERVICE_BINARY)
+if ([string]::IsNullOrWhiteSpace($expectedProcessName)) {
+    throw "SCREENPIPE_SERVICE_BINARY has no executable name."
+}
+$wqlProcessName = $expectedProcessName.Replace("'", "''")
 $processRunning = @(
-    Get-CimInstance Win32_Process -Filter "Name = 'screenpipe.exe'" |
+    Get-CimInstance Win32_Process -Filter "Name = '$wqlProcessName'" |
         Where-Object {
             $_.ProcessId -ne $callerPid -and
             [string]::Equals(
@@ -1687,6 +1692,38 @@ $parseErrors = $null
         assert!(
             as_other.process_running,
             "status missed a genuinely running agent at the owned path"
+        );
+    }
+
+    #[test]
+    fn status_script_matches_the_audio_service_executable_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let owned_path = temp.path().join(r"bin\screenpipe-audio.exe");
+        let mut agent = spawn_process_at(&owned_path);
+        std::thread::sleep(std::time::Duration::from_millis(900));
+
+        let output = super::run_powershell(
+            status_task_script(),
+            &[
+                (
+                    "SCREENPIPE_TASK_NAME",
+                    "MooseGoose Goal 1 Absent Audio Status Control".to_owned(),
+                ),
+                (
+                    "SCREENPIPE_SERVICE_BINARY",
+                    owned_path.to_string_lossy().into_owned(),
+                ),
+                ("SCREENPIPE_CALLER_PID", std::process::id().to_string()),
+            ],
+        );
+
+        let _ = agent.kill();
+        let _ = agent.wait();
+
+        let status = parse_status_output(&output.expect("status script failed")).unwrap();
+        assert!(
+            status.process_running,
+            "status missed the running audio agent at the exact owned path"
         );
     }
 

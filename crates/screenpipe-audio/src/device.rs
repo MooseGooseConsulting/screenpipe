@@ -73,8 +73,9 @@ pub(crate) fn categorize_device(
 /// Reports the role of the endpoint this channel would capture, without
 /// opening a stream on it.
 ///
-/// For `doctor`: it answers "if I turned this on, which device would it
-/// follow" without starting a recording to find out.
+/// Answers which endpoint role a channel would follow without opening a
+/// stream. Callers that need readiness proof must use [`crate::AudioCapture`]
+/// so the configured stream format is actually initialized.
 pub fn describe_default_endpoint(channel: Channel) -> Result<DeviceCategory, CaptureError> {
     let _ = wasapi::initialize_mta();
     let direction = match channel {
