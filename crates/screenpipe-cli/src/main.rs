@@ -1010,12 +1010,24 @@ mod audio {
         runner: &mut Runner,
         source: &mut dyn SampleSource,
         sink: &dyn screenpipe_memory::EventSink,
-        shutdown: std::pin::Pin<&mut F>,
+        mut shutdown: std::pin::Pin<&mut F>,
     ) -> AudioRunEvent
     where
         F: std::future::Future<Output = Result<()>>,
     {
         if runner.has_pending_observation() {
+            let ready_shutdown = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(
+                    match std::future::Future::poll(shutdown.as_mut(), context) {
+                        std::task::Poll::Ready(signal) => Some(signal),
+                        std::task::Poll::Pending => None,
+                    },
+                )
+            })
+            .await;
+            if let Some(signal) = ready_shutdown {
+                return AudioRunEvent::Shutdown(signal);
+            }
             return AudioRunEvent::Iteration(run_iteration(runner, source, sink).await);
         }
 
@@ -1132,6 +1144,31 @@ mod audio {
         next_step(kind, consecutive_failures, consecutive_gaps)
     }
 
+    async fn wait_for_audio_retry<F>(
+        delay: std::time::Duration,
+        mut shutdown: std::pin::Pin<&mut F>,
+    ) -> Option<Result<()>>
+    where
+        F: std::future::Future<Output = Result<()>>,
+    {
+        tokio::select! {
+            signal = shutdown.as_mut() => Some(signal),
+            _ = tokio::time::sleep(delay) => None,
+        }
+    }
+
+    async fn finish_audio_shutdown(
+        runner: &mut Runner,
+        source: &mut impl AudioShutdownSource,
+        sink: &dyn screenpipe_memory::EventSink,
+        signal: Result<()>,
+        drain_deadline: std::time::Duration,
+    ) -> Result<()> {
+        signal.context("listen for Ctrl-C")?;
+        println!("event=shutdown reason=ctrl_c");
+        drain_audio_shutdown(runner, source, sink, drain_deadline).await
+    }
+
     async fn run_audio_loop<F>(
         runner: &mut Runner,
         source: &mut impl AudioShutdownSource,
@@ -1149,9 +1186,8 @@ mod audio {
         loop {
             match next_audio_event(runner, source, sink, shutdown.as_mut()).await {
                 AudioRunEvent::Shutdown(signal) => {
-                    signal.context("listen for Ctrl-C")?;
-                    println!("event=shutdown reason=ctrl_c");
-                    return drain_audio_shutdown(runner, source, sink, drain_deadline).await;
+                    return finish_audio_shutdown(runner, source, sink, signal, drain_deadline)
+                        .await;
                 }
                 AudioRunEvent::Iteration(Ok(outcome)) => {
                     print_run_outcome("audio", &outcome);
@@ -1161,7 +1197,20 @@ mod audio {
                         &mut consecutive_gaps,
                     ) {
                         LoopStep::Continue => {}
-                        LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                        LoopStep::Retry(delay) => {
+                            if let Some(signal) =
+                                wait_for_audio_retry(delay, shutdown.as_mut()).await
+                            {
+                                return finish_audio_shutdown(
+                                    runner,
+                                    source,
+                                    sink,
+                                    signal,
+                                    drain_deadline,
+                                )
+                                .await;
+                            }
+                        }
                         LoopStep::AbortGaps => {
                             return Err(anyhow::anyhow!(
                                 "aborting after {MAX_CONSECUTIVE_GAPS} consecutive audio capture gaps"
@@ -1192,7 +1241,20 @@ mod audio {
                         "event=audio_error category={category} consecutive={consecutive_failures}"
                     );
                     match step {
-                        LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                        LoopStep::Retry(delay) => {
+                            if let Some(signal) =
+                                wait_for_audio_retry(delay, shutdown.as_mut()).await
+                            {
+                                return finish_audio_shutdown(
+                                    runner,
+                                    source,
+                                    sink,
+                                    signal,
+                                    drain_deadline,
+                                )
+                                .await;
+                            }
+                        }
                         LoopStep::AbortFailures(category) => {
                             return Err(anyhow::anyhow!(
                                 "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive audio processing failures (category={category})"
@@ -1308,9 +1370,9 @@ mod audio {
         use std::sync::{Arc, Mutex};
 
         use super::{
-            AudioCaptureProbe, AudioShutdownSource, MAX_TRANSCRIBE_THREADS, audio_next_step,
-            audio_runner, channel_of, drain_audio_shutdown, is_capture_stopped, probe_audio_stream,
-            resolve_threads, run_audio_loop,
+            AudioCaptureProbe, AudioRunEvent, AudioShutdownSource, MAX_TRANSCRIBE_THREADS,
+            audio_next_step, audio_runner, channel_of, drain_audio_shutdown, is_capture_stopped,
+            next_audio_event, probe_audio_stream, resolve_threads, run_audio_loop,
         };
         use crate::audio_source::CaptureStopped;
         use crate::{LoopStep, MAX_CONSECUTIVE_FAILURES};
@@ -1815,6 +1877,93 @@ mod audio {
             }
         }
 
+        #[derive(Default)]
+        struct PendingStartSink {
+            starts: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl EventSink for PendingStartSink {
+            async fn start(
+                &self,
+                _event: &OpenEvent,
+                _reason: SplitReason,
+            ) -> anyhow::Result<EventId> {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("PostgreSQL start failed"))
+            }
+
+            async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> anyhow::Result<()> {
+                unreachable!("a start that never succeeded cannot merge")
+            }
+        }
+
+        struct BackoffShutdownSource {
+            first: Option<anyhow::Result<ObservationRead>>,
+            shutdown_requested: bool,
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl SampleSource for BackoffShutdownSource {
+            async fn next_sample(&mut self) -> anyhow::Result<SampleRead> {
+                unreachable!("the audio foreground path reads envelopes")
+            }
+
+            async fn next_observation(&mut self) -> anyhow::Result<ObservationRead> {
+                if let Some(first) = self.first.take() {
+                    return first;
+                }
+                if self.shutdown_requested {
+                    return Err(anyhow::Error::new(CaptureStopped));
+                }
+                std::future::pending().await
+            }
+        }
+
+        impl AudioShutdownSource for BackoffShutdownSource {
+            fn request_shutdown(&mut self) {
+                self.events.lock().unwrap().push("shutdown_requested");
+                self.shutdown_requested = true;
+            }
+
+            fn stop_accepting_observations(&mut self) {}
+
+            fn join_workers(&mut self) -> anyhow::Result<()> {
+                self.events.lock().unwrap().push("joined");
+                Ok(())
+            }
+        }
+
+        struct FailThenMergeSink {
+            merges: Arc<AtomicUsize>,
+            events: Arc<Mutex<Vec<&'static str>>>,
+            first_attempt_finished: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl EventSink for FailThenMergeSink {
+            async fn start(
+                &self,
+                _event: &OpenEvent,
+                _reason: SplitReason,
+            ) -> anyhow::Result<EventId> {
+                unreachable!("the runner was seeded before the merge regression")
+            }
+
+            async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> anyhow::Result<()> {
+                let attempt = self.merges.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    self.events.lock().unwrap().push("first_attempt_finished");
+                    self.first_attempt_finished.notify_one();
+                    return Err(anyhow::anyhow!("PostgreSQL merge failed"));
+                }
+
+                self.events.lock().unwrap().push("drain_retry_started");
+                Ok(())
+            }
+        }
+
         #[async_trait]
         impl EventSink for SlowDrainSink {
             async fn start(
@@ -1832,6 +1981,115 @@ mod audio {
             async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> anyhow::Result<()> {
                 unreachable!("one completed observation starts exactly one event")
             }
+        }
+
+        #[tokio::test]
+        async fn ready_shutdown_prevents_retrying_a_failed_pending_start() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut source = ForegroundDrainSource {
+                first: Some(Ok(ObservationRead::Sample {
+                    observation: completed_audio_observation(),
+                    cadence: audio_cadence(),
+                })),
+                shutdown_requested: false,
+                events,
+            };
+            let sink = PendingStartSink::default();
+            let mut runner = audio_runner();
+
+            runner.run_once(&mut source, &sink).await.unwrap_err();
+            assert!(
+                runner.has_pending_observation(),
+                "the failed start must remain pending for the shutdown drain"
+            );
+            assert_eq!(sink.starts.load(Ordering::SeqCst), 1);
+
+            let shutdown = std::future::ready(Ok(()));
+            tokio::pin!(shutdown);
+            match next_audio_event(&mut runner, &mut source, &sink, shutdown.as_mut()).await {
+                AudioRunEvent::Shutdown(signal) => signal.unwrap(),
+                AudioRunEvent::Iteration(_) => {
+                    panic!("ready shutdown must win before a pending start retry")
+                }
+            }
+            assert_eq!(
+                sink.starts.load(Ordering::SeqCst),
+                1,
+                "the pending start is retried only by the shutdown drain"
+            );
+        }
+
+        #[tokio::test]
+        async fn shutdown_during_merge_backoff_retries_the_pending_write_in_the_drain() {
+            let observation = completed_audio_observation();
+            let cadence = audio_cadence();
+            let mut runner = audio_runner();
+            let seed_sink = DrainSink::default();
+            let mut seed_source = DrainSource {
+                reads: VecDeque::from([Ok(ObservationRead::Sample {
+                    observation: observation.clone(),
+                    cadence,
+                })]),
+                shutdown_requested: true,
+                joined: false,
+            };
+            runner.run_once(&mut seed_source, &seed_sink).await.unwrap();
+
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let first_attempt_finished = Arc::new(tokio::sync::Notify::new());
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+            let merges = Arc::new(AtomicUsize::new(0));
+            let mut source = BackoffShutdownSource {
+                first: Some(Ok(ObservationRead::Sample {
+                    observation,
+                    cadence,
+                })),
+                shutdown_requested: false,
+                events: Arc::clone(&events),
+            };
+            let sink = FailThenMergeSink {
+                merges: Arc::clone(&merges),
+                events: Arc::clone(&events),
+                first_attempt_finished: Arc::clone(&first_attempt_finished),
+            };
+            let shutdown_wait = Arc::clone(&shutdown);
+
+            let run = tokio::spawn(async move {
+                run_audio_loop(
+                    &mut runner,
+                    &mut source,
+                    &sink,
+                    async move {
+                        shutdown_wait.notified().await;
+                        Ok(())
+                    },
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                first_attempt_finished.notified(),
+            )
+            .await
+            .expect("the foreground merge attempt must finish");
+            shutdown.notify_one();
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), run)
+                .await
+                .expect("shutdown must interrupt the two-second retry backoff")
+                .unwrap()
+                .unwrap();
+            assert_eq!(merges.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                *events.lock().unwrap(),
+                [
+                    "first_attempt_finished",
+                    "shutdown_requested",
+                    "drain_retry_started",
+                    "joined"
+                ]
+            );
         }
 
         #[tokio::test]
