@@ -5,6 +5,7 @@
     "find": "if self.counts.len() >= MAX_TRACKED_HASHES",
     "replace": "if self.counts.len() >= usize::MAX",
     "package": "screenpipe-memory",
+    "test": "merge_contract",
     "claim": "the per-event hash ledger is bounded, so one event cannot accumulate a key per sample"
   },
   {
@@ -13,6 +14,7 @@
     "find": "self.evicted = self.evicted.saturating_add(1);",
     "replace": "self.evicted = self.evicted;",
     "package": "screenpipe-memory",
+    "test": "merge_contract",
     "claim": "evicted hashes are counted, so merge_meta distinguishes a truncated ledger from a complete census"
   },
   {
@@ -21,6 +23,7 @@
     "find": "&& let Some(oldest) = self.order.pop_front()",
     "replace": "&& let Some(oldest) = self.order.pop_back()",
     "package": "screenpipe-memory",
+    "test": "merge_contract",
     "claim": "eviction is oldest-first, so `contains` answers \"seen recently\""
   },
   {
@@ -151,16 +154,16 @@
   {
     "id": "locked-desktop-probe-deleted",
     "file": "crates/screenpipe-cli/src/windows_source.rs",
-    "find": "        if !self.ops.interactive_desktop_available() {",
-    "replace": "        if false {",
+    "find": "        if let Some(gap) = capture_gap_for_interactive_capability(self.ops.interactive_capability())\n        {",
+    "replace": "        if let Some(gap) = None::<CaptureGap> {",
     "package": "screenpipe-cli",
     "claim": "a locked desktop is detected before capture is attempted"
   },
   {
     "id": "locked-desktop-collapses-into-capture-unavailable",
     "file": "crates/screenpipe-cli/src/windows_source.rs",
-    "find": "            return Ok(SampleRead::Gap(CaptureGap::DesktopLocked));",
-    "replace": "            return Ok(SampleRead::Gap(CaptureGap::CaptureUnavailable));",
+    "find": "            Some(CaptureGap::DesktopLocked)",
+    "replace": "            Some(CaptureGap::CaptureUnavailable)",
     "package": "screenpipe-cli",
     "claim": "a lock is its own gap kind, not collapsed into a capture failure"
   },
@@ -183,7 +186,7 @@
   {
     "id": "lock-transition-blamed-on-capture",
     "file": "crates/screenpipe-cli/src/windows_source.rs",
-    "find": "                let gap = if self.ops.interactive_desktop_available() {\n                    CaptureGap::CaptureUnavailable\n                } else {\n                    CaptureGap::DesktopLocked\n                };",
+    "find": "                let gap = capture_gap_for_interactive_capability(self.ops.interactive_capability())\n                    .unwrap_or(CaptureGap::CaptureUnavailable);",
     "replace": "                let gap = CaptureGap::CaptureUnavailable;",
     "package": "screenpipe-cli",
     "claim": "a capture failure during a lock transition is attributed to the lock, not the capture device"
@@ -191,8 +194,8 @@
   {
     "id": "every-capture-failure-excused-as-a-lock",
     "file": "crates/screenpipe-cli/src/windows_source.rs",
-    "find": "                    CaptureGap::CaptureUnavailable\n                } else {\n                    CaptureGap::DesktopLocked\n                };",
-    "replace": "                    CaptureGap::DesktopLocked\n                } else {\n                    CaptureGap::DesktopLocked\n                };",
+    "find": ".unwrap_or(CaptureGap::CaptureUnavailable)",
+    "replace": ".unwrap_or(CaptureGap::DesktopLocked)",
     "package": "screenpipe-cli",
     "claim": "a genuine capture fault on a live desktop is not excused as a lock"
   }

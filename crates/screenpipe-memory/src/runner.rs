@@ -75,6 +75,10 @@ pub enum RunOutcome {
 pub struct Runner {
     merger: Merger,
     current_event_id: Option<EventId>,
+    // Pending counters become durable only when a later content sample starts
+    // or merges an event. A terminal run with no later sample has no durable
+    // gap record; independent terminal-gap durability is deferred to Context
+    // Pipeline V2 and is intentionally not added in this PR.
     pending_gaps: CaptureGapSummary,
     pending_sample: Option<(ObservationSample, CadenceRecord)>,
 }

@@ -131,8 +131,10 @@ fn ensure_test_database(database_url: &str) -> Result<()> {
 fn the_production_capture_database_is_refused() {
     // The exact URL Doppler injects must be rejected. Without this the suite
     // silently ran DDL inside the live capture database.
-    let production = "postgresql://screen_memory:secret@127.0.0.1:5432/screen_memory";
-    let error = ensure_test_database(production).unwrap_err();
+    const CREDENTIAL_MARKER: &str = "__TEST_DATABASE_PASSWORD_MARKER__";
+    let production =
+        format!("postgresql://screen_memory:{CREDENTIAL_MARKER}@127.0.0.1:5432/screen_memory");
+    let error = ensure_test_database(&production).unwrap_err();
     let rendered = format!("{error:#}");
     assert!(
         rendered.contains("refusing to run schema-mutating tests"),
@@ -140,8 +142,8 @@ fn the_production_capture_database_is_refused() {
     );
     // The refusal must not echo the credential it was handed.
     assert!(
-        !rendered.contains("secret"),
-        "the refusal leaked the connection secret: {rendered}"
+        !rendered.contains(CREDENTIAL_MARKER),
+        "the refusal leaked the test credential marker: {rendered}"
     );
 
     ensure_test_database("postgresql://u:p@127.0.0.1:5432/screen_memory_test")
@@ -1044,6 +1046,41 @@ async fn search_finds_by_words_by_time_and_by_both() -> Result<()> {
 }
 
 #[tokio::test]
+async fn search_headline_includes_context_for_a_match_after_twenty_thousand_characters()
+-> Result<()> {
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let mut late = event(1, "notepad.exe", "Notepad", "notes", "early OCR", None);
+        late.latest.readable_text = format!("{}lateheadlinefixturemarker", "filler ".repeat(3_500));
+        let event_id = writer.write_start(&late, SplitReason::Initial).await?;
+
+        let hits = writer
+            .search(&screenpipe_memory::SearchRequest {
+                query: "lateheadlinefixturemarker".to_owned(),
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+
+        ensure!(
+            hits.iter()
+                .map(|hit| hit.event_id.as_str())
+                .eq([event_id.as_str()]),
+            "the complete FTS corpus must find the late marker: {hits:?}"
+        );
+        ensure!(
+            hits[0].snippet.contains("[lateheadlinefixturemarker]"),
+            "the headline must show context around its late match: {:?}",
+            hits[0].snippet
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
 async fn explicit_machine_search_connection_never_upserts_a_machine() -> Result<()> {
     let db = TestDatabase::create().await?;
     let test_result = async {
@@ -1150,8 +1187,8 @@ async fn writer_backfill_leaves_blank_derived_titles_null_without_rewriting_them
                 &event(
                     1,
                     "notepad.exe",
-                    "   ",
-                    "  ",
+                    " \t\r\n ",
+                    "\n\t  ",
                     "text",
                     None,
                 ),

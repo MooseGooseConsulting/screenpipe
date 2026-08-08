@@ -463,13 +463,12 @@ async fn backfill_event_titles(pool: &PgPool) -> Result<()> {
         r#"WITH title_candidates AS (
                SELECT e.id,
                    NULLIF(
-               regexp_replace(
-                   concat_ws(' - ', NULLIF(btrim(a.app_title), ''), NULLIF(btrim(e.window_title), '')),
-                   '\s+',
-                   ' ',
-                   'g'
-               ),
-               ''
+                       concat_ws(
+                           ' - ',
+                           NULLIF(btrim(regexp_replace(a.app_title, '\s+', ' ', 'g')), ''),
+                           NULLIF(btrim(regexp_replace(e.window_title, '\s+', ' ', 'g')), '')
+                       ),
+                       ''
                    ) AS title
                FROM events e
                JOIN apps a ON e.app_id = a.id
@@ -612,9 +611,10 @@ fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
             "capture_unavailable": event.capture_gaps.capture_unavailable,
             "ocr_unavailable": event.capture_gaps.ocr_unavailable,
             "empty_ocr": event.capture_gaps.empty_ocr,
-            // The durable record that a lock happened. merge_meta.capture_gaps
-            // is the only place a seam run can read it back after the fact -
-            // the agent log rotates and the process restarts, this does not.
+            // This is persisted only when a later content event flushes the
+            // runner's pending counters. A terminal lock gap is not durable in
+            // this PR; independent gap persistence is deferred to Context
+            // Pipeline V2.
             "desktop_locked": event.capture_gaps.desktop_locked,
         },
         "browser_url": event.latest.browser_url,
@@ -717,7 +717,7 @@ impl PgEventWriter {
                     e.merge_meta ->> 'browser_url', \
                     CASE WHEN $4 THEN \
                         ts_headline('english', \
-                                    left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 20000), \
+                                    coalesce(nullif(e.readable_text, ''), e.ocr_text), \
                                     plainto_tsquery('english', $1), \
                                     'StartSel=[, StopSel=], MaxFragments=2, FragmentDelimiter= ... , MaxWords=18, MinWords=6') \
                     ELSE left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 160) END \
