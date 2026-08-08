@@ -7,8 +7,8 @@ use screenpipe_memory::{
     CadenceInput, CadenceRecord, CaptureGap, ObservationSample, SampleRead, SampleSource,
 };
 use screenpipe_screen::{
-    BrowserUrlReader, ForegroundMetadata, FrameFingerprint, TransientFrame, WindowsCapture,
-    WindowsLastInput, WindowsOcr,
+    BrowserUrlReader, ForegroundMetadata, FrameFingerprint, InteractiveCapability, NotInteractive,
+    TransientFrame, WindowsCapture, WindowsLastInput, WindowsOcr,
 };
 
 const RETRY_CADENCE: Duration = Duration::from_secs(2);
@@ -37,12 +37,18 @@ trait WindowsSampleOps: Send {
     async fn recognize(&mut self, frame: &TransientFrame) -> Result<String>;
     async fn input_idle(&mut self) -> Result<Duration>;
     async fn browser_url(&mut self, metadata: &ForegroundMetadata) -> Result<Option<String>>;
+    /// Whether an interactive desktop can provide meaningful capture content.
+    fn interactive_capability(&mut self) -> InteractiveCapability;
 }
 
 struct LiveWindowsOps;
 
 #[async_trait]
 impl WindowsSampleOps for LiveWindowsOps {
+    fn interactive_capability(&mut self) -> InteractiveCapability {
+        screenpipe_screen::probe_interactive_capability()
+    }
+
     async fn sleep(&mut self, duration: Duration) {
         tokio::time::sleep(duration).await;
     }
@@ -67,6 +73,20 @@ impl WindowsSampleOps for LiveWindowsOps {
         BrowserUrlReader
             .read_for_foreground(metadata)
             .map(|url| url.map(|url| url.to_string()))
+    }
+}
+
+fn capture_gap_for_interactive_capability(capability: InteractiveCapability) -> Option<CaptureGap> {
+    match capability {
+        InteractiveCapability::Available => None,
+        InteractiveCapability::Unavailable(NotInteractive::DesktopLocked) => {
+            Some(CaptureGap::DesktopLocked)
+        }
+        InteractiveCapability::Unavailable(
+            NotInteractive::NoActiveConsoleSession
+            | NotInteractive::WrongSession
+            | NotInteractive::NoForegroundWindow,
+        ) => Some(CaptureGap::CaptureUnavailable),
     }
 }
 
@@ -116,11 +136,41 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
             self.ops.sleep(duration).await;
         }
 
+        // Ask whether there IS an interactive desktop before trying to capture
+        // one. `probe_interactive_capability` existed for the test gate and had
+        // no production caller at all, so a locked workstation surfaced as
+        // `capture_unavailable` - the same code as a dead capture device.
+        //
+        // Only the explicit lock reason takes the never-abort path. The other
+        // unavailable reasons describe absent capture capacity, not a normal
+        // locked desktop, and remain ordinary capture gaps for restart policy.
+        if let Some(gap) = capture_gap_for_interactive_capability(self.ops.interactive_capability())
+        {
+            self.next_sleep = Some(RETRY_CADENCE);
+            return Ok(SampleRead::Gap(gap));
+        }
+
         let (frame, metadata) = match self.ops.capture_foreground().await {
             Ok(capture) => capture,
             Err(_) => {
                 self.next_sleep = Some(RETRY_CADENCE);
-                return Ok(SampleRead::Gap(CaptureGap::CaptureUnavailable));
+                // Re-probe before blaming capture.
+                //
+                // The pre-capture probe is not enough on its own: locking a
+                // workstation stops capture working BEFORE `OpenInputDesktop`
+                // starts refusing, so the probe still answers "available" for
+                // the first few samples of a lock. Measured on a real lock,
+                // that window was six samples - all recorded as
+                // `capture_unavailable`, which is the code for a broken
+                // capture device, and all of them counted toward the ceiling
+                // that exists to catch one.
+                //
+                // Asking again after the failure closes the window: if the
+                // desktop has gone by the time capture failed, the lock is the
+                // explanation, not a fault.
+                let gap = capture_gap_for_interactive_capability(self.ops.interactive_capability())
+                    .unwrap_or(CaptureGap::CaptureUnavailable);
+                return Ok(SampleRead::Gap(gap));
             }
         };
         let (captured_at, monotonic_now) = self.ops.now().await;
@@ -254,7 +304,9 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use screenpipe_memory::{CaptureGap, SampleRead, SampleSource};
-    use screenpipe_screen::{ForegroundMetadata, TransientFrame};
+    use screenpipe_screen::{
+        ForegroundMetadata, InteractiveCapability, NotInteractive, TransientFrame,
+    };
 
     use super::{Source, WindowsSampleOps, WindowsSampleSource, cadence_record};
 
@@ -276,6 +328,8 @@ mod tests {
         ocr: VecDeque<Result<String>>,
         input_idle: VecDeque<Result<Duration>>,
         browser_urls: VecDeque<Result<Option<String>>>,
+        interactive_desktop: bool,
+        desktop_answers: VecDeque<InteractiveCapability>,
     }
 
     impl TestOps {
@@ -294,7 +348,27 @@ mod tests {
                 ocr: ocr.into_iter().collect(),
                 input_idle: input_idle.into_iter().collect(),
                 browser_urls: browser_urls.into_iter().collect(),
+                interactive_desktop: true,
+                desktop_answers: VecDeque::new(),
             }
+        }
+
+        /// Answer the desktop probe from a script, in order.
+        fn with_capability_answers(
+            mut self,
+            answers: impl IntoIterator<Item = InteractiveCapability>,
+        ) -> Self {
+            self.desktop_answers = answers.into_iter().collect();
+            self
+        }
+
+        fn with_locked_desktop(mut self) -> Self {
+            self.desktop_answers = [InteractiveCapability::Unavailable(
+                NotInteractive::DesktopLocked,
+            )]
+            .into_iter()
+            .collect();
+            self
         }
 
         fn next<T>(queue: &mut VecDeque<Result<T>>, boundary: &str) -> Result<T> {
@@ -306,6 +380,24 @@ mod tests {
 
     #[async_trait]
     impl WindowsSampleOps for TestOps {
+        fn interactive_capability(&mut self) -> InteractiveCapability {
+            // Every pre-existing test predates the desktop probe and asserts
+            // behaviour that only happens on an unlocked desktop. Defaulting to
+            // `true` keeps them meaning what they meant; the locked fixtures
+            // below override it.
+            //
+            // A queue rather than a flag, because the defect this models is
+            // precisely that the answer CHANGES between the pre-capture probe
+            // and the post-failure one.
+            self.desktop_answers
+                .pop_front()
+                .unwrap_or(if self.interactive_desktop {
+                    InteractiveCapability::Available
+                } else {
+                    InteractiveCapability::Unavailable(NotInteractive::DesktopLocked)
+                })
+        }
+
         async fn sleep(&mut self, duration: Duration) {
             self.calls.lock().unwrap().sleeps.push(duration);
         }
@@ -359,6 +451,44 @@ mod tests {
                 self.base_utc + chrono::Duration::seconds(seconds as i64),
                 self.base_instant + Duration::from_secs(seconds),
             );
+        }
+
+        /// A desktop that still probes as available, then fails to capture,
+        /// then probes as gone - the real transition when a screen locks.
+        fn locking_source(&self) -> Source<TestOps> {
+            Source::new(
+                TestOps::new(
+                    Arc::clone(&self.clock),
+                    Arc::clone(&self.calls),
+                    [Err(anyhow::anyhow!("foreground window is gone"))],
+                    [],
+                    [],
+                    [],
+                )
+                .with_capability_answers([
+                    InteractiveCapability::Available,
+                    InteractiveCapability::Unavailable(NotInteractive::DesktopLocked),
+                ]),
+            )
+        }
+
+        fn locked_source(&self) -> Source<TestOps> {
+            // No capture, OCR, or input-idle results are queued ON PURPOSE.
+            // TestOps::next panics on an unexpected boundary call, so if the
+            // locked-desktop check is ever removed or moved below the capture
+            // attempt, this test fails loudly instead of quietly reporting a
+            // different gap kind.
+            Source::new(
+                TestOps::new(
+                    Arc::clone(&self.clock),
+                    Arc::clone(&self.calls),
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                .with_locked_desktop(),
+            )
         }
 
         fn source(
@@ -884,5 +1014,113 @@ mod tests {
         assert_send_value(WindowsSampleSource::new());
         assert_send::<Source<TestOps>>();
         assert_source::<Source<TestOps>>();
+    }
+
+    #[tokio::test]
+    async fn a_locked_desktop_yields_a_typed_gap_without_attempting_capture() {
+        // `probe_interactive_capability` shipped with the test gate and had NO
+        // production caller, so a locked workstation reached the run loop as
+        // `capture_unavailable` - the same code a dead capture device produces.
+        // The loop could not tell an overnight lock from a real fault.
+        //
+        // The harness queues nothing, so any attempt to capture, OCR, or read
+        // input idle panics. Passing therefore proves the probe short-circuits
+        // BEFORE the capture attempt, not merely that the gap is relabelled.
+        let harness = Harness::new();
+        let mut source = harness.locked_source();
+
+        let read = source.next_sample().await.unwrap();
+
+        assert_eq!(
+            read,
+            SampleRead::Gap(CaptureGap::DesktopLocked),
+            "a locked desktop must be its own gap kind, distinguishable from a              capture failure"
+        );
+        assert_ne!(
+            read,
+            SampleRead::Gap(CaptureGap::CaptureUnavailable),
+            "a lock must not be reported as a capture failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_lock_unavailable_reasons_remain_capture_gaps() {
+        for reason in [
+            NotInteractive::NoActiveConsoleSession,
+            NotInteractive::WrongSession,
+            NotInteractive::NoForegroundWindow,
+        ] {
+            let harness = Harness::new();
+            let mut source = Source::new(
+                TestOps::new(
+                    Arc::clone(&harness.clock),
+                    Arc::clone(&harness.calls),
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                .with_capability_answers([InteractiveCapability::Unavailable(reason)]),
+            );
+
+            let read = source.next_sample().await.unwrap();
+
+            assert_eq!(
+                read,
+                SampleRead::Gap(CaptureGap::CaptureUnavailable),
+                "{reason:?} is unavailable capture capacity, not a desktop lock"
+            );
+            assert_ne!(
+                read,
+                SampleRead::Gap(CaptureGap::DesktopLocked),
+                "{reason:?} must not inherit the never-abort lock route"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lock_caught_mid_transition_is_not_blamed_on_capture() {
+        // Locking a workstation stops capture working BEFORE OpenInputDesktop
+        // starts refusing, so the pre-capture probe answers "available" for the
+        // first few samples of a lock. Measured on a real lock on this machine,
+        // that window was six samples - every one recorded as
+        // `capture_unavailable`, the code for a broken capture device, and
+        // every one counted toward the ceiling that exists to catch one.
+        //
+        // The fixture is that exact sequence: probe says available, capture
+        // fails, probe now says gone.
+        let harness = Harness::new();
+        let mut source = harness.locking_source();
+
+        let read = source.next_sample().await.unwrap();
+
+        assert_eq!(
+            read,
+            SampleRead::Gap(CaptureGap::DesktopLocked),
+            "a capture failure during a lock transition must be attributed to              the lock, not to the capture device"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_capture_failure_on_a_live_desktop_is_still_a_capture_failure() {
+        // The negative control for the test above. If the re-probe answered
+        // "gone" unconditionally, every capture fault would be relabelled as a
+        // lock and the ceiling that catches a dead capture device would never
+        // fire again.
+        let harness = Harness::new();
+        let mut source = harness.source([Err(anyhow::anyhow!("WGC timed out"))], [], [], []);
+
+        let read = source.next_sample().await.unwrap();
+
+        assert_eq!(
+            read,
+            SampleRead::Gap(CaptureGap::CaptureUnavailable),
+            "a genuine capture fault on a live desktop must not be excused as a lock"
+        );
+        assert_ne!(
+            read,
+            SampleRead::Gap(CaptureGap::DesktopLocked),
+            "an available desktop and a locked desktop must remain distinct session gaps"
+        );
     }
 }

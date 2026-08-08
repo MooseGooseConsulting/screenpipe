@@ -83,14 +83,30 @@ foreach ($mutation in $mutations) {
     if (-not (Test-Path -LiteralPath $path)) { throw "mutation $($mutation.id): missing file $($mutation.file)" }
 
     $original = [IO.File]::ReadAllText($path)
-    $occurrences = ([regex]::Escape($mutation.find) | ForEach-Object { [regex]::Matches($original, $_).Count })
+
+    # Match the file's own line endings.
+    #
+    # JSON carries `\n`, and `[IO.File]::ReadAllText` returns the file's bytes
+    # verbatim - no universal-newline translation. So every multi-line `find`
+    # silently matched ZERO times in a CRLF source file and was filed INVALID,
+    # while the identical string matched fine in an LF file. The verdict looked
+    # like a stale manifest entry rather than a newline mismatch, and this
+    # repository contains both kinds of file.
+    $find = $mutation.find
+    $replace = $mutation.replace
+    if ($original.Contains("`r`n")) {
+        $find = $find -replace "(?<!`r)`n", "`r`n"
+        $replace = $replace -replace "(?<!`r)`n", "`r`n"
+    }
+
+    $occurrences = ([regex]::Escape($find) | ForEach-Object { [regex]::Matches($original, $_).Count })
     if ($occurrences -ne 1) {
         Write-Host "INVALID  $($mutation.id) - 'find' matched $occurrences times (need exactly 1)" -ForegroundColor Magenta
         $results.Add([pscustomobject]@{ id = $mutation.id; verdict = 'INVALID'; claim = $mutation.claim })
         continue
     }
 
-    $mutated = $original.Replace($mutation.find, $mutation.replace)
+    $mutated = $original.Replace($find, $replace)
     if ($mutated -eq $original) { throw "mutation $($mutation.id): replacement was a no-op" }
 
     $backup = Save-MutationBackup -RelativePath $mutation.file -Content $original
@@ -109,14 +125,27 @@ foreach ($mutation in $mutations) {
 
         $output = & cargo @cargoArgs 2>&1
         $exit = $LASTEXITCODE
+        $outputText = $output | Out-String
 
         # A mutation that does not compile is not evidence about the tests.
         # Match only genuine compiler diagnostics: cargo also prints a bare
         # "error: test failed" line for an ordinary failing test, which is a
         # KILL, not a build problem.
-        $compileFailed = @($output | Where-Object {
-                $_ -match 'error\[E\d+\]' -or $_ -match 'could not compile'
-            }).Count -gt 0
+        # A const-evaluation panic is the STRONGEST possible kill, not an
+        # invalid mutation.
+        #
+        # Invariants over constants - the idle-gap margin, the
+        # consecutive-failure bounds - are asserted in `const` blocks precisely
+        # so that violating them fails `cargo build` rather than only
+        # `cargo test`. When such a mutation lands, rustc reports
+        # `error[E0080]: evaluation panicked: <the assertion message>`. Matching
+        # that as "does not compile" filed the loudest result the suite can
+        # produce under "no evidence either way", and
+        # `idle-gap-margin-collapses-to-one-second` was reported UNAUDITED when
+        # the test had in fact stopped the build.
+        $constAssertionFired = $outputText -match '(?s)error\[E0080\].*evaluation panicked'
+
+        $compileFailed = -not $constAssertionFired -and $outputText -match 'error\[E\d+\]|could not compile'
 
         # A KILL requires POSITIVE evidence that tests actually ran.
         #
@@ -131,7 +160,11 @@ foreach ($mutation in $mutations) {
                 $_ -match 'running \d+ test' -or $_ -match '^test result:'
             }).Count -gt 0
 
-        if ($compileFailed) {
+        if ($constAssertionFired) {
+            # Killed at compile time. Nothing needed to run.
+            $verdict = 'KILLED'
+            $colour = 'Green'
+        } elseif ($compileFailed) {
             $verdict = 'UNCOMPILABLE'
             $colour = 'Magenta'
         } elseif ($exit -eq 0) {

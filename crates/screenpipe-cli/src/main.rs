@@ -4,8 +4,8 @@ use anyhow::{Context, Result, ensure};
 use chrono::Duration;
 use clap::{Parser, Subcommand};
 use screenpipe_memory::{
-    EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventWriter, RunOutcome, Runner,
-    SampleSource,
+    EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventReader, PgEventWriter, RunOutcome,
+    Runner, SampleSource,
 };
 use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
@@ -46,6 +46,24 @@ enum Command {
         #[arg(long, default_value = DEFAULT_DISPLAY_NAME)]
         display_name: String,
     },
+    /// Search recorded screen memory.
+    Search {
+        /// Words to look for. Ranked, not literal. May be omitted if --since
+        /// or --until is given.
+        query: Vec<String>,
+        /// Existing machine to read without creating or changing its identity.
+        #[arg(long, default_value = DEFAULT_MACHINE_SLUG)]
+        machine_slug: String,
+        #[arg(long, default_value_t = 10)]
+        limit: i64,
+        /// Only events that were still going after this. Accepts `90m`, `4h`,
+        /// `3d`, `today`, `yesterday`, or a date like `2026-08-06`.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only events that had started by this. Same formats as --since.
+        #[arg(long)]
+        until: Option<String>,
+    },
     /// Manage the per-user headless service.
     Service {
         #[command(subcommand)]
@@ -77,8 +95,151 @@ async fn main() -> anyhow::Result<()> {
             let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
             run_doctor(&database_url, &machine_slug, &display_name).await
         }
+        Command::Search {
+            query,
+            machine_slug,
+            limit,
+            since,
+            until,
+        } => {
+            let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
+            let request = screenpipe_memory::SearchRequest {
+                query: query.join(" "),
+                limit,
+                since: since.as_deref().map(parse_when).transpose()?,
+                until: until.as_deref().map(parse_when).transpose()?,
+            };
+            run_search(&database_url, &machine_slug, &request).await
+        }
         Command::Service { action } => run_service_action(action),
     }
+}
+
+/// Parse the time expressions a person actually types.
+///
+/// Deliberately small and local. `90m`, `4h`, `3d` are relative to now;
+/// `today` and `yesterday` are local midnights, because that is what those
+/// words mean to someone looking back at their own day; a bare `YYYY-MM-DD` is
+/// local midnight on that date. Everything is converted to UTC at the boundary
+/// so the query never depends on the server's timezone.
+fn midnight_in_timezone<Tz>(
+    timezone: Tz,
+    date: chrono::NaiveDate,
+) -> Result<chrono::DateTime<chrono::Utc>>
+where
+    Tz: chrono::TimeZone,
+{
+    let naive = date.and_hms_opt(0, 0, 0).context("build local midnight")?;
+    Ok(timezone
+        .from_local_datetime(&naive)
+        .single()
+        .context("ambiguous local midnight (daylight-saving boundary)")?
+        .with_timezone(&chrono::Utc))
+}
+
+fn parse_when(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    use chrono::{Duration as ChronoDuration, Local, NaiveDate};
+
+    let raw = value.trim().to_ascii_lowercase();
+
+    if raw == "today" {
+        return midnight_in_timezone(Local, Local::now().date_naive());
+    }
+    if raw == "yesterday" {
+        return midnight_in_timezone(
+            Local,
+            Local::now()
+                .date_naive()
+                .pred_opt()
+                .context("yesterday is out of range")?,
+        );
+    }
+    if let Some(rest) = raw.strip_suffix('m') {
+        ensure!(
+            !rest.starts_with('-'),
+            "relative times must not be negative"
+        );
+        let minutes: i64 = rest.parse().context("minutes must be a whole number")?;
+        let duration = ChronoDuration::try_minutes(minutes).context("minutes is too large")?;
+        return chrono::Utc::now()
+            .checked_sub_signed(duration)
+            .context("relative time is too large");
+    }
+    if let Some(rest) = raw.strip_suffix('h') {
+        ensure!(
+            !rest.starts_with('-'),
+            "relative times must not be negative"
+        );
+        let hours: i64 = rest.parse().context("hours must be a whole number")?;
+        let duration = ChronoDuration::try_hours(hours).context("hours is too large")?;
+        return chrono::Utc::now()
+            .checked_sub_signed(duration)
+            .context("relative time is too large");
+    }
+    if let Some(rest) = raw.strip_suffix('d') {
+        ensure!(
+            !rest.starts_with('-'),
+            "relative times must not be negative"
+        );
+        let days: i64 = rest.parse().context("days must be a whole number")?;
+        let duration = ChronoDuration::try_days(days).context("days is too large")?;
+        return chrono::Utc::now()
+            .checked_sub_signed(duration)
+            .context("relative time is too large");
+    }
+    let date = NaiveDate::parse_from_str(&raw, "%Y-%m-%d").with_context(|| {
+        format!(
+            "could not read {value:?} as a time: try 90m, 4h, 3d, today, yesterday, or 2026-08-06"
+        )
+    })?;
+    midnight_in_timezone(Local, date)
+}
+
+async fn run_search(
+    database_url: &str,
+    machine_slug: &str,
+    request: &screenpipe_memory::SearchRequest,
+) -> Result<()> {
+    let reader = PgEventReader::connect(database_url, machine_slug).await?;
+    let hits = reader.search(request).await?;
+
+    if hits.is_empty() {
+        if request.query.trim().is_empty() {
+            println!("nothing recorded in that window");
+        } else {
+            println!("no matches for {:?}", request.query);
+        }
+        return Ok(());
+    }
+
+    for hit in &hits {
+        let minutes = (hit.ended_at - hit.started_at).num_minutes();
+        let label = hit
+            .title
+            .as_deref()
+            .or(hit.app_title.as_deref())
+            .unwrap_or("(untitled)");
+        println!(
+            "{}  {}  ({} samples, {} min)",
+            hit.started_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M"),
+            label,
+            hit.sample_count,
+            minutes.max(0)
+        );
+        if let Some(url) = hit.browser_url.as_deref() {
+            println!("    {url}");
+        }
+        let snippet = hit.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !snippet.is_empty() {
+            println!("    {snippet}");
+        }
+        println!("    {}", hit.event_id);
+        println!();
+    }
+    println!("{} match(es)", hits.len());
+    Ok(())
 }
 
 fn required_database_url(value: Option<OsString>) -> Result<String> {
@@ -132,10 +293,12 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
                 match outcome {
                     Ok(outcome) => {
                         print_run_outcome(&outcome);
-                        let kind = if matches!(outcome, RunOutcome::GapRecorded { .. }) {
-                            IterationKind::Gap
-                        } else {
-                            IterationKind::Persisted
+                        let kind = match &outcome {
+                            RunOutcome::GapRecorded {
+                                gap: screenpipe_memory::CaptureGap::DesktopLocked,
+                            } => IterationKind::DesktopLocked,
+                            RunOutcome::GapRecorded { .. } => IterationKind::Gap,
+                            _ => IterationKind::Persisted,
                         };
                         match next_step(kind, &mut consecutive_failures, &mut consecutive_gaps) {
                             LoopStep::Continue => {}
@@ -203,8 +366,17 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
 enum IterationKind {
     /// An observation reached PostgreSQL. This is the only genuine success.
     Persisted,
-    /// A typed capture gap. Ordinary and expected, but NOT a success.
+    /// A typed capture gap on a live desktop. Ordinary and expected, but NOT
+    /// a success - a persistent one means capture is broken.
     Gap,
+    /// The desktop is locked or absent.
+    ///
+    /// Held separate from `Gap` because it is not a fault at all. A machine
+    /// left locked overnight produces nothing else for eight hours, and the
+    /// gap ceiling exists to catch a dead capture device - it must not fire on
+    /// a normal night. Backs off, never aborts, and never touches either
+    /// streak.
+    DesktopLocked,
     /// The iteration returned an error.
     Failure,
 }
@@ -240,6 +412,12 @@ fn next_step(
             *consecutive_gaps = 0;
             LoopStep::Continue
         }
+        IterationKind::DesktopLocked => {
+            // Deliberately does NOT advance the gap streak. Waiting for a user
+            // to come back is not a fault, and treating it as one made the
+            // agent abort and restart every few hours on an idle machine.
+            LoopStep::Retry(failure_backoff(MAX_BACKOFF_STEP))
+        }
         IterationKind::Gap => {
             *consecutive_gaps = consecutive_gaps.saturating_add(1);
             if *consecutive_gaps >= MAX_CONSECUTIVE_GAPS {
@@ -263,6 +441,9 @@ fn next_step(
 /// wrapper restart it from a clean state.
 const MAX_CONSECUTIVE_FAILURES: u32 = 20;
 
+/// Exponent clamp for `failure_backoff`. `2^5 = 32` seconds.
+const MAX_BACKOFF_STEP: u32 = 5;
+
 /// Consecutive capture gaps tolerated before the process exits.
 ///
 /// Far higher than `MAX_CONSECUTIVE_FAILURES` because the two describe
@@ -285,7 +466,7 @@ const MAX_CONSECUTIVE_GAPS: u32 = 640;
 /// was unreachable and anyone raising the clamp to 6 expecting it to hold would
 /// have got 64s instead.
 fn failure_backoff(consecutive_failures: u32) -> std::time::Duration {
-    let seconds = 2_u64.saturating_pow(consecutive_failures.min(5));
+    let seconds = 2_u64.saturating_pow(consecutive_failures.min(MAX_BACKOFF_STEP));
     std::time::Duration::from_secs(seconds)
 }
 
@@ -539,6 +720,29 @@ mod tests {
         assert_eq!(display_name, "Icarus-Laptop");
     }
 
+    #[test]
+    fn search_command_scopes_reads_to_the_explicit_machine() {
+        let cli = Cli::try_parse_from([
+            "screenpipe",
+            "search",
+            "--machine-slug",
+            "laptop_b",
+            "release",
+        ])
+        .unwrap();
+        let Command::Search {
+            machine_slug,
+            query,
+            ..
+        } = cli.command
+        else {
+            panic!("search command expected");
+        };
+
+        assert_eq!(machine_slug, "laptop_b");
+        assert_eq!(query, ["release"]);
+    }
+
     #[tokio::test]
     async fn run_iteration_wires_a_sample_through_runner_and_sink() {
         let captured_at = Utc.with_ymd_and_hms(2026, 8, 4, 12, 0, 0).single().unwrap();
@@ -641,6 +845,185 @@ mod tests {
             failures, 0,
             "gaps must not be counted as failures - the two ceilings differ on purpose"
         );
+    }
+
+    #[test]
+    fn time_expressions_a_person_would_actually_type() {
+        use super::parse_when;
+        use chrono::{Local, TimeZone, Utc};
+
+        let now = Utc::now();
+
+        // Relative windows land in the past, in the right ballpark.
+        let ninety = parse_when("90m").unwrap();
+        let delta = (now - ninety).num_minutes();
+        assert!(
+            (89..=91).contains(&delta),
+            "90m resolved to {delta} minutes ago"
+        );
+        assert!(
+            ((3 * 60 - 1)..=(4 * 60 + 1))
+                .contains(&(now - parse_when("4h").unwrap()).num_minutes())
+        );
+        // Hours, not days: `now` is sampled before parse_when runs, so the
+        // delta is a hair under 3 days and num_days() would floor it to 2.
+        let three_days = (now - parse_when("3d").unwrap()).num_hours();
+        assert!(
+            (71..=72).contains(&three_days),
+            "3d resolved to {three_days} hours ago"
+        );
+
+        // `today` is LOCAL midnight, not UTC midnight. Getting this wrong
+        // silently shifts the window by the timezone offset, which is exactly
+        // the kind of error nobody notices until a search misses.
+        let today = parse_when("today").unwrap();
+        let expected = Local
+            .from_local_datetime(&Local::now().date_naive().and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(today, expected);
+        let yesterday = parse_when("yesterday").unwrap();
+        assert_eq!(
+            yesterday.with_timezone(&Local).date_naive(),
+            today.with_timezone(&Local).date_naive().pred_opt().unwrap(),
+            "yesterday must select the preceding local calendar date"
+        );
+        assert!(yesterday < today, "yesterday must precede today");
+
+        // Absolute dates.
+        assert_eq!(
+            parse_when("2026-08-06").unwrap(),
+            Local
+                .from_local_datetime(
+                    &chrono::NaiveDate::from_ymd_opt(2026, 8, 6)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                )
+                .single()
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+
+        // Nonsense must be refused with something a person can act on, not
+        // silently treated as "now" - which would quietly return everything.
+        let error = parse_when("last tuesday").unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("try 90m"),
+            "the error must say what IS accepted: {rendered}"
+        );
+        assert!(parse_when("").is_err());
+        assert!(parse_when("4 hours").is_err());
+    }
+
+    #[test]
+    fn local_midnight_keeps_named_chicago_dst_dates_on_their_calendar_day() {
+        use super::midnight_in_timezone;
+        use chrono::{Duration, NaiveDate};
+        use chrono_tz::America::Chicago;
+
+        let spring_start = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+        let spring_end = spring_start.succ_opt().unwrap();
+        let fall_start = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let fall_end = fall_start.succ_opt().unwrap();
+
+        let spring_before = midnight_in_timezone(Chicago, spring_start).unwrap();
+        let spring_after = midnight_in_timezone(Chicago, spring_end).unwrap();
+        let fall_before = midnight_in_timezone(Chicago, fall_start).unwrap();
+        let fall_after = midnight_in_timezone(Chicago, fall_end).unwrap();
+
+        assert_eq!(
+            spring_before.with_timezone(&Chicago).date_naive(),
+            spring_start
+        );
+        assert_eq!(
+            spring_after.with_timezone(&Chicago).date_naive(),
+            spring_end
+        );
+        assert_eq!(fall_before.with_timezone(&Chicago).date_naive(), fall_start);
+        assert_eq!(fall_after.with_timezone(&Chicago).date_naive(), fall_end);
+        assert_ne!(
+            spring_after - spring_before,
+            Duration::days(1),
+            "the spring transition is a calendar day, not a fixed UTC duration"
+        );
+        assert_ne!(
+            fall_after - fall_before,
+            Duration::days(1),
+            "the fall transition is a calendar day, not a fixed UTC duration"
+        );
+    }
+
+    #[test]
+    fn relative_time_rejects_a_leading_minus_instead_of_searching_the_future() {
+        use super::parse_when;
+
+        for value in ["-1m", "-4h", "-3d"] {
+            let error = parse_when(value).expect_err("{value} must not become a future window");
+            assert!(
+                format!("{error:#}").contains("must not be negative"),
+                "{value} returned the wrong error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_time_rejects_an_interval_that_chrono_cannot_represent() {
+        use super::parse_when;
+
+        for value in [
+            "9223372036854775807m",
+            "9223372036854775807h",
+            "9223372036854775807d",
+        ] {
+            let error = parse_when(value).expect_err("{value} must not panic or wrap");
+            assert!(
+                format!("{error:#}").contains("is too large"),
+                "{value} returned the wrong error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_locked_desktop_never_reaches_the_gap_ceiling() {
+        use super::{IterationKind, LoopStep, next_step};
+
+        // A machine left locked overnight produces nothing but gaps for eight
+        // hours. The gap ceiling exists to catch a DEAD CAPTURE DEVICE, and
+        // before `DesktopLocked` was typed the two were the same code, so the
+        // agent would abort and restart every few hours on an idle machine.
+        //
+        // Ten times the gap ceiling: if a lock advanced either streak at all,
+        // this would abort long before the loop ends.
+        let mut failures = 0;
+        let mut gaps = 0;
+        for _ in 0..(super::MAX_CONSECUTIVE_GAPS * 10) {
+            let step = next_step(IterationKind::DesktopLocked, &mut failures, &mut gaps);
+            assert!(
+                matches!(step, LoopStep::Retry(_)),
+                "a locked desktop must back off and keep waiting, got {step:?}"
+            );
+        }
+        assert_eq!(gaps, 0, "a lock advanced the gap streak");
+        assert_eq!(failures, 0, "a lock advanced the failure streak");
+    }
+
+    #[test]
+    fn a_locked_desktop_waits_at_the_slowest_backoff() {
+        use super::{IterationKind, next_step};
+
+        // Polling a locked desktop every two seconds is 43,000 futile probes a
+        // day. It must sit at the ceiling, not the floor.
+        let mut failures = 0;
+        let mut gaps = 0;
+        let step = next_step(IterationKind::DesktopLocked, &mut failures, &mut gaps);
+        let super::LoopStep::Retry(delay) = step else {
+            panic!("expected a retry, got {step:?}");
+        };
+        assert_eq!(delay, super::failure_backoff(super::MAX_BACKOFF_STEP));
+        assert_eq!(delay.as_secs(), 32);
     }
 
     #[test]

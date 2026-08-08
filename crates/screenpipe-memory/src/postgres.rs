@@ -222,6 +222,12 @@ pub struct PgEventWriter {
     machine_slug: String,
 }
 
+/// A machine-scoped PostgreSQL reader that never creates or updates identity
+/// rows while establishing a search connection.
+pub struct PgEventReader {
+    writer: PgEventWriter,
+}
+
 /// Returned only when `preflight` succeeded, which means
 /// `validate_authoritative_schema` already passed. There is deliberately no
 /// `schema_present` field: it was a hardcoded `true`, so it reported schema
@@ -244,21 +250,42 @@ impl PgEventWriter {
             .connect(database_url)
             .await
             .context("connect PostgreSQL event writer")?;
-        // The version floor is enforced HERE, not only in `preflight`.
-        //
-        // `run_capture` calls `connect` and never `preflight` - only `doctor`
-        // does - so the guard was unreachable on the one path that actually
-        // writes for 24 hours. Pointed at an older server holding the
-        // authoritative schema, `validate_authoritative_schema` passes and the
-        // agent would have run against a server the writer declares
-        // unsupported.
         let server_version_num =
             sqlx::query_scalar::<_, i32>("SELECT current_setting('server_version_num')::integer")
                 .fetch_one(&pool)
                 .await
                 .context("read PostgreSQL server version")?;
+        Self::connect_with_server_version(pool, server_version_num, slug, display_name).await
+    }
+
+    /// Everything `connect` does after it has learned the server version.
+    ///
+    /// Split out so the version floor can actually be TESTED on the write
+    /// path. It is enforced here and not only in `preflight`, because
+    /// `run_capture` calls `connect` and never `preflight` - only `doctor`
+    /// does - so the guard was unreachable on the one path that writes for 24
+    /// hours. Pointed at an older server holding the authoritative schema,
+    /// `validate_authoritative_schema` passes and the agent would have run
+    /// against a server the writer declares unsupported.
+    ///
+    /// Moving the guard there fixed the hole but left it unprotected: a
+    /// mutation deleting the call survived the whole suite, because
+    /// `server_version_num` comes from `current_setting('server_version_num')`,
+    /// a preset GUC no test can override. Taking it as a parameter is what
+    /// makes the check drivable without a PostgreSQL 15 server to point at.
+    ///
+    /// The order matters and is asserted: the version check runs BEFORE any
+    /// schema validation or write, so an unsupported server is rejected
+    /// without this writer having touched it.
+    async fn connect_with_server_version(
+        pool: PgPool,
+        server_version_num: i32,
+        slug: &str,
+        display_name: &str,
+    ) -> Result<Self> {
         ensure_supported_server_version(server_version_num)?;
         validate_authoritative_schema(&pool).await?;
+        backfill_event_titles(&pool).await?;
         let machine_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO machines (slug, display_name) VALUES ($1, $2) \
              ON CONFLICT (slug) DO UPDATE SET display_name = EXCLUDED.display_name \
@@ -336,8 +363,8 @@ impl PgEventWriter {
         sqlx::query(
             "INSERT INTO events (\
                  id, machine_id, seq, kind, started_at, ended_at, app_id, window_title, \
-                 ocr_text, readable_text, ocr_text_hash, sample_count, merge_meta\
-             ) VALUES ($1, $2, $3, 'screen', $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                 ocr_text, readable_text, ocr_text_hash, sample_count, merge_meta, title\
+             ) VALUES ($1, $2, $3, 'screen', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&event_id)
         .bind(machine_id)
@@ -351,6 +378,7 @@ impl PgEventWriter {
         .bind(&event.latest_exact_ocr_hash)
         .bind(sample_count)
         .bind(merge_meta)
+        .bind(event_title(event))
         .execute(&mut *transaction)
         .await
         .context("insert allocated screen event")?;
@@ -367,8 +395,8 @@ impl PgEventWriter {
             "UPDATE events SET \
                  ended_at = $1, app_id = $2, window_title = $3, ocr_text = $4, \
                  readable_text = $5, ocr_text_hash = $6, sample_count = $7, \
-                 merge_meta = $8, updated_at = now() \
-             WHERE id = $9 AND machine_id = $10",
+                 merge_meta = $8, title = $9, updated_at = now() \
+             WHERE id = $10 AND machine_id = $11",
         )
         .bind(event.ended_at)
         .bind(app_id)
@@ -378,6 +406,7 @@ impl PgEventWriter {
         .bind(&event.latest_exact_ocr_hash)
         .bind(sample_count)
         .bind(merge_meta)
+        .bind(event_title(event))
         .bind(event_id)
         .bind(self.machine_id)
         .execute(&mut *transaction)
@@ -390,6 +419,72 @@ impl PgEventWriter {
         transaction.commit().await.context("commit event merge")?;
         Ok(())
     }
+}
+
+impl PgEventReader {
+    /// Connect to an already-recorded machine without changing its identity.
+    pub async fn connect(database_url: &str, slug: &str) -> Result<Self> {
+        if database_url.trim().is_empty() {
+            bail!("PostgreSQL database URL is blank");
+        }
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(database_url)
+            .await
+            .context("connect PostgreSQL event reader")?;
+        let server_version_num =
+            sqlx::query_scalar::<_, i32>("SELECT current_setting('server_version_num')::integer")
+                .fetch_one(&pool)
+                .await
+                .context("read PostgreSQL server version")?;
+        ensure_supported_server_version(server_version_num)?;
+        validate_authoritative_schema(&pool).await?;
+        let machine_id = sqlx::query_scalar::<_, i64>("SELECT id FROM machines WHERE slug = $1")
+            .bind(slug)
+            .fetch_one(&pool)
+            .await
+            .context("read search machine identity")?;
+        Ok(Self {
+            writer: PgEventWriter {
+                pool,
+                machine_id,
+                machine_slug: slug.to_owned(),
+            },
+        })
+    }
+
+    pub async fn search(&self, request: &SearchRequest) -> Result<Vec<SearchHit>> {
+        self.writer.search(request).await
+    }
+}
+
+async fn backfill_event_titles(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"WITH title_candidates AS (
+               SELECT e.id,
+                   NULLIF(
+                       concat_ws(
+                           ' - ',
+                           NULLIF(btrim(regexp_replace(a.app_title, '\s+', ' ', 'g')), ''),
+                           NULLIF(btrim(regexp_replace(e.window_title, '\s+', ' ', 'g')), '')
+                       ),
+                       ''
+                   ) AS title
+               FROM events e
+               LEFT JOIN apps a ON e.app_id = a.id
+               WHERE e.title IS NULL
+           )
+           UPDATE events e
+           SET title = title_candidates.title
+           FROM title_candidates
+           WHERE e.id = title_candidates.id
+             AND e.title IS NULL
+             AND title_candidates.title IS NOT NULL"#,
+    )
+    .execute(pool)
+    .await
+    .context("backfill missing event titles")?;
+    Ok(())
 }
 
 async fn validate_authoritative_schema(pool: &PgPool) -> Result<()> {
@@ -451,7 +546,7 @@ fn checked_sample_count(event: &OpenEvent) -> Result<i32> {
 /// Minimum `server_version_num` the writer will run against. The authoritative
 /// schema uses a generated `search_tsv` column, so an older server cannot hold
 /// it.
-const MINIMUM_SERVER_VERSION_NUM: i32 = 180_000;
+pub const MINIMUM_SERVER_VERSION_NUM: i32 = 180_000;
 
 /// Extracted from `preflight` so it can be proven without a second PostgreSQL
 /// installation. Inline, the guard was untestable: every integration test runs
@@ -464,6 +559,33 @@ fn ensure_supported_server_version(server_version_num: i32) -> Result<()> {
         "PostgreSQL 18 or newer is required, found server_version_num {server_version_num}"
     );
     Ok(())
+}
+
+/// The weight-A search term for an event.
+///
+/// `title` was NULL on every row this system had ever written - 784 of 784 -
+/// so the highest-weighted branch of `search_tsv` was empty everywhere and
+/// ranking could not distinguish "the window I worked in" from "a word that
+/// happened to be on screen". Every event ranked purely on its OCR body.
+///
+/// There is no summarizer yet, so this is the best honest label available: the
+/// application and the window it was showing. It is deliberately NOT the raw
+/// window title alone, which already carries weight D - the point is to give
+/// ranking the app name too, since "Notepad" is how a person remembers where
+/// they were.
+///
+/// Whitespace-collapsed, and `None` rather than an empty string when there is
+/// nothing to say, so a blank title never outranks a real one.
+fn event_title(event: &OpenEvent) -> Option<String> {
+    let app = event.latest.app_title.trim();
+    let window = event.latest.window_title.trim();
+    let joined = match (app.is_empty(), window.is_empty()) {
+        (true, true) => return None,
+        (true, false) => window.to_owned(),
+        (false, true) => app.to_owned(),
+        (false, false) => format!("{app} - {window}"),
+    };
+    Some(joined.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
@@ -490,6 +612,11 @@ fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
             "capture_unavailable": event.capture_gaps.capture_unavailable,
             "ocr_unavailable": event.capture_gaps.ocr_unavailable,
             "empty_ocr": event.capture_gaps.empty_ocr,
+            // This is persisted only when a later content event flushes the
+            // runner's pending counters. A terminal lock gap is not durable in
+            // this PR; independent gap persistence is deferred to Context
+            // Pipeline V2.
+            "desktop_locked": event.capture_gaps.desktop_locked,
         },
         "browser_url": event.latest.browser_url,
     })
@@ -518,5 +645,129 @@ mod tests {
             ensure_supported_server_version(accepted)
                 .unwrap_or_else(|error| panic!("{accepted} must be accepted: {error:#}"));
         }
+    }
+}
+
+/// What to look for, and when.
+///
+/// A time window without keywords is a first-class question - "what was I
+/// doing yesterday afternoon" has no search terms in it - so `query` may be
+/// empty as long as a bound is given.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchRequest {
+    pub query: String,
+    pub limit: i64,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// One search hit, shaped for a human reading a terminal.
+///
+/// Deliberately does NOT carry `ocr_text`. A search result is displayed, and
+/// the full OCR of a screen is the most sensitive thing this system holds; a
+/// snippet around the match is what a person needs to recognise the moment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SearchHit {
+    pub event_id: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: chrono::DateTime<chrono::Utc>,
+    pub sample_count: i32,
+    pub title: Option<String>,
+    pub app_title: Option<String>,
+    pub browser_url: Option<String>,
+    /// PostgreSQL `ts_headline` output: the matching words in context, with
+    /// the matches wrapped in `[` and `]`.
+    pub snippet: String,
+}
+
+impl PgEventWriter {
+    /// Full-text search over recorded events, newest-and-best first.
+    ///
+    /// This is the read path. Until it existed the system was write-only: it
+    /// recorded continuously and offered no way to ask it anything, which made
+    /// every other property of it unverifiable by a person.
+    ///
+    /// Ranking is `ts_rank_cd` over the weighted `search_tsv`, so a match in
+    /// the event title outranks one buried in the OCR body - which is the
+    /// entire reason the weights exist.
+    pub async fn search(&self, request: &SearchRequest) -> Result<Vec<SearchHit>> {
+        let SearchRequest {
+            query,
+            limit,
+            since,
+            until,
+        } = request;
+        let limit = *limit;
+        // A blank query is allowed ONLY with a time window. "What was I doing
+        // yesterday afternoon" is how people actually reach for this, and it
+        // has no keywords in it. A blank query and no window would be "return
+        // everything", which is not a question.
+        ensure!(
+            !query.trim().is_empty() || since.is_some() || until.is_some(),
+            "give some words to search for, a time window, or both"
+        );
+        ensure!((1..=200).contains(&limit), "limit must be 1..=200");
+        if let (Some(since), Some(until)) = (since, until) {
+            ensure!(since <= until, "the time window ends before it starts");
+        }
+        let terms = query.trim();
+        let ranked = !terms.is_empty();
+
+        let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i32, Option<String>, Option<String>, Option<String>, String)>(
+            "SELECT e.id, e.started_at, e.ended_at, e.sample_count, e.title, a.app_title, \
+                    e.merge_meta ->> 'browser_url', \
+                    CASE WHEN $4 THEN \
+                        ts_headline('english', \
+                                    coalesce(nullif(e.readable_text, ''), e.ocr_text), \
+                                    plainto_tsquery('english', $1), \
+                                    'StartSel=[, StopSel=], MaxFragments=2, FragmentDelimiter= ... , MaxWords=18, MinWords=6') \
+                    ELSE left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 160) END \
+             FROM events e \
+             LEFT JOIN apps a ON a.id = e.app_id \
+             WHERE e.machine_id = $2 \
+               AND (NOT $4 OR e.search_tsv @@ plainto_tsquery('english', $1)) \
+               AND ($5::timestamptz IS NULL OR e.ended_at >= $5) \
+               AND ($6::timestamptz IS NULL OR e.started_at <= $6) \
+             ORDER BY \
+               CASE WHEN $4 THEN ts_rank_cd(e.search_tsv, plainto_tsquery('english', $1)) ELSE 0 END DESC, \
+               e.started_at DESC \
+             LIMIT $3",
+        )
+        .bind(terms)
+        .bind(self.machine_id)
+        .bind(limit)
+        .bind(ranked)
+        .bind(*since)
+        .bind(*until)
+        .fetch_all(&self.pool)
+        .await
+        .context("search recorded events")?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    event_id,
+                    started_at,
+                    ended_at,
+                    sample_count,
+                    title,
+                    app_title,
+                    browser_url,
+                    snippet,
+                )| {
+                    SearchHit {
+                        event_id,
+                        started_at,
+                        ended_at,
+                        sample_count,
+                        title,
+                        app_title,
+                        browser_url,
+                        snippet,
+                    }
+                },
+            )
+            .collect())
     }
 }

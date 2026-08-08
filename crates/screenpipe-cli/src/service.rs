@@ -121,8 +121,26 @@ impl ServiceSpec {
         // `screen_started`, `capture_gap`, and `capture_error` line the agent
         // prints goes to a console nobody can read and dies with the process -
         // leaving a 24-hour unattended run with no diagnostic record at all.
-        // `*>>` captures every stream, appending so a wrapper restart never
-        // truncates the evidence from the run that just failed.
+        //
+        // The output goes through `Add-Content` per line rather than the
+        // obvious `*>> $log`. Running the `*>>` version against a real
+        // installed service broke it three separate ways, all specific to
+        // Windows PowerShell 5.1, which is what the scheduled task runs:
+        //
+        //   1. It writes UTF-16LE. The banner lines around it use
+        //      `-Encoding utf8`, so one log held two encodings and every
+        //      byte-oriented reader saw NUL-separated garbage.
+        //   2. It holds the file open EXCLUSIVELY for the life of the agent.
+        //      The log could not be read while capture was running, which is
+        //      the only time anyone wants to read it, and the seam tests that
+        //      assert on its contents could not open it at all.
+        //   3. The redirect target is resolved as a wildcard path, so a
+        //      service root containing `[` or `]` silently discards every line
+        //      while the `-LiteralPath` banners still land.
+        //
+        // `Add-Content` opens and closes per line: UTF-8, literal path, and
+        // readable by anyone while the agent runs. The line rate is one every
+        // two to thirty seconds, so the per-call cost does not matter.
         let wrapper_contents = format!(
             r#"$ErrorActionPreference = 'Continue'
 $agent = '{escaped_agent}'
@@ -132,9 +150,10 @@ if (-not (Test-Path -LiteralPath $logDirectory)) {{
 }}
 while ($true) {{
     $log = Join-Path $logDirectory ('screenpipe-agent-{{0:yyyy-MM-dd}}.log' -f (Get-Date))
-    "=== agent start {{0:o}} ===" -f (Get-Date).ToUniversalTime() | Out-File -LiteralPath $log -Append -Encoding utf8
-    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop *>> $log
-    "=== agent exited {{0:o}} exit={{1}} ===" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE | Out-File -LiteralPath $log -Append -Encoding utf8
+    Add-Content -LiteralPath $log -Encoding utf8 -Value ("=== agent start {{0:o}} ===" -f (Get-Date).ToUniversalTime())
+    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop 2>&1 |
+        ForEach-Object {{ Add-Content -LiteralPath $log -Encoding utf8 -Value ([string]$_) }}
+    Add-Content -LiteralPath $log -Encoding utf8 -Value ("=== agent exited {{0:o}} exit={{1}} ===" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE)
     Start-Sleep -Seconds 10
 }}
 "#
@@ -899,9 +918,10 @@ $parseErrors = $null
                 "}\n",
                 "while ($true) {\n",
                 "    $log = Join-Path $logDirectory ('screenpipe-agent-{0:yyyy-MM-dd}.log' -f (Get-Date))\n",
-                "    \"=== agent start {0:o} ===\" -f (Get-Date).ToUniversalTime() | Out-File -LiteralPath $log -Append -Encoding utf8\n",
-                "    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop *>> $log\n",
-                "    \"=== agent exited {0:o} exit={1} ===\" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE | Out-File -LiteralPath $log -Append -Encoding utf8\n",
+                "    Add-Content -LiteralPath $log -Encoding utf8 -Value (\"=== agent start {0:o} ===\" -f (Get-Date).ToUniversalTime())\n",
+                "    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop 2>&1 |\n",
+                "        ForEach-Object { Add-Content -LiteralPath $log -Encoding utf8 -Value ([string]$_) }\n",
+                "    Add-Content -LiteralPath $log -Encoding utf8 -Value (\"=== agent exited {0:o} exit={1} ===\" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE)\n",
                 "    Start-Sleep -Seconds 10\n",
                 "}\n",
             )
@@ -1588,5 +1608,38 @@ $parseErrors = $null
                 "install script is missing {required}: {script}"
             );
         }
+    }
+    #[test]
+    #[cfg(windows)]
+    fn real_scheduler_status_reports_an_absent_task_as_absent() {
+        // The ONLY test that exercises `WindowsTaskScheduler` itself.
+        //
+        // Every other scheduler test drives `FakeTaskScheduler`, so the real
+        // implementation could return a hardcoded `Ready`/`running` and the
+        // whole suite stayed green - a mutation that did exactly that survived
+        // the audit. `service status` is the one command whose entire purpose
+        // is to report reality, and reality was the one thing nothing checked.
+        //
+        // An absent task is the deterministic fixture: it needs no
+        // registration, no process, and no cleanup, and no fabricated answer
+        // can produce it. A binary path that does not exist pins the process
+        // half for the same reason.
+        let mut scheduler = super::WindowsTaskScheduler;
+        let absent_task = "MooseGoose Goal 1 Task That Must Not Exist";
+        let absent_binary = Path::new(r"C:\does-not-exist\screenpipe.exe");
+
+        let status = scheduler
+            .status(absent_task, absent_binary)
+            .expect("status must succeed for an absent task");
+
+        assert_eq!(
+            status.task_state,
+            TaskState::Absent,
+            "status fabricated a task state for a task that is not registered"
+        );
+        assert!(
+            !status.process_running,
+            "status fabricated a running process for a binary path that does not exist"
+        );
     }
 }

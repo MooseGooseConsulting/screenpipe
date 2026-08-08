@@ -141,13 +141,16 @@ fn app_change_starts_a_new_event_before_other_checks() {
 }
 
 #[test]
-fn normalized_window_title_change_starts_a_new_event() {
+fn a_title_change_splits_only_when_the_content_changed_too() {
+    // A title change with DIFFERENT content is a real boundary and keeps its
+    // own reason code, because "the title changed" describes what happened
+    // better than "the text changed" does.
     let mut merger = merger();
     merger.ingest(sample(0, "notepad.exe", "Project A", "same text"));
 
     let event = started(
         merger.ingest(sample(
-            31,
+            2,
             "notepad.exe",
             "Project B",
             "completely different text",
@@ -156,6 +159,56 @@ fn normalized_window_title_change_starts_a_new_event() {
     );
 
     assert_eq!(event.latest.window_title, "Project B");
+}
+
+#[test]
+fn a_title_change_over_unchanged_content_does_not_split() {
+    // THE FIX THIS CONTRACT EXISTS FOR.
+    //
+    // On 784 real events from this machine, 690 - 88% - started because of a
+    // title change, averaging 3.2 samples. Events that started from an app
+    // change, an unambiguous real change of activity, averaged 24.1. The
+    // activity was not that fragmented; the segmentation was, because a title
+    // is a presentation surface and apps animate spinners, unsaved markers and
+    // notification counts in it.
+    //
+    // Identical screen text, wholly different title. This must merge. The
+    // braille glyphs are the real terminal spinner that caused it here.
+    let mut merger = merger();
+    let screen = "the same document, unchanged, while the title bar animates";
+    merger.ingest(sample(0, "code.exe", "\u{2800} building - project", screen));
+
+    let decision = merger.ingest(sample(2, "code.exe", "\u{2803} building - project", screen));
+
+    let event = merged(decision);
+    assert_eq!(
+        event.sample_count, 2,
+        "an animated title glyph must not open a new event"
+    );
+    assert_eq!(event.start_reason, SplitReason::Initial);
+}
+
+#[test]
+fn a_title_change_over_scrolling_content_does_not_split() {
+    // The same rule under the scroll-overlap path rather than the exact-hash
+    // path: a document being read while a notification count ticks in the
+    // title is one activity, not four.
+    let mut merger = merger();
+    let head = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron";
+    merger.ingest(sample(0, "chrome.exe", "(1) Inbox - Mail", head));
+
+    let decision = merger.ingest(sample(
+        2,
+        "chrome.exe",
+        "(7) Inbox - Mail",
+        &format!("{head} pi rho sigma"),
+    ));
+
+    let event = merged(decision);
+    assert_eq!(
+        event.sample_count, 2,
+        "a notification count in the title must not open a new event"
+    );
 }
 
 #[test]
@@ -287,6 +340,7 @@ fn capture_gaps_accumulate_per_kind_across_a_merge() {
             capture_unavailable: 1,
             ocr_unavailable: 0,
             empty_ocr: 2,
+            desktop_locked: 0,
         },
         "record must credit each gap kind to its own counter"
     );
@@ -315,6 +369,7 @@ fn capture_gaps_accumulate_per_kind_across_a_merge() {
             capture_unavailable: 1,
             ocr_unavailable: 3,
             empty_ocr: 2,
+            desktop_locked: 0,
         },
         "a merge must sum each gap counter with its own kind"
     );
