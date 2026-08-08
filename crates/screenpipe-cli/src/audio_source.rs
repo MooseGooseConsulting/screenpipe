@@ -52,6 +52,7 @@ const AUDIO_NO_SPEECH: &str = "event=audio_discarded reason=no_speech";
 /// audio, model paths, and OS error details, none of which belong in logs.
 const AUDIO_CAPTURE_FAILURE: &str = "event=audio_capture_error category=capture_unavailable";
 const AUDIO_TRANSCRIBE_FAILURE: &str = "event=audio_transcribe_error category=transcription";
+const AUDIO_WORKER_SHUTDOWN_FAILURE: &str = "one or more audio workers panicked during shutdown";
 
 fn capture_error_reason_code(error: &CaptureError) -> &'static str {
     match error {
@@ -272,20 +273,21 @@ impl AudioSampleSource {
         self.incoming.close();
     }
 
-    /// Joins workers only after their observed channel has closed, so joining
+    /// Joins every worker after its observed channel has closed, so joining
     /// cannot wait on a writer that the foreground drain has not processed.
     pub(crate) fn join_workers(&mut self) -> Result<()> {
-        for (name, worker) in [
-            ("capture", &mut self.capture_worker),
-            ("transcribe", &mut self.transcribe_worker),
-        ] {
+        let mut worker_panicked = false;
+        for worker in [&mut self.capture_worker, &mut self.transcribe_worker] {
             if let Some(worker) = worker.take() {
-                worker
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("audio {name} worker panicked during shutdown"))?;
+                let join_failed = worker.join().is_err();
+                worker_panicked |= join_failed;
             }
         }
-        Ok(())
+        if worker_panicked {
+            Err(anyhow::anyhow!(AUDIO_WORKER_SHUTDOWN_FAILURE))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -514,8 +516,8 @@ mod tests {
 
     use super::{
         AUDIO_BACKLOG, AUDIO_CAPTURE_FAILURE, AUDIO_NO_SPEECH, AUDIO_TRANSCRIBE_FAILURE,
-        CaptureError, CaptureStopped, FrameSource, TRANSCRIBE_QUEUE, WRITE_QUEUE,
-        capture_error_reason_code, capture_loop, receive_utterance, to_permille,
+        AudioSampleSource, CaptureError, CaptureStopped, FrameSource, TRANSCRIBE_QUEUE,
+        WRITE_QUEUE, capture_error_reason_code, capture_loop, receive_utterance, to_permille,
     };
     use chrono::{TimeZone, Utc};
     use screenpipe_audio::{CapturedFrame, Utterance, UtteranceEnd, VadAggressiveness};
@@ -643,6 +645,44 @@ mod tests {
         let error = anyhow::Error::new(CaptureStopped).context("audio source read failed");
 
         assert!(error.downcast_ref::<CaptureStopped>().is_some());
+    }
+
+    #[test]
+    fn joining_workers_attempts_both_and_redacts_any_panic() {
+        for (capture_panics, transcriber_panics) in [(true, false), (false, true), (true, true)] {
+            let (observed_tx, incoming) = tokio::sync::mpsc::channel(1);
+            drop(observed_tx);
+            let capture_worker = std::thread::spawn(move || {
+                assert!(!capture_panics, "private capture panic value");
+            });
+            let transcribe_worker = std::thread::spawn(move || {
+                assert!(!transcriber_panics, "private transcriber panic value");
+            });
+            let mut source = AudioSampleSource {
+                incoming,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                capture_worker: Some(capture_worker),
+                transcribe_worker: Some(transcribe_worker),
+            };
+
+            let error = source.join_workers().unwrap_err();
+
+            assert!(
+                source.capture_worker.is_none(),
+                "capture join was not attempted"
+            );
+            assert!(
+                source.transcribe_worker.is_none(),
+                "transcriber join was not attempted after capture failed"
+            );
+            assert_eq!(
+                error.to_string(),
+                "one or more audio workers panicked during shutdown"
+            );
+            let rendered = format!("{error:?}");
+            assert!(!rendered.contains("private capture"));
+            assert!(!rendered.contains("private transcriber"));
+        }
     }
 
     #[test]

@@ -1452,7 +1452,8 @@ mod audio {
             reads: VecDeque<anyhow::Result<ObservationRead>>,
             shutdown_requested: bool,
             stopped_accepting: bool,
-            joined: bool,
+            capture_join_attempted: bool,
+            transcriber_join_attempted: bool,
         }
 
         #[async_trait]
@@ -1480,7 +1481,8 @@ mod audio {
             }
 
             fn join_workers(&mut self) -> anyhow::Result<()> {
-                self.joined = true;
+                self.capture_join_attempted = true;
+                self.transcriber_join_attempted = true;
                 Err(anyhow::anyhow!(
                     "audio worker panic contained private cleanup value"
                 ))
@@ -1544,7 +1546,8 @@ mod audio {
                 })]),
                 shutdown_requested: false,
                 stopped_accepting: false,
-                joined: false,
+                capture_join_attempted: false,
+                transcriber_join_attempted: false,
             };
             let mut runner = audio_runner();
 
@@ -1562,7 +1565,11 @@ mod audio {
                 source.stopped_accepting,
                 "the observation receiver is closed"
             );
-            assert!(source.joined, "capture and transcriber workers are joined");
+            assert!(source.capture_join_attempted, "capture join is attempted");
+            assert!(
+                source.transcriber_join_attempted,
+                "transcriber join is attempted even when capture cleanup fails"
+            );
             assert_eq!(
                 error.to_string(),
                 "audio shutdown drain failed (category=postgres)"
