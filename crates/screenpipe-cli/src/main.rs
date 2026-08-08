@@ -93,10 +93,9 @@ enum Command {
     /// Nothing under here starts as a side effect of anything else: `run`
     /// records only while it is in the foreground, and `service install`
     /// registers a task of its own that `screenpipe service install` never
-    /// touches. Before enabling either, read
-    /// `docs/build/tracks/audio-channel.md` section 6 - this channel can record
-    /// other people, and whether that is lawful where you are is not something
-    /// this program can decide.
+    /// touches. Before enabling either, read the README Audio channel section:
+    /// this channel can record other people, and whether that is lawful where
+    /// you are is not something this program can decide.
     Audio {
         #[command(subcommand)]
         action: AudioAction,
@@ -269,7 +268,7 @@ async fn run_audio_action(action: AudioAction) -> Result<()> {
         _ => Err(anyhow::anyhow!(
             "this build has no audio channel. It is a compile-time feature, off by default: \
              rebuild with `cargo build --release --features audio` to get one that can record \
-             audio, and read docs/build/tracks/audio-channel.md section 6 first."
+             audio, and read the README Audio channel section first."
         )),
     }
 }
@@ -863,7 +862,7 @@ mod audio {
     use screenpipe_audio::{
         AudioCapture, CaptureError, Channel, DeviceCategory, ModelPath, VadAggressiveness,
     };
-    use screenpipe_memory::{EventKind, MergeConfig, PgEventWriter, Runner};
+    use screenpipe_memory::{EventKind, MergeConfig, PgEventWriter, Runner, SampleSource};
 
     use crate::audio_source::{AudioConfig, AudioSampleSource, CaptureStopped};
     use crate::{
@@ -878,6 +877,7 @@ mod audio {
     /// business taking a laptop over when it is on, and `base.en` runs faster
     /// than real time well below this.
     const MAX_TRANSCRIBE_THREADS: i32 = 4;
+    const SHUTDOWN_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
     pub(crate) struct Options {
         pub(crate) microphone: bool,
@@ -943,6 +943,65 @@ mod audio {
 
     fn is_capture_stopped(error: &anyhow::Error) -> bool {
         error.downcast_ref::<CaptureStopped>().is_some()
+    }
+
+    #[derive(Debug)]
+    struct AudioShutdownTimedOut;
+
+    impl std::fmt::Display for AudioShutdownTimedOut {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("audio shutdown did not complete before its bounded deadline")
+        }
+    }
+
+    impl std::error::Error for AudioShutdownTimedOut {}
+
+    /// The shutdown operations the foreground run path needs from its source.
+    trait AudioShutdownSource: SampleSource {
+        fn request_shutdown(&mut self);
+        fn join_workers(&mut self) -> Result<()>;
+    }
+
+    impl AudioShutdownSource for AudioSampleSource {
+        fn request_shutdown(&mut self) {
+            AudioSampleSource::request_shutdown(self);
+        }
+
+        fn join_workers(&mut self) -> Result<()> {
+            AudioSampleSource::join_workers(self)
+        }
+    }
+
+    /// Signals capture, persists every observation already completed by the
+    /// workers, then joins after the observed channel closes. The deadline is
+    /// deliberately around the whole drain so Ctrl-C cannot hang forever on a
+    /// broken native worker.
+    async fn drain_audio_shutdown(
+        runner: &mut Runner,
+        source: &mut impl AudioShutdownSource,
+        sink: &dyn screenpipe_memory::EventSink,
+        deadline: std::time::Duration,
+    ) -> Result<()> {
+        source.request_shutdown();
+        tokio::time::timeout(deadline, async {
+            loop {
+                match run_iteration(runner, source, sink).await {
+                    Ok(outcome) => print_run_outcome("audio", &outcome),
+                    Err(error) if is_capture_stopped(&error) => {
+                        source.join_workers()?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "audio shutdown drain failed (category={})",
+                            failure_category(&error)
+                        ));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| anyhow::Error::new(AudioShutdownTimedOut))?
     }
 
     trait AudioCaptureProbe {
@@ -1079,7 +1138,12 @@ mod audio {
                 signal = &mut shutdown => {
                     signal.context("listen for Ctrl-C")?;
                     println!("event=shutdown reason=ctrl_c");
-                    return Ok(());
+                    return drain_audio_shutdown(
+                        &mut runner,
+                        &mut source,
+                        &writer,
+                        SHUTDOWN_DRAIN_DEADLINE,
+                    ).await;
                 }
                 step = run_iteration(&mut runner, &mut source, &writer) => match step {
                     Ok(outcome) => {
@@ -1142,15 +1206,24 @@ mod audio {
     #[cfg(test)]
     mod tests {
         use std::cell::Cell;
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
 
         use super::{
-            AudioCaptureProbe, MAX_TRANSCRIBE_THREADS, audio_next_step, channel_of,
-            is_capture_stopped, probe_audio_stream, resolve_threads,
+            AudioCaptureProbe, AudioShutdownSource, AudioShutdownTimedOut, MAX_TRANSCRIBE_THREADS,
+            audio_next_step, audio_runner, channel_of, drain_audio_shutdown, is_capture_stopped,
+            probe_audio_stream, resolve_threads,
         };
         use crate::audio_source::CaptureStopped;
         use crate::{LoopStep, MAX_CONSECUTIVE_FAILURES};
+        use async_trait::async_trait;
+        use chrono::TimeZone;
         use screenpipe_audio::{CaptureError, Channel, DeviceCategory};
-        use screenpipe_memory::{CaptureGap, RunOutcome};
+        use screenpipe_memory::{
+            AudioMeta, CadenceInput, CadenceRecord, CaptureGap, EventId, EventSink,
+            ObservationEnvelope, ObservationRead, ObservationSample, OpenEvent, RunOutcome,
+            SampleRead, SampleSource, SplitReason,
+        };
 
         struct FakeCaptureProbe {
             opened: Cell<Option<Channel>>,
@@ -1279,6 +1352,171 @@ mod audio {
                 LoopStep::Continue
             );
             assert_eq!((failures, gaps), (0, 0));
+        }
+
+        struct DrainSource {
+            reads: VecDeque<anyhow::Result<ObservationRead>>,
+            shutdown_requested: bool,
+            joined: bool,
+        }
+
+        #[async_trait]
+        impl SampleSource for DrainSource {
+            async fn next_sample(&mut self) -> anyhow::Result<SampleRead> {
+                unreachable!("the drain path reads envelopes")
+            }
+
+            async fn next_observation(&mut self) -> anyhow::Result<ObservationRead> {
+                assert!(
+                    self.shutdown_requested,
+                    "Ctrl-C must signal workers before draining"
+                );
+                self.reads.pop_front().expect("a queued drain result")
+            }
+        }
+
+        impl AudioShutdownSource for DrainSource {
+            fn request_shutdown(&mut self) {
+                self.shutdown_requested = true;
+            }
+
+            fn join_workers(&mut self) -> anyhow::Result<()> {
+                self.joined = true;
+                Ok(())
+            }
+        }
+
+        #[derive(Default)]
+        struct DrainSink {
+            starts: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl EventSink for DrainSink {
+            async fn start(
+                &self,
+                _event: &OpenEvent,
+                _reason: SplitReason,
+            ) -> anyhow::Result<EventId> {
+                *self.starts.lock().unwrap() += 1;
+                EventId::try_from("icarus_1".to_owned())
+            }
+
+            async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> anyhow::Result<()> {
+                unreachable!("one completed observation starts exactly one event")
+            }
+        }
+
+        #[tokio::test]
+        async fn ctrl_c_drains_completed_audio_before_workers_are_joined() {
+            let started_at = chrono::Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, 0).unwrap();
+            let observation = ObservationEnvelope::spanning(
+                ObservationSample {
+                    captured_at: started_at,
+                    app_key: "audio:loopback".to_owned(),
+                    app_title: "System Audio".to_owned(),
+                    window_title: String::new(),
+                    ocr_text: "fixed transcript".to_owned(),
+                    readable_text: "fixed transcript".to_owned(),
+                    browser_url: None,
+                },
+                started_at + chrono::Duration::seconds(1),
+                AudioMeta {
+                    channel: "system_audio",
+                    device_category: "communications",
+                    engine: "whisper-rs",
+                    model: "ggml-base.en".to_owned(),
+                    vad_engine: "webrtc-vad",
+                    vad_aggressiveness: "quality",
+                    language: None,
+                    avg_no_speech_permille: Some(0),
+                    closed_by: "stream_closed",
+                },
+            );
+            let mut source = DrainSource {
+                reads: VecDeque::from([
+                    Ok(ObservationRead::Sample {
+                        observation,
+                        cadence: CadenceRecord::from_input(CadenceInput {
+                            input_idle: chrono::Duration::zero(),
+                            frame_stable_for: chrono::Duration::zero(),
+                            foreground_changed: false,
+                            frame_changed: false,
+                        }),
+                    }),
+                    Err(anyhow::Error::new(CaptureStopped)),
+                ]),
+                shutdown_requested: false,
+                joined: false,
+            };
+            let sink = DrainSink::default();
+            let mut runner = audio_runner();
+
+            drain_audio_shutdown(
+                &mut runner,
+                &mut source,
+                &sink,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(*sink.starts.lock().unwrap(), 1);
+            assert!(source.shutdown_requested);
+            assert!(
+                source.joined,
+                "workers join only after the queue is persisted"
+            );
+        }
+
+        struct StalledDrainSource {
+            shutdown_requested: bool,
+        }
+
+        #[async_trait]
+        impl SampleSource for StalledDrainSource {
+            async fn next_sample(&mut self) -> anyhow::Result<SampleRead> {
+                unreachable!("the drain path reads envelopes")
+            }
+
+            async fn next_observation(&mut self) -> anyhow::Result<ObservationRead> {
+                std::future::pending().await
+            }
+        }
+
+        impl AudioShutdownSource for StalledDrainSource {
+            fn request_shutdown(&mut self) {
+                self.shutdown_requested = true;
+            }
+
+            fn join_workers(&mut self) -> anyhow::Result<()> {
+                unreachable!("a stalled worker cannot be joined")
+            }
+        }
+
+        #[tokio::test]
+        async fn ctrl_c_shutdown_uses_its_bounded_drain_deadline() {
+            let mut source = StalledDrainSource {
+                shutdown_requested: false,
+            };
+            let sink = DrainSink::default();
+            let mut runner = audio_runner();
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                drain_audio_shutdown(
+                    &mut runner,
+                    &mut source,
+                    &sink,
+                    std::time::Duration::from_millis(1),
+                ),
+            )
+            .await
+            .expect("the shutdown helper must honor its own deadline")
+            .unwrap_err();
+
+            assert!(result.downcast_ref::<AudioShutdownTimedOut>().is_some());
+            assert!(source.shutdown_requested);
         }
     }
 }

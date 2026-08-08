@@ -19,8 +19,8 @@ path = "src/main.rs"
 #
 # Turning the feature on still records nothing. It has to be run
 # (`screenpipe audio run`) or installed (`screenpipe audio service install`),
-# both of which are separate deliberate acts. See
-# docs/build/tracks/audio-channel.md section 6.
+# both of which are separate deliberate acts. See the README Audio channel
+# section.
 default = []
 audio = ["dep:screenpipe-audio"]
 
