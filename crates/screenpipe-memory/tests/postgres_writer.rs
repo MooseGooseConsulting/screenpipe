@@ -1205,6 +1205,47 @@ async fn search_headline_includes_context_for_a_match_after_twenty_thousand_char
 }
 
 #[tokio::test]
+async fn search_headline_marks_a_caption_only_match() -> Result<()> {
+    // A headline source that omits `caption` can return this FTS hit with an
+    // unmarked body snippet, even though caption is a searchable field.
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let mut recorded = event(1, "notepad.exe", "Notepad", "notes", "ordinary OCR", None);
+        recorded.latest.readable_text = "ordinary readable body".to_owned();
+        let event_id = writer.write_start(&recorded, SplitReason::Initial).await?;
+        sqlx::query("UPDATE events SET caption = $1 WHERE id = $2")
+            .bind("captionheadlinefixturemarker")
+            .bind(&event_id)
+            .execute(&db.pool)
+            .await?;
+
+        let hits = writer
+            .search(&screenpipe_memory::SearchRequest {
+                query: "captionheadlinefixturemarker".to_owned(),
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        ensure!(
+            hits.iter()
+                .map(|hit| hit.event_id.as_str())
+                .eq([event_id.as_str()]),
+            "caption-only FTS query must return its event"
+        );
+        ensure!(
+            hits[0].snippet.contains("[captionheadlinefixturemarker]"),
+            "caption-only FTS match must be included and marked in the headline"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
 async fn explicit_machine_search_connection_never_upserts_a_machine() -> Result<()> {
     let Some(db) = TestDatabase::create().await? else {
         return Ok(());

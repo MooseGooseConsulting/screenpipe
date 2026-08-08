@@ -730,6 +730,11 @@ impl PgEventWriter {
         let terms = query.trim();
         let ranked = !terms.is_empty();
 
+        // `text_source` intentionally follows every `search_tsv` input in the
+        // same order: a result's presentation must not omit the field that
+        // satisfied its FTS predicate. The literal-match branch below bounds
+        // the displayed input around that match; stemming and other nonliteral
+        // matches keep the complete domain so `ts_headline` can still find it.
         let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i32, Option<String>, Option<String>, Option<String>, String)>(
             "SELECT e.id, e.started_at, e.ended_at, e.sample_count, e.title, a.app_title, \
                     e.merge_meta ->> 'browser_url', \
@@ -742,7 +747,13 @@ impl PgEventWriter {
                                     'StartSel=[, StopSel=], MaxFragments=2, FragmentDelimiter= ... , MaxWords=18, MinWords=6') \
                     ELSE left(text_source.value, 160) END \
              FROM events e \
-             CROSS JOIN LATERAL (SELECT coalesce(nullif(e.readable_text, ''), e.ocr_text) AS value) text_source \
+             CROSS JOIN LATERAL (SELECT concat_ws(E'\\n', \
+                 nullif(e.title, ''), \
+                 nullif(e.caption, ''), \
+                 nullif(e.readable_text, ''), \
+                 nullif(e.ocr_text, ''), \
+                 nullif(e.window_title, '') \
+             ) AS value) text_source \
              LEFT JOIN apps a ON a.id = e.app_id \
              WHERE e.machine_id = $2 \
                AND (NOT $4 OR e.search_tsv @@ plainto_tsquery('english', $1)) \
