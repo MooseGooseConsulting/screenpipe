@@ -122,24 +122,32 @@ async fn main() -> anyhow::Result<()> {
 /// words mean to someone looking back at their own day; a bare `YYYY-MM-DD` is
 /// local midnight on that date. Everything is converted to UTC at the boundary
 /// so the query never depends on the server's timezone.
+fn midnight_in_timezone<Tz>(
+    timezone: Tz,
+    date: chrono::NaiveDate,
+) -> Result<chrono::DateTime<chrono::Utc>>
+where
+    Tz: chrono::TimeZone,
+{
+    let naive = date.and_hms_opt(0, 0, 0).context("build local midnight")?;
+    Ok(timezone
+        .from_local_datetime(&naive)
+        .single()
+        .context("ambiguous local midnight (daylight-saving boundary)")?
+        .with_timezone(&chrono::Utc))
+}
+
 fn parse_when(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
-    use chrono::{Duration as ChronoDuration, Local, NaiveDate, TimeZone};
+    use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 
     let raw = value.trim().to_ascii_lowercase();
-    let local_midnight = |date: chrono::NaiveDate| -> Result<chrono::DateTime<chrono::Utc>> {
-        let naive = date.and_hms_opt(0, 0, 0).context("build local midnight")?;
-        Ok(Local
-            .from_local_datetime(&naive)
-            .single()
-            .context("ambiguous local midnight (daylight-saving boundary)")?
-            .with_timezone(&chrono::Utc))
-    };
 
     if raw == "today" {
-        return local_midnight(Local::now().date_naive());
+        return midnight_in_timezone(Local, Local::now().date_naive());
     }
     if raw == "yesterday" {
-        return local_midnight(
+        return midnight_in_timezone(
+            Local,
             Local::now()
                 .date_naive()
                 .pred_opt()
@@ -184,7 +192,7 @@ fn parse_when(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
             "could not read {value:?} as a time: try 90m, 4h, 3d, today, yesterday, or 2026-08-06"
         )
     })?;
-    local_midnight(date)
+    midnight_in_timezone(Local, date)
 }
 
 async fn run_search(
@@ -879,7 +887,7 @@ mod tests {
         assert_eq!(
             yesterday.with_timezone(&Local).date_naive(),
             today.with_timezone(&Local).date_naive().pred_opt().unwrap(),
-            "yesterday must select the preceding local calendar date, including across DST"
+            "yesterday must select the preceding local calendar date"
         );
         assert!(yesterday < today, "yesterday must precede today");
 
@@ -908,6 +916,44 @@ mod tests {
         );
         assert!(parse_when("").is_err());
         assert!(parse_when("4 hours").is_err());
+    }
+
+    #[test]
+    fn local_midnight_keeps_named_chicago_dst_dates_on_their_calendar_day() {
+        use super::midnight_in_timezone;
+        use chrono::{Duration, NaiveDate};
+        use chrono_tz::America::Chicago;
+
+        let spring_start = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+        let spring_end = spring_start.succ_opt().unwrap();
+        let fall_start = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let fall_end = fall_start.succ_opt().unwrap();
+
+        let spring_before = midnight_in_timezone(Chicago, spring_start).unwrap();
+        let spring_after = midnight_in_timezone(Chicago, spring_end).unwrap();
+        let fall_before = midnight_in_timezone(Chicago, fall_start).unwrap();
+        let fall_after = midnight_in_timezone(Chicago, fall_end).unwrap();
+
+        assert_eq!(
+            spring_before.with_timezone(&Chicago).date_naive(),
+            spring_start
+        );
+        assert_eq!(
+            spring_after.with_timezone(&Chicago).date_naive(),
+            spring_end
+        );
+        assert_eq!(fall_before.with_timezone(&Chicago).date_naive(), fall_start);
+        assert_eq!(fall_after.with_timezone(&Chicago).date_naive(), fall_end);
+        assert_ne!(
+            spring_after - spring_before,
+            Duration::days(1),
+            "the spring transition is a calendar day, not a fixed UTC duration"
+        );
+        assert_ne!(
+            fall_after - fall_before,
+            Duration::days(1),
+            "the fall transition is a calendar day, not a fixed UTC duration"
+        );
     }
 
     #[test]

@@ -460,8 +460,9 @@ impl PgEventReader {
 
 async fn backfill_event_titles(pool: &PgPool) -> Result<()> {
     sqlx::query(
-        r#"UPDATE events e
-           SET title = NULLIF(
+        r#"WITH title_candidates AS (
+               SELECT e.id,
+                   NULLIF(
                regexp_replace(
                    concat_ws(' - ', NULLIF(btrim(a.app_title), ''), NULLIF(btrim(e.window_title), '')),
                    '\s+',
@@ -469,10 +470,16 @@ async fn backfill_event_titles(pool: &PgPool) -> Result<()> {
                    'g'
                ),
                ''
+                   ) AS title
+               FROM events e
+               JOIN apps a ON e.app_id = a.id
+               WHERE e.title IS NULL
            )
-           FROM apps a
-           WHERE e.app_id = a.id
-             AND e.title IS NULL"#,
+           UPDATE events e
+           SET title = title_candidates.title
+           FROM title_candidates
+           WHERE e.id = title_candidates.id
+             AND title_candidates.title IS NOT NULL"#,
     )
     .execute(pool)
     .await

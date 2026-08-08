@@ -1139,3 +1139,57 @@ async fn writer_backfills_missing_titles_once_for_existing_events() -> Result<()
     .await;
     db.finish(test_result).await
 }
+
+#[tokio::test]
+async fn writer_backfill_leaves_blank_derived_titles_null_without_rewriting_them() -> Result<()> {
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let event_id = writer
+            .write_start(
+                &event(
+                    1,
+                    "notepad.exe",
+                    "   ",
+                    "  ",
+                    "text",
+                    None,
+                ),
+                SplitReason::Initial,
+            )
+            .await?;
+        sqlx::query("UPDATE events SET title = NULL WHERE id = $1")
+            .bind(&event_id)
+            .execute(&db.pool)
+            .await?;
+        let before: (Option<String>, String) =
+            sqlx::query_as("SELECT title, xmin::text FROM events WHERE id = $1")
+                .bind(&event_id)
+                .fetch_one(&db.pool)
+                .await?;
+
+        let _ = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let first: (Option<String>, String) =
+            sqlx::query_as("SELECT title, xmin::text FROM events WHERE id = $1")
+                .bind(&event_id)
+                .fetch_one(&db.pool)
+                .await?;
+        let _ = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let second: (Option<String>, String) =
+            sqlx::query_as("SELECT title, xmin::text FROM events WHERE id = $1")
+                .bind(&event_id)
+                .fetch_one(&db.pool)
+                .await?;
+
+        ensure!(before.0.is_none(), "the blank title fixture must begin NULL: {before:?}");
+        ensure!(first.0.is_none(), "the first writer connection filled a blank title: {first:?}");
+        ensure!(second.0.is_none(), "the second writer connection filled a blank title: {second:?}");
+        ensure!(
+            before == first && first == second,
+            "blank derived titles must not create row versions: before={before:?} first={first:?} second={second:?}"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
