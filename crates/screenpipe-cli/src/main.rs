@@ -1031,10 +1031,13 @@ mod audio {
                     return Ok(());
                 }
                 Err(error) => {
-                    return Err(anyhow::anyhow!(
+                    let persistence_error = anyhow::anyhow!(
                         "audio shutdown drain failed (category={})",
                         failure_category(&error)
-                    ));
+                    );
+                    source.stop_accepting_observations();
+                    let _ = source.join_workers();
+                    return Err(persistence_error);
                 }
             }
         }
@@ -1443,6 +1446,130 @@ mod audio {
             async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> anyhow::Result<()> {
                 unreachable!("one completed observation starts exactly one event")
             }
+        }
+
+        struct FailingDrainSource {
+            reads: VecDeque<anyhow::Result<ObservationRead>>,
+            shutdown_requested: bool,
+            stopped_accepting: bool,
+            joined: bool,
+        }
+
+        #[async_trait]
+        impl SampleSource for FailingDrainSource {
+            async fn next_sample(&mut self) -> anyhow::Result<SampleRead> {
+                unreachable!("the drain path reads envelopes")
+            }
+
+            async fn next_observation(&mut self) -> anyhow::Result<ObservationRead> {
+                assert!(
+                    self.shutdown_requested,
+                    "Ctrl-C must signal workers before draining"
+                );
+                self.reads.pop_front().expect("a queued drain result")
+            }
+        }
+
+        impl AudioShutdownSource for FailingDrainSource {
+            fn request_shutdown(&mut self) {
+                self.shutdown_requested = true;
+            }
+
+            fn stop_accepting_observations(&mut self) {
+                self.stopped_accepting = true;
+            }
+
+            fn join_workers(&mut self) -> anyhow::Result<()> {
+                self.joined = true;
+                Err(anyhow::anyhow!(
+                    "audio worker panic contained private cleanup value"
+                ))
+            }
+        }
+
+        struct FailingDrainSink;
+
+        #[async_trait]
+        impl EventSink for FailingDrainSink {
+            async fn start(
+                &self,
+                _event: &OpenEvent,
+                _reason: SplitReason,
+            ) -> anyhow::Result<EventId> {
+                Err(anyhow::anyhow!(
+                    "PostgreSQL rejected private transcript value"
+                ))
+            }
+
+            async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> anyhow::Result<()> {
+                unreachable!("one completed observation starts exactly one event")
+            }
+        }
+
+        #[tokio::test]
+        async fn persistence_failure_runs_redacted_shutdown_cleanup() {
+            let started_at = chrono::Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, 0).unwrap();
+            let observation = ObservationEnvelope::spanning(
+                ObservationSample {
+                    captured_at: started_at,
+                    app_key: "audio:loopback".to_owned(),
+                    app_title: "System Audio".to_owned(),
+                    window_title: String::new(),
+                    ocr_text: "fixed transcript".to_owned(),
+                    readable_text: "fixed transcript".to_owned(),
+                    browser_url: None,
+                },
+                started_at + chrono::Duration::seconds(1),
+                AudioMeta {
+                    channel: "system_audio",
+                    device_category: "communications",
+                    engine: "whisper-rs",
+                    model: "ggml-base.en".to_owned(),
+                    vad_engine: "webrtc-vad",
+                    vad_aggressiveness: "quality",
+                    language: None,
+                    avg_no_speech_permille: Some(0),
+                    closed_by: "stream_closed",
+                },
+            );
+            let mut source = FailingDrainSource {
+                reads: VecDeque::from([Ok(ObservationRead::Sample {
+                    observation,
+                    cadence: CadenceRecord::from_input(CadenceInput {
+                        input_idle: chrono::Duration::zero(),
+                        frame_stable_for: chrono::Duration::zero(),
+                        foreground_changed: false,
+                        frame_changed: false,
+                    }),
+                })]),
+                shutdown_requested: false,
+                stopped_accepting: false,
+                joined: false,
+            };
+            let mut runner = audio_runner();
+
+            let error = drain_audio_shutdown(
+                &mut runner,
+                &mut source,
+                &FailingDrainSink,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(source.shutdown_requested);
+            assert!(
+                source.stopped_accepting,
+                "the observation receiver is closed"
+            );
+            assert!(source.joined, "capture and transcriber workers are joined");
+            assert_eq!(
+                error.to_string(),
+                "audio shutdown drain failed (category=postgres)"
+            );
+            let rendered = format!("{error:?}");
+            assert!(!rendered.contains("private transcript"));
+            assert!(!rendered.contains("private cleanup"));
         }
 
         struct SlowDrainSource {
