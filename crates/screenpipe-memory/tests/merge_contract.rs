@@ -957,35 +957,62 @@ fn every_distinct_utterance_becomes_its_own_event() {
 }
 
 #[test]
-fn a_repeated_transcript_merges_rather_than_writing_the_same_row_twice() {
-    // Whisper reliably produces a short repeated phrase over near-silence - a
-    // caption credit, a bare "Thank you." - and a quiet room would otherwise
-    // become a row per utterance saying the same thing.
+fn identical_transcripts_in_distinct_utterance_windows_start_distinct_events() {
+    // The transcript is deliberately identical. These windows cannot belong
+    // to one VAD utterance: the first is closed before the second begins. A
+    // content-only identity would merge them and erase the first occurrence as
+    // a separately searchable event.
     let mut merger = audio_merger();
-    started(
-        merger.ingest(audio_sample(0, "Thank you.")),
+    let first = started(
+        merger.ingest(audio_sample_lasting(0, 1, "Thank you.")),
         SplitReason::Initial,
     );
 
-    let merged_once = merged(merger.ingest(audio_sample(2, "Thank you.")));
-    let merged_twice = merged(merger.ingest(audio_sample(4, " thank   you. ")));
+    let second = started(
+        merger.ingest(audio_sample_lasting(2, 1, "Thank you.")),
+        SplitReason::TextHashChange,
+    );
 
-    assert_eq!(merged_once.sample_count, 2);
-    // Normalized, so case and whitespace do not make a second row either.
-    assert_eq!(merged_twice.sample_count, 3);
+    assert_eq!(first.started_at, at(0));
+    assert_eq!(first.ended_at, at(1));
+    assert_eq!(second.started_at, at(2));
+    assert_eq!(second.ended_at, at(3));
+    assert_eq!(second.sample_count, 1);
+    assert_ne!(first.merge_hash, second.merge_hash);
+}
+
+#[test]
+fn identical_chunks_from_one_utterance_window_are_deduplicated() {
+    // Guard the other side of the boundary: an upstream retry can hand the
+    // same closed VAD utterance to the merger twice. The shared start/end span
+    // is its identity, so this is one durable occurrence with two samples.
+    let mut merger = audio_merger();
+    let chunk = audio_sample_lasting(0, 1, "Thank you.");
+    let first = started(merger.ingest(chunk.clone()), SplitReason::Initial);
+
+    let duplicate = merged(merger.ingest(chunk));
+
+    assert_eq!(duplicate.started_at, at(0));
+    assert_eq!(duplicate.ended_at, at(1));
+    assert_eq!(duplicate.sample_count, 2);
+    assert_eq!(duplicate.merge_hash, first.merge_hash);
 }
 
 #[test]
 fn a_silence_longer_than_the_idle_gap_starts_a_new_audio_event() {
-    // The VAD has already closed each utterance, so the interval between two
-    // audio samples IS the silence between two turns. This is the design's
-    // "silence is the boundary", expressed in the shared merger.
+    // Every separately closed VAD window is already a new event. The idle-gap
+    // reason still has priority when the silence itself crosses the shared
+    // threshold, so readers can distinguish an ordinary new utterance from a
+    // long period with no speech.
     let mut merger = audio_merger();
     let line = "same thing said twice, an hour apart";
     started(merger.ingest(audio_sample(0, line)), SplitReason::Initial);
 
-    let at_threshold = merged(merger.ingest(audio_sample(TEST_IDLE_GAP_SECONDS, line)));
-    assert_eq!(at_threshold.sample_count, 2);
+    let at_threshold = started(
+        merger.ingest(audio_sample(TEST_IDLE_GAP_SECONDS, line)),
+        SplitReason::TextHashChange,
+    );
+    assert_eq!(at_threshold.sample_count, 1);
 
     let event = started(
         merger.ingest(audio_sample(TEST_IDLE_GAP_SECONDS * 2 + 1, line)),

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use chrono::{DateTime, Duration, Utc};
+use sha2::{Digest, Sha256};
 
 use crate::cadence::CadenceRecord;
 use crate::sample::ObservationSample;
@@ -21,7 +22,12 @@ use crate::text_hash::{TextIdentity, jaccard_overlap, normalize_text};
 /// implied by the version alone; from 5 on, `events.kind` selects the test -
 /// see [`EventKind::merge_rule`] - so the version no longer determines how a
 /// row was segmented on its own.
-pub const MERGE_CONTRACT_VERSION: u32 = 5;
+///
+/// Bumped to 6 when audio events stopped using transcript content alone as
+/// their merge identity. From 6 on, an audio identity also includes the VAD
+/// utterance window, so repeating the same words in a later utterance remains
+/// a separately durable event.
+pub const MERGE_CONTRACT_VERSION: u32 = 6;
 
 /// What a durable event is a record of.
 ///
@@ -50,10 +56,10 @@ pub enum EventKind {
     /// things, not one thing being scrolled past. The window title is not
     /// consulted either, because a clipboard capture has no window of its own.
     Clipboard,
-    /// One utterance of speech, transcribed locally. Same test as
-    /// [`EventKind::Clipboard`], for a different reason that arrives at the
-    /// same place: content continues ONLY when the normalized transcript is
-    /// identical.
+    /// One utterance of speech, transcribed locally. Content continues only
+    /// when both the normalized transcript and the VAD utterance window are
+    /// identical. That deduplicates a retried chunk from one utterance without
+    /// erasing a later occurrence of the same words.
     ///
     /// Speech does not repeat itself the way a screen does, so the overlap
     /// test that segments the screen has nothing to measure here - which is
@@ -63,11 +69,6 @@ pub enum EventKind {
     /// between two samples on this channel is exactly the silence between two
     /// utterances.
     ///
-    /// The identical-transcript merge is not incidental either. Whisper
-    /// reliably hallucinates a short repeated phrase over near-silence - the
-    /// caption-credit line, a bare "Thank you." - and merging those into one
-    /// event with a higher `sample_count` is what keeps a quiet room from
-    /// becoming a hundred identical rows.
     Audio,
 }
 
@@ -361,9 +362,14 @@ impl Merger {
         capture_gaps: CaptureGapSummary,
     ) -> MergeDecision {
         let identity = TextIdentity::from_ocr(&sample.ocr_text);
+        let merge_hash = match self.config.kind {
+            EventKind::Audio => audio_merge_hash(&sample, &identity.exact_hash),
+            EventKind::Screen | EventKind::Clipboard => identity.exact_hash.clone(),
+        };
         let Some(open) = self.open.as_ref() else {
             return self.start(
                 sample,
+                merge_hash,
                 identity.exact_hash,
                 cadence,
                 capture_gaps,
@@ -373,9 +379,8 @@ impl Merger {
 
         let reason = match self.config.kind {
             EventKind::Screen => self.screen_split_reason(open, &sample, &identity),
-            EventKind::Clipboard | EventKind::Audio => {
-                self.discrete_split_reason(open, &sample, &identity)
-            }
+            EventKind::Clipboard => self.clipboard_split_reason(open, &sample, &identity),
+            EventKind::Audio => self.audio_split_reason(open, &sample, &merge_hash),
         };
 
         // The ceilings are consulted last, so an observed reason always wins
@@ -394,7 +399,14 @@ impl Merger {
         });
 
         if let Some(reason) = reason {
-            return self.start(sample, identity.exact_hash, cadence, capture_gaps, reason);
+            return self.start(
+                sample,
+                merge_hash,
+                identity.exact_hash,
+                cadence,
+                capture_gaps,
+                reason,
+            );
         }
 
         let open = self.open.as_mut().expect("open event checked above");
@@ -463,29 +475,14 @@ impl Merger {
         }
     }
 
-    /// The boundary test for the discrete channels - [`EventKind::Clipboard`]
-    /// and [`EventKind::Audio`].
+    /// The boundary test for the discrete [`EventKind::Clipboard`] channel.
     ///
     /// Two closers, and deliberately no others: the text changed, or the
     /// channel went quiet for longer than the idle gap. A capture whose
     /// normalized text hash equals the open event's merges instead, which is
     /// what makes re-copying the same thing - hitting Ctrl-C twice, or a
     /// re-copy from a different app - one event with a higher `sample_count`
-    /// rather than a second row saying the same thing. On the audio channel it
-    /// does the same job for a transcript whisper emitted twice.
-    ///
-    /// One rule for both because both channels deliver DISCRETE, already-bounded
-    /// text: a copy is a copy, an utterance is an utterance, and neither is a
-    /// continuous surface being sampled. The screen is the odd one out - it is
-    /// sampled on a clock, so the same material shows up over and over and has
-    /// to be recognised as continuing.
-    ///
-    /// **Every distinct text starts a new row, and that is load-bearing.** The
-    /// writer persists `latest.ocr_text`, replacing what the row held before,
-    /// so a rule that merged two different transcripts would keep the second
-    /// and silently lose the first. Splitting is what makes every utterance
-    /// durable and searchable. Runs of speech are reassembled downstream by the
-    /// summarization ladder, which is where grouping belongs.
+    /// rather than a second row saying the same thing.
     ///
     /// The comparison is against the OPEN EVENT'S OWN hash and not against its
     /// ledger. `hash_counts` answers "did this event ever see this screen",
@@ -497,11 +494,8 @@ impl Merger {
     /// The app key is not consulted. A clipboard capture is not attributed to
     /// an app at all - the foreground window at poll time is not reliably the
     /// window the copy came from, and asserting otherwise would put a guess in
-    /// a durable row. An audio capture does carry one, `audio:loopback` or
-    /// `audio:microphone`, but it cannot change within a merger: each enabled
-    /// channel runs its own capture stream and its own `Merger`, so there is no
-    /// sample sequence in which that key differs.
-    fn discrete_split_reason(
+    /// a durable row.
+    fn clipboard_split_reason(
         &self,
         open: &OpenEvent,
         sample: &ObservationSample,
@@ -516,15 +510,35 @@ impl Merger {
         }
     }
 
+    /// Audio deduplicates only a retry of the same VAD utterance. Transcript
+    /// content alone cannot identify an occurrence: people can say the same
+    /// words twice, and both occurrences must remain durable. The merge hash
+    /// therefore binds normalized content to the utterance's start/end window.
+    fn audio_split_reason(
+        &self,
+        open: &OpenEvent,
+        sample: &ObservationSample,
+        merge_hash: &str,
+    ) -> Option<SplitReason> {
+        if sample.captured_at - open.ended_at > self.config.idle_gap {
+            Some(SplitReason::IdleGap)
+        } else if merge_hash != open.merge_hash {
+            Some(SplitReason::TextHashChange)
+        } else {
+            None
+        }
+    }
+
     fn start(
         &mut self,
         sample: ObservationSample,
         merge_hash: String,
+        latest_exact_ocr_hash: String,
         cadence: CadenceRecord,
         capture_gaps: CaptureGapSummary,
         reason: SplitReason,
     ) -> MergeDecision {
-        let hash_counts = HashLedger::with_first(merge_hash.clone());
+        let hash_counts = HashLedger::with_first(latest_exact_ocr_hash.clone());
         let event = OpenEvent {
             kind: self.config.kind,
             merge_contract_version: MERGE_CONTRACT_VERSION,
@@ -536,7 +550,7 @@ impl Merger {
             // after it.
             ended_at: sample.observed_until(),
             latest: sample,
-            latest_exact_ocr_hash: merge_hash.clone(),
+            latest_exact_ocr_hash,
             merge_hash,
             start_reason: reason,
             last_decision: MergeDecisionKind::Start,
@@ -548,4 +562,25 @@ impl Merger {
         self.open = Some(event.clone());
         MergeDecision::Start { reason, event }
     }
+}
+
+/// Stable identity for one normalized transcript occurrence.
+///
+/// The timestamps are encoded as fixed-width seconds/nanoseconds pairs, so no
+/// locale or formatter can alter the durable hash. Including the transcript
+/// hash keeps different chunks in one window distinct; including both ends of
+/// the VAD window keeps identical words in separate utterances distinct.
+fn audio_merge_hash(sample: &ObservationSample, transcript_hash: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"screenpipe-audio-utterance-v1\0");
+    hasher.update(transcript_hash.as_bytes());
+    for instant in [sample.captured_at, sample.observed_until()] {
+        hasher.update(instant.timestamp().to_be_bytes());
+        hasher.update(instant.timestamp_subsec_nanos().to_be_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
