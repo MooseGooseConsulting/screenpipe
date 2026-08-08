@@ -135,6 +135,14 @@ impl Runner {
         self.pending_gaps
     }
 
+    /// Whether a source observation has been accepted but not durably written.
+    ///
+    /// Callers that place source waiting behind a cancellation boundary use
+    /// this to retry the accepted write directly instead of reading ahead.
+    pub fn has_pending_observation(&self) -> bool {
+        self.pending_sample.is_some()
+    }
+
     pub async fn run_once(
         &mut self,
         source: &mut dyn SampleSource,
@@ -496,6 +504,7 @@ mod tests {
 
         runner.run_once(&mut source, &sink).await.unwrap();
         assert!(runner.run_once(&mut source, &sink).await.is_err());
+        assert!(runner.has_pending_observation());
         assert_eq!(runner.pending_gaps().capture_unavailable, 1);
         assert_eq!((source.read_count(), source.remaining()), (2, 1));
         let retry = runner.run_once(&mut source, &sink).await.unwrap();
@@ -525,6 +534,7 @@ mod tests {
         assert_eq!(started_event(&calls[1]).latest_cadence, cadence(0));
         assert_eq!((source.read_count(), source.remaining()), (2, 1));
         assert_eq!(runner.pending_gaps(), CaptureGapSummary::default());
+        assert!(!runner.has_pending_observation());
     }
 
     #[tokio::test]
@@ -544,6 +554,7 @@ mod tests {
         runner.run_once(&mut source, &sink).await.unwrap();
         runner.run_once(&mut source, &sink).await.unwrap();
         assert!(runner.run_once(&mut source, &sink).await.is_err());
+        assert!(runner.has_pending_observation());
         assert_eq!(runner.current_event_id(), Some("event-1"));
         assert_eq!(runner.pending_gaps().ocr_unavailable, 1);
         assert_eq!((source.read_count(), source.remaining()), (3, 1));
@@ -563,6 +574,7 @@ mod tests {
         assert_eq!(retry_event.latest_cadence, cadence(2));
         assert_eq!((source.read_count(), source.remaining()), (3, 1));
         assert_eq!(runner.pending_gaps(), CaptureGapSummary::default());
+        assert!(!runner.has_pending_observation());
     }
 
     #[tokio::test]

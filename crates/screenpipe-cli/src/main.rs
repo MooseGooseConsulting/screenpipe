@@ -979,6 +979,54 @@ mod audio {
         }
     }
 
+    /// A source result selected before persistence begins. Once this owns the
+    /// result, `Runner::run_once` can stage and write it without remaining
+    /// inside the Ctrl-C select.
+    struct AcceptedObservationSource(Option<Result<ObservationRead>>);
+
+    #[async_trait::async_trait]
+    impl SampleSource for AcceptedObservationSource {
+        async fn next_sample(&mut self) -> Result<SampleRead> {
+            unreachable!("accepted audio observations preserve their envelope")
+        }
+
+        async fn next_observation(&mut self) -> Result<ObservationRead> {
+            self.0
+                .take()
+                .expect("one accepted observation is available")
+        }
+    }
+
+    enum AudioRunEvent {
+        Shutdown(Result<()>),
+        Iteration(Result<screenpipe_memory::RunOutcome>),
+    }
+
+    /// Ctrl-C may cancel only the wait for source output. A source result is
+    /// moved out of the select before the runner stages it and starts a sink
+    /// transaction, so an accepted durable write cannot become an unknown
+    /// commit through future cancellation.
+    async fn next_audio_event<F>(
+        runner: &mut Runner,
+        source: &mut dyn SampleSource,
+        sink: &dyn screenpipe_memory::EventSink,
+        shutdown: std::pin::Pin<&mut F>,
+    ) -> AudioRunEvent
+    where
+        F: std::future::Future<Output = Result<()>>,
+    {
+        if runner.has_pending_observation() {
+            return AudioRunEvent::Iteration(run_iteration(runner, source, sink).await);
+        }
+
+        let accepted = tokio::select! {
+            signal = shutdown => return AudioRunEvent::Shutdown(signal),
+            observation = source.next_observation() => observation,
+        };
+        let mut accepted_source = AcceptedObservationSource(Some(accepted));
+        AudioRunEvent::Iteration(run_iteration(runner, &mut accepted_source, sink).await)
+    }
+
     /// Signals capture, then gives workers a bounded window to produce more
     /// observations. Once an observation reaches the runner, persistence is
     /// never cancelled; after the window, the receiver closes to new output
@@ -1084,6 +1132,81 @@ mod audio {
         next_step(kind, consecutive_failures, consecutive_gaps)
     }
 
+    async fn run_audio_loop<F>(
+        runner: &mut Runner,
+        source: &mut impl AudioShutdownSource,
+        sink: &dyn screenpipe_memory::EventSink,
+        shutdown: F,
+        drain_deadline: std::time::Duration,
+    ) -> Result<()>
+    where
+        F: std::future::Future<Output = Result<()>>,
+    {
+        let mut consecutive_failures: u32 = 0;
+        let mut consecutive_gaps: u32 = 0;
+        tokio::pin!(shutdown);
+
+        loop {
+            match next_audio_event(runner, source, sink, shutdown.as_mut()).await {
+                AudioRunEvent::Shutdown(signal) => {
+                    signal.context("listen for Ctrl-C")?;
+                    println!("event=shutdown reason=ctrl_c");
+                    return drain_audio_shutdown(runner, source, sink, drain_deadline).await;
+                }
+                AudioRunEvent::Iteration(Ok(outcome)) => {
+                    print_run_outcome("audio", &outcome);
+                    match audio_next_step(
+                        &outcome,
+                        &mut consecutive_failures,
+                        &mut consecutive_gaps,
+                    ) {
+                        LoopStep::Continue => {}
+                        LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                        LoopStep::AbortGaps => {
+                            return Err(anyhow::anyhow!(
+                                "aborting after {MAX_CONSECUTIVE_GAPS} consecutive audio capture gaps"
+                            ));
+                        }
+                        LoopStep::AbortFailures(category) => {
+                            return Err(anyhow::anyhow!(
+                                "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive audio processing failures (category={category})"
+                            ));
+                        }
+                    }
+                }
+                AudioRunEvent::Iteration(Err(error)) if is_capture_stopped(&error) => {
+                    // Not retryable. The WASAPI stream and the model live on
+                    // threads that have exited; the service wrapper re-opens
+                    // everything from a clean process.
+                    println!("event=shutdown reason=capture_stopped");
+                    return Err(error);
+                }
+                AudioRunEvent::Iteration(Err(error)) => {
+                    let category = failure_category(&error);
+                    let step = next_step(
+                        IterationKind::Failure(category),
+                        &mut consecutive_failures,
+                        &mut consecutive_gaps,
+                    );
+                    println!(
+                        "event=audio_error category={category} consecutive={consecutive_failures}"
+                    );
+                    match step {
+                        LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                        LoopStep::AbortFailures(category) => {
+                            return Err(anyhow::anyhow!(
+                                "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive audio processing failures (category={category})"
+                            ));
+                        }
+                        LoopStep::Continue | LoopStep::AbortGaps => unreachable!(
+                            "a failure iteration can only retry or reach its failure ceiling"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     /// Opens the configured stream, immediately closes it, and records nothing.
     pub(crate) async fn doctor(
         database_url: &str,
@@ -1166,92 +1289,28 @@ mod audio {
             language: options.language,
         })?;
         let mut runner = audio_runner();
-        let mut consecutive_failures: u32 = 0;
-        let mut consecutive_gaps: u32 = 0;
         println!("event=audio_runtime_ready machine_slug={machine_slug}");
-
-        let shutdown = tokio::signal::ctrl_c();
-        tokio::pin!(shutdown);
-        loop {
-            tokio::select! {
-                signal = &mut shutdown => {
-                    signal.context("listen for Ctrl-C")?;
-                    println!("event=shutdown reason=ctrl_c");
-                    return drain_audio_shutdown(
-                        &mut runner,
-                        &mut source,
-                        &writer,
-                        SHUTDOWN_DRAIN_DEADLINE,
-                    ).await;
-                }
-                step = run_iteration(&mut runner, &mut source, &writer) => match step {
-                    Ok(outcome) => {
-                        print_run_outcome("audio", &outcome);
-                        match audio_next_step(
-                            &outcome,
-                            &mut consecutive_failures,
-                            &mut consecutive_gaps,
-                        ) {
-                            LoopStep::Continue => {}
-                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
-                            LoopStep::AbortGaps => {
-                                return Err(anyhow::anyhow!(
-                                    "aborting after {MAX_CONSECUTIVE_GAPS} consecutive audio capture gaps"
-                                ));
-                            }
-                            LoopStep::AbortFailures(category) => {
-                                return Err(anyhow::anyhow!(
-                                    "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive audio processing failures (category={category})"
-                                ));
-                            }
-                        }
-                    }
-                    Err(error) if is_capture_stopped(&error) => {
-                        // Not retryable. The WASAPI stream and the model live
-                        // on threads that have exited; backing off would print
-                        // the same line every second until logoff. Exiting
-                        // hands off to the service wrapper's restart loop,
-                        // which re-opens everything from a clean process.
-                        println!("event=shutdown reason=capture_stopped");
-                        return Err(error);
-                    }
-                    Err(error) => {
-                        let category = failure_category(&error);
-                        let step = next_step(
-                            IterationKind::Failure(category),
-                            &mut consecutive_failures,
-                            &mut consecutive_gaps,
-                        );
-                        println!(
-                            "event=audio_error category={category} consecutive={consecutive_failures}"
-                        );
-                        match step {
-                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
-                            LoopStep::AbortFailures(category) => {
-                                return Err(anyhow::anyhow!(
-                                    "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive audio processing failures (category={category})"
-                                ));
-                            }
-                            LoopStep::Continue | LoopStep::AbortGaps => unreachable!(
-                                "a failure iteration can only retry or reach its failure ceiling"
-                            ),
-                        }
-                    }
-                },
-            }
-        }
+        run_audio_loop(
+            &mut runner,
+            &mut source,
+            &writer,
+            async { tokio::signal::ctrl_c().await.map_err(anyhow::Error::from) },
+            SHUTDOWN_DRAIN_DEADLINE,
+        )
+        .await
     }
 
     #[cfg(test)]
     mod tests {
         use std::cell::Cell;
         use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
 
         use super::{
             AudioCaptureProbe, AudioShutdownSource, MAX_TRANSCRIBE_THREADS, audio_next_step,
             audio_runner, channel_of, drain_audio_shutdown, is_capture_stopped, probe_audio_stream,
-            resolve_threads,
+            resolve_threads, run_audio_loop,
         };
         use crate::audio_source::CaptureStopped;
         use crate::{LoopStep, MAX_CONSECUTIVE_FAILURES};
@@ -1391,6 +1450,42 @@ mod audio {
                 LoopStep::Continue
             );
             assert_eq!((failures, gaps), (0, 0));
+        }
+
+        fn completed_audio_observation() -> ObservationEnvelope {
+            let started_at = chrono::Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, 0).unwrap();
+            ObservationEnvelope::spanning(
+                ObservationSample {
+                    captured_at: started_at,
+                    app_key: "audio:loopback".to_owned(),
+                    app_title: "System Audio".to_owned(),
+                    window_title: String::new(),
+                    ocr_text: "fixed transcript".to_owned(),
+                    readable_text: "fixed transcript".to_owned(),
+                    browser_url: None,
+                },
+                started_at + chrono::Duration::seconds(1),
+                AudioMeta {
+                    channel: "system_audio",
+                    device_category: "communications",
+                    engine: "whisper-rs",
+                    model: "ggml-base.en".to_owned(),
+                    vad_engine: "webrtc-vad",
+                    vad_aggressiveness: "quality",
+                    language: None,
+                    avg_no_speech_permille: Some(0),
+                    closed_by: "stream_closed",
+                },
+            )
+        }
+
+        fn audio_cadence() -> CadenceRecord {
+            CadenceRecord::from_input(CadenceInput {
+                input_idle: chrono::Duration::zero(),
+                frame_stable_for: chrono::Duration::zero(),
+                foreground_changed: false,
+                frame_changed: false,
+            })
         }
 
         struct DrainSource {
@@ -1600,6 +1695,42 @@ mod audio {
             }
         }
 
+        struct ForegroundDrainSource {
+            first: Option<anyhow::Result<ObservationRead>>,
+            shutdown_requested: bool,
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl SampleSource for ForegroundDrainSource {
+            async fn next_sample(&mut self) -> anyhow::Result<SampleRead> {
+                unreachable!("the audio foreground path reads envelopes")
+            }
+
+            async fn next_observation(&mut self) -> anyhow::Result<ObservationRead> {
+                if let Some(first) = self.first.take() {
+                    return first;
+                }
+                if self.shutdown_requested {
+                    return Err(anyhow::Error::new(CaptureStopped));
+                }
+                std::future::pending().await
+            }
+        }
+
+        impl AudioShutdownSource for ForegroundDrainSource {
+            fn request_shutdown(&mut self) {
+                self.shutdown_requested = true;
+            }
+
+            fn stop_accepting_observations(&mut self) {}
+
+            fn join_workers(&mut self) -> anyhow::Result<()> {
+                self.events.lock().unwrap().push("joined");
+                Ok(())
+            }
+        }
+
         impl AudioShutdownSource for SlowDrainSource {
             fn request_shutdown(&mut self) {
                 self.shutdown_requested = true;
@@ -1617,6 +1748,71 @@ mod audio {
             events: Arc<Mutex<Vec<&'static str>>>,
             started: Arc<tokio::sync::Notify>,
             release: Arc<tokio::sync::Notify>,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum BlockedWrite {
+            Start,
+            Merge,
+        }
+
+        struct BlockingSink {
+            blocked_write: BlockedWrite,
+            starts: Arc<AtomicUsize>,
+            merges: Arc<AtomicUsize>,
+            completed: Arc<AtomicUsize>,
+            cancelled: Arc<AtomicBool>,
+            events: Arc<Mutex<Vec<&'static str>>>,
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        struct PersistenceGuard {
+            cancelled: Arc<AtomicBool>,
+            completed: bool,
+        }
+
+        impl Drop for PersistenceGuard {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        impl BlockingSink {
+            async fn block(&self, write: BlockedWrite) {
+                assert_eq!(self.blocked_write, write);
+                let mut guard = PersistenceGuard {
+                    cancelled: Arc::clone(&self.cancelled),
+                    completed: false,
+                };
+                self.events.lock().unwrap().push("persistence_started");
+                self.started.notify_one();
+                self.release.notified().await;
+                guard.completed = true;
+                self.completed.fetch_add(1, Ordering::SeqCst);
+                self.events.lock().unwrap().push("persistence_completed");
+            }
+        }
+
+        #[async_trait]
+        impl EventSink for BlockingSink {
+            async fn start(
+                &self,
+                _event: &OpenEvent,
+                _reason: SplitReason,
+            ) -> anyhow::Result<EventId> {
+                self.starts.fetch_add(1, Ordering::SeqCst);
+                self.block(BlockedWrite::Start).await;
+                EventId::try_from("icarus_1".to_owned())
+            }
+
+            async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> anyhow::Result<()> {
+                self.merges.fetch_add(1, Ordering::SeqCst);
+                self.block(BlockedWrite::Merge).await;
+                Ok(())
+            }
         }
 
         #[async_trait]
@@ -1773,6 +1969,157 @@ mod audio {
 
             release.notify_one();
             drain.await.unwrap().unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["persistence_started", "persistence_completed", "joined"]
+            );
+        }
+
+        #[tokio::test]
+        async fn foreground_shutdown_does_not_cancel_an_accepted_start() {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+            let starts = Arc::new(AtomicUsize::new(0));
+            let merges = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let mut source = ForegroundDrainSource {
+                first: Some(Ok(ObservationRead::Sample {
+                    observation: completed_audio_observation(),
+                    cadence: audio_cadence(),
+                })),
+                shutdown_requested: false,
+                events: Arc::clone(&events),
+            };
+            let sink = BlockingSink {
+                blocked_write: BlockedWrite::Start,
+                starts: Arc::clone(&starts),
+                merges: Arc::clone(&merges),
+                completed: Arc::clone(&completed),
+                cancelled: Arc::clone(&cancelled),
+                events: Arc::clone(&events),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            };
+            let shutdown_wait = Arc::clone(&shutdown);
+            let mut runner = audio_runner();
+
+            let mut run = Box::pin(tokio::spawn(async move {
+                run_audio_loop(
+                    &mut runner,
+                    &mut source,
+                    &sink,
+                    async move {
+                        shutdown_wait.notified().await;
+                        Ok(())
+                    },
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+            }));
+            started.notified().await;
+            shutdown.notify_one();
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), run.as_mut())
+                    .await
+                    .is_err(),
+                "shutdown must wait for the accepted start"
+            );
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+            assert_eq!(merges.load(Ordering::SeqCst), 0);
+            assert_eq!(completed.load(Ordering::SeqCst), 0);
+            assert!(!cancelled.load(Ordering::SeqCst));
+
+            release.notify_one();
+            run.await.unwrap().unwrap();
+            assert_eq!(starts.load(Ordering::SeqCst), 1);
+            assert_eq!(completed.load(Ordering::SeqCst), 1);
+            assert!(!cancelled.load(Ordering::SeqCst));
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["persistence_started", "persistence_completed", "joined"]
+            );
+        }
+
+        #[tokio::test]
+        async fn foreground_shutdown_does_not_cancel_an_accepted_merge() {
+            let observation = completed_audio_observation();
+            let cadence = audio_cadence();
+            let mut runner = audio_runner();
+            let seed_sink = DrainSink::default();
+            let mut seed_source = DrainSource {
+                reads: VecDeque::from([Ok(ObservationRead::Sample {
+                    observation: observation.clone(),
+                    cadence,
+                })]),
+                shutdown_requested: true,
+                joined: false,
+            };
+            runner.run_once(&mut seed_source, &seed_sink).await.unwrap();
+
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+            let starts = Arc::new(AtomicUsize::new(0));
+            let merges = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let mut source = ForegroundDrainSource {
+                first: Some(Ok(ObservationRead::Sample {
+                    observation,
+                    cadence,
+                })),
+                shutdown_requested: false,
+                events: Arc::clone(&events),
+            };
+            let sink = BlockingSink {
+                blocked_write: BlockedWrite::Merge,
+                starts: Arc::clone(&starts),
+                merges: Arc::clone(&merges),
+                completed: Arc::clone(&completed),
+                cancelled: Arc::clone(&cancelled),
+                events: Arc::clone(&events),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            };
+            let shutdown_wait = Arc::clone(&shutdown);
+
+            let mut run = Box::pin(tokio::spawn(async move {
+                run_audio_loop(
+                    &mut runner,
+                    &mut source,
+                    &sink,
+                    async move {
+                        shutdown_wait.notified().await;
+                        Ok(())
+                    },
+                    std::time::Duration::from_secs(1),
+                )
+                .await
+            }));
+            started.notified().await;
+            shutdown.notify_one();
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), run.as_mut())
+                    .await
+                    .is_err(),
+                "shutdown must wait for the accepted merge"
+            );
+            assert_eq!(starts.load(Ordering::SeqCst), 0);
+            assert_eq!(merges.load(Ordering::SeqCst), 1);
+            assert_eq!(completed.load(Ordering::SeqCst), 0);
+            assert!(!cancelled.load(Ordering::SeqCst));
+
+            release.notify_one();
+            run.await.unwrap().unwrap();
+            assert_eq!(merges.load(Ordering::SeqCst), 1);
+            assert_eq!(completed.load(Ordering::SeqCst), 1);
+            assert!(!cancelled.load(Ordering::SeqCst));
             assert_eq!(
                 *events.lock().unwrap(),
                 ["persistence_started", "persistence_completed", "joined"]
