@@ -1,8 +1,8 @@
 # Wasapi bindings for Rust
 
-The aim of this crate is to provide easy and safe access to the Wasapi API for audio playback and capture. 
+The aim of this crate is to provide easy and safe access to the Wasapi API for audio playback and capture.
 
-The presented API is all safe Rust, but structs and functions closely follow the original Windows API. 
+The presented API is all safe Rust, but structs and functions closely follow the original Windows API.
 
 For details on how to use Wasapi, please see [the Windows documentation](https://docs.microsoft.com/en-us/windows/win32/coreaudio/core-audio-interfaces).
 

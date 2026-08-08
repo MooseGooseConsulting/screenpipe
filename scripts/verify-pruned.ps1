@@ -84,4 +84,4 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 
-Write-Output 'PASS: only the headless Goal 1 workspace remains; audio stays opt-in'
+Write-Output 'PASS: Goal 1 workspace members include screenpipe-audio; default members are the non-audio screenpipe-screen, screenpipe-memory, and screenpipe-cli packages'

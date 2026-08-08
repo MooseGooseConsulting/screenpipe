@@ -5,7 +5,8 @@ This directory vendors `wasapi` 0.23.0 from crates.io, checksum
 upstream commit `ce77ae1040128f0f92587adda0de75bc38eaa3db`.
 
 The local change is intentionally limited to `Handle::wait_for_event` and its
-error contract:
+error contract. Two trailing spaces in the upstream README were also removed
+so the repository's whitespace check remains clean. The behavioral patch is:
 
 - `WAIT_TIMEOUT` remains `WasapiError::EventTimeout`;
 - `WAIT_FAILED` preserves the Windows error as `WasapiError::Windows`;
