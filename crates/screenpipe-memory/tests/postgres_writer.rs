@@ -1128,6 +1128,115 @@ async fn explicit_machine_search_connection_never_upserts_a_machine() -> Result<
 }
 
 #[tokio::test]
+async fn concurrent_writer_startup_backfills_each_historical_title_once() -> Result<()> {
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let event_id = writer
+            .write_start(
+                &event(
+                    1,
+                    "notepad.exe",
+                    "Notepad",
+                    "race-free title",
+                    "text",
+                    None,
+                ),
+                SplitReason::Initial,
+            )
+            .await?;
+        sqlx::query("UPDATE events SET title = NULL WHERE id = $1")
+            .bind(&event_id)
+            .execute(&db.pool)
+            .await?;
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE title_backfill_audit (id BIGSERIAL PRIMARY KEY);
+            CREATE FUNCTION pause_and_count_title_backfill() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                INSERT INTO title_backfill_audit DEFAULT VALUES;
+                PERFORM pg_sleep(0.25);
+                RETURN NEW;
+            END;
+            $$;
+            CREATE TRIGGER pause_and_count_title_backfill
+            BEFORE UPDATE OF title ON events
+            FOR EACH ROW WHEN (NEW.title IS NOT NULL)
+            EXECUTE FUNCTION pause_and_count_title_backfill();
+            "#,
+        )
+        .execute(&db.pool)
+        .await?;
+
+        let (left, right) = tokio::join!(
+            PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop"),
+            PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop"),
+        );
+        drop((left?, right?));
+
+        let updates: i64 = sqlx::query_scalar("SELECT count(*) FROM title_backfill_audit")
+            .fetch_one(&db.pool)
+            .await?;
+        let title: Option<String> = sqlx::query_scalar("SELECT title FROM events WHERE id = $1")
+            .bind(&event_id)
+            .fetch_one(&db.pool)
+            .await?;
+        ensure!(
+            updates == 1,
+            "concurrent writer startup must backfill once, not rewrite an already-backfilled title: updates={updates}"
+        );
+        ensure!(title.as_deref() == Some("Notepad - race-free title"));
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn writer_backfills_window_only_historical_events_without_an_app_row() -> Result<()> {
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let _writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let machine_id: i64 = sqlx::query_scalar("SELECT id FROM machines WHERE slug = $1")
+            .bind("icarus")
+            .fetch_one(&db.pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO events (\
+                 id, machine_id, seq, kind, started_at, ended_at, app_id, window_title, \
+                 ocr_text, readable_text, ocr_text_hash, sample_count, merge_meta, title\
+             ) VALUES ($1, $2, $3, 'screen', $4, $5, NULL, $6, $7, $8, $9, $10, $11, NULL)",
+        )
+        .bind("icarus_999")
+        .bind(machine_id)
+        .bind(999_i64)
+        .bind(at(1))
+        .bind(at(1))
+        .bind("window-only historical title")
+        .bind("text")
+        .bind("text")
+        .bind("hash-window-only")
+        .bind(1_i32)
+        .bind(serde_json::json!({}))
+        .execute(&db.pool)
+        .await?;
+
+        let _ = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let title: Option<String> =
+            sqlx::query_scalar("SELECT title FROM events WHERE id = 'icarus_999'")
+                .fetch_one(&db.pool)
+                .await?;
+        ensure!(
+            title.as_deref() == Some("window-only historical title"),
+            "a nullable app_id must not prevent window-only historical title backfill: {title:?}"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
 async fn writer_backfills_missing_titles_once_for_existing_events() -> Result<()> {
     let db = TestDatabase::create().await?;
     let test_result = async {

@@ -471,13 +471,14 @@ async fn backfill_event_titles(pool: &PgPool) -> Result<()> {
                        ''
                    ) AS title
                FROM events e
-               JOIN apps a ON e.app_id = a.id
+               LEFT JOIN apps a ON e.app_id = a.id
                WHERE e.title IS NULL
            )
            UPDATE events e
            SET title = title_candidates.title
            FROM title_candidates
            WHERE e.id = title_candidates.id
+             AND e.title IS NULL
              AND title_candidates.title IS NOT NULL"#,
     )
     .execute(pool)
