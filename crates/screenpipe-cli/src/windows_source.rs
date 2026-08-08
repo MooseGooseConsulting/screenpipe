@@ -13,6 +13,13 @@ use screenpipe_screen::{
 
 const RETRY_CADENCE: Duration = Duration::from_secs(2);
 
+/// Emitted when the browser-URL boundary itself failed, as opposed to the
+/// reader deciding no URL was available - the reader emits its own
+/// stage/reason categories for that. Fixed text, matching the reader's wire
+/// format: it must never carry the app, the window title, or the URL.
+const BROWSER_URL_BOUNDARY_UNAVAILABLE: &str =
+    "event=browser_url_unavailable stage=boundary reason=reader_error";
+
 fn cadence_record(
     input_idle: Duration,
     frame_stable_for: Duration,
@@ -37,6 +44,15 @@ trait WindowsSampleOps: Send {
     async fn recognize(&mut self, frame: &TransientFrame) -> Result<String>;
     async fn input_idle(&mut self) -> Result<Duration>;
     async fn browser_url(&mut self, metadata: &ForegroundMetadata) -> Result<Option<String>>;
+    /// True when the console session is locked.
+    ///
+    /// Deliberately NOT `probe_interactive_capability`. That probe answers
+    /// `Available` on a demonstrably locked workstation - measured on this
+    /// machine, `OpenInputDesktop` returned a handle and `GetForegroundWindow`
+    /// returned a window while the screen was locked - which is why a real
+    /// lock produced 78 `capture_unavailable` gaps against 1 `desktop_locked`.
+    fn desktop_is_locked(&mut self) -> bool;
+
     /// Whether an interactive desktop can provide meaningful capture content.
     fn interactive_capability(&mut self) -> InteractiveCapability;
 }
@@ -45,6 +61,13 @@ struct LiveWindowsOps;
 
 #[async_trait]
 impl WindowsSampleOps for LiveWindowsOps {
+    fn desktop_is_locked(&mut self) -> bool {
+        // `None` means the state could not be determined, which must not be
+        // read as either answer - defaulting to "locked" would stop capture on
+        // a healthy machine.
+        screenpipe_screen::session_is_locked().unwrap_or(false)
+    }
+
     fn interactive_capability(&mut self) -> InteractiveCapability {
         screenpipe_screen::probe_interactive_capability()
     }
@@ -141,6 +164,16 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
         // no production caller at all, so a locked workstation surfaced as
         // `capture_unavailable` - the same code as a dead capture device.
         //
+        // Two things went wrong with that. The run loop's gap ceiling, which
+        // exists so a broken WGC path cannot spin until logoff, could not tell
+        // an overnight lock from a real fault and would fire on the lock. And
+        // the seam runbook had no durable evidence that a lock had happened at
+        // all, so seam 2 could only be verified by watching a pid.
+        if self.ops.desktop_is_locked() {
+            self.next_sleep = Some(RETRY_CADENCE);
+            return Ok(SampleRead::Gap(CaptureGap::DesktopLocked));
+        }
+
         // Only the explicit lock reason takes the never-abort path. The other
         // unavailable reasons describe absent capture capacity, not a normal
         // locked desktop, and remain ordinary capture gaps for restart policy.
@@ -168,8 +201,12 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
                 // Asking again after the failure closes the window: if the
                 // desktop has gone by the time capture failed, the lock is the
                 // explanation, not a fault.
-                let gap = capture_gap_for_interactive_capability(self.ops.interactive_capability())
-                    .unwrap_or(CaptureGap::CaptureUnavailable);
+                let gap = if self.ops.desktop_is_locked() {
+                    CaptureGap::DesktopLocked
+                } else {
+                    capture_gap_for_interactive_capability(self.ops.interactive_capability())
+                        .unwrap_or(CaptureGap::CaptureUnavailable)
+                };
                 return Ok(SampleRead::Gap(gap));
             }
         };
@@ -240,7 +277,20 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
             metadata.app_key.to_ascii_lowercase().as_str(),
             "chrome.exe" | "msedge.exe"
         ) {
-            self.ops.browser_url(&metadata).await.unwrap_or(None)
+            match self.ops.browser_url(&metadata).await {
+                Ok(url) => url,
+                Err(_) => {
+                    // A URL is optional metadata, never a capture precondition:
+                    // this must not gap, must not retry, and must not change
+                    // cadence. It must not vanish either. `unwrap_or(None)`
+                    // made a run that had silently lost every browser URL
+                    // externally indistinguishable from one where no page had
+                    // one, which is the same class of defect as the run loop
+                    // discarding its errors with no category.
+                    eprintln!("{}", BROWSER_URL_BOUNDARY_UNAVAILABLE);
+                    None
+                }
+            }
         } else {
             None
         };
@@ -328,8 +378,8 @@ mod tests {
         ocr: VecDeque<Result<String>>,
         input_idle: VecDeque<Result<Duration>>,
         browser_urls: VecDeque<Result<Option<String>>>,
-        interactive_desktop: bool,
-        desktop_answers: VecDeque<InteractiveCapability>,
+        desktop_locked: bool,
+        capability_answers: VecDeque<InteractiveCapability>,
     }
 
     impl TestOps {
@@ -348,8 +398,8 @@ mod tests {
                 ocr: ocr.into_iter().collect(),
                 input_idle: input_idle.into_iter().collect(),
                 browser_urls: browser_urls.into_iter().collect(),
-                interactive_desktop: true,
-                desktop_answers: VecDeque::new(),
+                desktop_locked: false,
+                capability_answers: VecDeque::new(),
             }
         }
 
@@ -358,16 +408,12 @@ mod tests {
             mut self,
             answers: impl IntoIterator<Item = InteractiveCapability>,
         ) -> Self {
-            self.desktop_answers = answers.into_iter().collect();
+            self.capability_answers = answers.into_iter().collect();
             self
         }
 
         fn with_locked_desktop(mut self) -> Self {
-            self.desktop_answers = [InteractiveCapability::Unavailable(
-                NotInteractive::DesktopLocked,
-            )]
-            .into_iter()
-            .collect();
+            self.desktop_locked = true;
             self
         }
 
@@ -380,6 +426,10 @@ mod tests {
 
     #[async_trait]
     impl WindowsSampleOps for TestOps {
+        fn desktop_is_locked(&mut self) -> bool {
+            self.desktop_locked
+        }
+
         fn interactive_capability(&mut self) -> InteractiveCapability {
             // Every pre-existing test predates the desktop probe and asserts
             // behaviour that only happens on an unlocked desktop. Defaulting to
@@ -389,13 +439,9 @@ mod tests {
             // A queue rather than a flag, because the defect this models is
             // precisely that the answer CHANGES between the pre-capture probe
             // and the post-failure one.
-            self.desktop_answers
+            self.capability_answers
                 .pop_front()
-                .unwrap_or(if self.interactive_desktop {
-                    InteractiveCapability::Available
-                } else {
-                    InteractiveCapability::Unavailable(NotInteractive::DesktopLocked)
-                })
+                .unwrap_or(InteractiveCapability::Available)
         }
 
         async fn sleep(&mut self, duration: Duration) {
@@ -887,6 +933,17 @@ mod tests {
         );
         assert_eq!(second.browser_url, None);
         assert_eq!(harness.calls.lock().unwrap().browser_url, 2);
+    }
+
+    #[test]
+    fn the_browser_url_boundary_diagnostic_carries_only_a_fixed_category() {
+        // The line is printed on a path that has the URL, the window title and
+        // the app key in scope. Pinning its exact text is what stops any of
+        // them being interpolated into it later.
+        assert_eq!(
+            super::BROWSER_URL_BOUNDARY_UNAVAILABLE,
+            "event=browser_url_unavailable stage=boundary reason=reader_error"
+        );
     }
 
     #[tokio::test]

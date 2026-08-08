@@ -23,14 +23,18 @@ windows = { version = "0.58", features = [
     "Media_Ocr",
     "Storage_Streams",
     "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_RemoteDesktop",
 ] }
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 screenpipe-memory = { path = "../screenpipe-memory" }
 tokio = { version = "1", features = ["macros"] }
+trybuild = "1"

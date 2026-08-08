@@ -1,7 +1,7 @@
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
-    CadenceInput, CadenceRecord, CaptureGap, CaptureGapSummary, MergeConfig, MergeDecision,
-    MergeDecisionKind, Merger, ObservationSample, SplitReason, TextIdentity,
+    CadenceInput, CadenceRecord, CaptureGap, CaptureGapSummary, EventKind, MergeConfig,
+    MergeDecision, MergeDecisionKind, Merger, ObservationSample, SplitReason, TextIdentity,
 };
 
 trait TestIngest {
@@ -58,6 +58,7 @@ const TEST_IDLE_GAP_SECONDS: i64 = 30;
 
 fn merger() -> Merger {
     Merger::new(MergeConfig {
+        kind: EventKind::Screen,
         idle_gap: Duration::seconds(TEST_IDLE_GAP_SECONDS),
         scroll_overlap: 0.35,
     })
@@ -434,6 +435,7 @@ fn an_idle_window_sampled_at_max_backoff_keeps_merging() {
     // events and collapsing the merge ratio Goal 1 measures. The production
     // idle gap must stay strictly above the slowest cadence.
     let mut merger = Merger::new(MergeConfig {
+        kind: EventKind::Screen,
         idle_gap: Duration::seconds(screenpipe_memory::MAX_CADENCE_INTERVAL_SECONDS * 2),
         scroll_overlap: 0.35,
     });
@@ -477,6 +479,7 @@ fn a_long_lived_event_keeps_its_hash_ledger_bounded() {
     // The fixture must actually take the merge path, so each sample shares
     // most of its five-grams with the previous one and only the tail differs.
     let mut merger = Merger::new(MergeConfig {
+        kind: EventKind::Screen,
         idle_gap: Duration::seconds(120),
         scroll_overlap: 0.35,
     });
@@ -530,6 +533,7 @@ fn an_evicted_hash_no_longer_forces_a_merge() {
     // restores it, and this is the assertion that proves the bound has that
     // effect rather than merely capping memory.
     let mut merger = Merger::new(MergeConfig {
+        kind: EventKind::Screen,
         idle_gap: Duration::seconds(120),
         scroll_overlap: 0.35,
     });
@@ -570,4 +574,296 @@ fn event_of(decision: &MergeDecision) -> &screenpipe_memory::OpenEvent {
     match decision {
         MergeDecision::Start { event, .. } | MergeDecision::Merge { event } => event,
     }
+}
+
+#[test]
+fn an_unchanging_window_is_split_once_it_outlives_the_duration_ceiling() {
+    // Every other split test in this file describes a CHANGE - of app, of
+    // idleness, of text. An event whose app never changes, whose window never
+    // goes idle and whose text keeps matching answers none of them and merges
+    // for the length of the run. A dashboard, a video player, a clock, a
+    // terminal tailing a log all behave exactly like this, so an unattended
+    // week produced one row spanning the week: a week-old screen in `ocr_text`,
+    // a duration that describes nothing, and a `sample_count` no reader can act
+    // on.
+    //
+    // The idle gap here is deliberately enormous, so the only thing that can
+    // end this event is the ceiling.
+    let ceiling = screenpipe_memory::MAX_EVENT_DURATION_SECONDS;
+    let mut merger = Merger::new(MergeConfig {
+        kind: EventKind::Screen,
+        idle_gap: Duration::seconds(ceiling * 10),
+        scroll_overlap: 0.35,
+    });
+    let unchanged = "a dashboard nobody is looking at";
+    merger.ingest(sample(0, "chrome.exe", "Dashboard", unchanged));
+
+    // One second inside the ceiling still merges: the bound must not fire early
+    // and fragment ordinary long sessions.
+    let inside = merged(merger.ingest(sample(ceiling - 1, "chrome.exe", "Dashboard", unchanged)));
+    assert_eq!(inside.sample_count, 2);
+    assert_eq!(inside.started_at, at(0));
+
+    let event = started(
+        merger.ingest(sample(ceiling, "chrome.exe", "Dashboard", unchanged)),
+        SplitReason::MaxDuration,
+    );
+
+    assert_eq!(event.started_at, at(ceiling));
+    assert_eq!(event.sample_count, 1);
+    assert!(
+        event.start_reason.is_forced(),
+        "a ceiling boundary must be distinguishable from an observed change"
+    );
+}
+
+#[test]
+fn an_unchanging_window_is_split_once_it_outgrows_the_sample_ceiling() {
+    // The duration ceiling is measured on the wall clock, and the wall clock is
+    // not something an unattended recorder can rely on: a suspend/resume, an
+    // NTP correction, or a VM restored from a snapshot all leave it unreachable
+    // while samples keep arriving. Every sample here shares one timestamp, so
+    // the duration is permanently zero and only the sample ceiling can end the
+    // event - which is exactly the frozen-clock case.
+    let ceiling = screenpipe_memory::MAX_EVENT_SAMPLES;
+    let mut merger = Merger::new(MergeConfig {
+        kind: EventKind::Screen,
+        idle_gap: Duration::seconds(30),
+        scroll_overlap: 0.35,
+    });
+    let unchanged = "the same screen, and a clock that stopped";
+
+    merger.ingest(sample(0, "code.exe", "Frozen", unchanged));
+    for index in 1..ceiling {
+        let event = merged(merger.ingest(sample(0, "code.exe", "Frozen", unchanged)));
+        assert_eq!(
+            event.sample_count,
+            index + 1,
+            "the fixture stopped merging, so it no longer reaches the ceiling"
+        );
+    }
+
+    let event = started(
+        merger.ingest(sample(0, "code.exe", "Frozen", unchanged)),
+        SplitReason::MaxSamples,
+    );
+
+    assert_eq!(event.sample_count, 1);
+    assert!(event.start_reason.is_forced());
+}
+
+#[test]
+fn a_forced_boundary_never_outranks_an_observed_one() {
+    // The ceilings are consulted last on purpose. If they ran first, an event
+    // that reached the ceiling in the same sample that changed app would be
+    // recorded as `max_duration` - blaming the recorder's own bound for a real
+    // change of activity, and hiding the boundary a reader actually wants.
+    let ceiling = screenpipe_memory::MAX_EVENT_DURATION_SECONDS;
+    let mut merger = Merger::new(MergeConfig {
+        kind: EventKind::Screen,
+        idle_gap: Duration::seconds(ceiling * 10),
+        scroll_overlap: 0.35,
+    });
+    merger.ingest(sample(0, "chrome.exe", "Dashboard", "unchanged screen"));
+
+    let event = started(
+        merger.ingest(sample(ceiling, "notepad.exe", "notes", "something else")),
+        SplitReason::AppChange,
+    );
+
+    assert!(!event.start_reason.is_forced());
+}
+
+#[test]
+fn every_split_reason_has_its_own_durable_code() {
+    // These codes are written into `merge_meta.start_reason` and are the only
+    // thing a reader has to tell one boundary from another. Two reasons sharing
+    // a code is silent and durable.
+    let codes = [
+        SplitReason::Initial,
+        SplitReason::AppChange,
+        SplitReason::WindowTitleChange,
+        SplitReason::IdleGap,
+        SplitReason::TextHashChange,
+        SplitReason::MaxDuration,
+        SplitReason::MaxSamples,
+    ]
+    .map(SplitReason::as_code);
+
+    let mut unique = codes.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), codes.len(), "duplicate split reason code");
+    assert!(codes.iter().all(|code| !code.is_empty()));
+}
+
+// --- The clipboard contract ------------------------------------------------
+//
+// Same merger, same identifiers, same `merge_meta`; a different content test.
+// The tests below pin both halves of that: what the clipboard rule DOES merge,
+// and - the part that would otherwise rot silently - what it must not, because
+// the screen rule would.
+
+/// A clipboard capture as the channel actually produces one: text, and no app.
+///
+/// The empty app key is load-bearing. A clipboard capture is not attributed to
+/// an application, so nothing here can accidentally exercise the app-change
+/// split and pass for a content decision.
+fn clipboard_sample(second: i64, text: &str) -> ObservationSample {
+    ObservationSample {
+        captured_at: at(second),
+        app_key: String::new(),
+        app_title: "Clipboard".to_owned(),
+        window_title: String::new(),
+        ocr_text: text.to_owned(),
+        readable_text: text.to_owned(),
+        browser_url: None,
+    }
+}
+
+fn clipboard_merger() -> Merger {
+    Merger::new(MergeConfig {
+        kind: EventKind::Clipboard,
+        idle_gap: Duration::seconds(TEST_IDLE_GAP_SECONDS),
+        // Deliberately the production screen value. If the clipboard rule ever
+        // consults it, these tests must fail rather than quietly agree.
+        scroll_overlap: 0.35,
+    })
+}
+
+#[test]
+fn a_clipboard_event_records_its_kind_so_the_writer_cannot_mislabel_it() {
+    let event = started(
+        clipboard_merger().ingest(clipboard_sample(0, "the text that was copied")),
+        SplitReason::Initial,
+    );
+
+    assert_eq!(event.kind, EventKind::Clipboard);
+    assert_eq!(event.kind.as_code(), "clipboard");
+    assert_eq!(EventKind::Screen.as_code(), "screen");
+    assert_eq!(
+        event.merge_contract_version,
+        screenpipe_memory::MERGE_CONTRACT_VERSION
+    );
+}
+
+#[test]
+fn recopying_identical_text_merges_rather_than_opening_a_second_event() {
+    // The clipboard sequence number changes on every copy, including a copy of
+    // something already on the clipboard. Without this, hitting Ctrl-C twice -
+    // or any application that re-asserts its own clipboard content - writes a
+    // second row saying exactly what the first one said.
+    let mut merger = clipboard_merger();
+    started(
+        merger.ingest(clipboard_sample(0, "one two three four five")),
+        SplitReason::Initial,
+    );
+
+    let event = merged(merger.ingest(clipboard_sample(5, "one two three four five")));
+
+    assert_eq!(event.sample_count, 2);
+    assert_eq!(event.started_at, at(0));
+    assert_eq!(event.ended_at, at(5));
+}
+
+#[test]
+fn clipboard_text_identity_reuses_the_ocr_normalization() {
+    // Same pipeline as the screen path: NFKC, case folding, whitespace
+    // collapse. A re-copy that differs only in case or spacing is the same
+    // text, and the hash the event carries is the one that pipeline produces.
+    let mut merger = clipboard_merger();
+    let started_event = started(
+        merger.ingest(clipboard_sample(0, "Deploy The Release Notes")),
+        SplitReason::Initial,
+    );
+    assert_eq!(
+        started_event.latest_exact_ocr_hash,
+        TextIdentity::from_ocr("Deploy The Release Notes").exact_hash
+    );
+
+    let event = merged(merger.ingest(clipboard_sample(2, "  deploy the\trelease   notes ")));
+
+    assert_eq!(event.sample_count, 2);
+}
+
+#[test]
+fn different_clipboard_text_closes_the_open_event_and_opens_a_new_one() {
+    let mut merger = clipboard_merger();
+    started(
+        merger.ingest(clipboard_sample(0, "the first thing copied")),
+        SplitReason::Initial,
+    );
+
+    let event = started(
+        merger.ingest(clipboard_sample(2, "an entirely different thing")),
+        SplitReason::TextHashChange,
+    );
+
+    assert_eq!(event.started_at, at(2));
+    assert_eq!(event.sample_count, 1);
+}
+
+#[test]
+fn overlapping_clipboard_text_still_splits_because_a_copy_is_not_a_scroll() {
+    // The negative control for the whole kind. These two strings share every
+    // five-gram but the last, so the SCREEN rule would merge them on scroll
+    // overlap - they are the same material being scrolled past. Two clipboard
+    // entries are not: they are two separate copies of two different things,
+    // and merging them would silently lose the first one's text, since an
+    // event keeps only its latest sample.
+    let first = "the quick brown fox jumps over the lazy dog";
+    let second = "the quick brown fox jumps over the lazy cat";
+    let overlap = {
+        let left = TextIdentity::from_ocr(first);
+        let right = TextIdentity::from_ocr(second);
+        screenpipe_memory::jaccard_overlap(&left.five_grams, &right.five_grams)
+    };
+    assert!(
+        overlap >= 0.35,
+        "the fixture no longer overlaps enough to be merged by the screen rule \
+         ({overlap}), so it proves nothing about the clipboard rule"
+    );
+
+    let mut clipboard = clipboard_merger();
+    started(
+        clipboard.ingest(clipboard_sample(0, first)),
+        SplitReason::Initial,
+    );
+    let split = started(
+        clipboard.ingest(clipboard_sample(2, second)),
+        SplitReason::TextHashChange,
+    );
+    assert_eq!(split.latest.ocr_text, second);
+
+    // The same two texts on the screen path, to prove the difference is the
+    // rule and not the fixture.
+    let mut screen = merger();
+    screen.ingest(sample(0, "notepad.exe", "notes", first));
+    merged(screen.ingest(sample(2, "notepad.exe", "notes", second)));
+}
+
+#[test]
+fn a_clipboard_event_is_closed_by_the_shared_idle_gap() {
+    // The idle gap is not re-implemented for the clipboard: it is the same
+    // threshold, applied to the same delta, so a copy made after a long silence
+    // starts a new event even when it copies exactly what was there before.
+    let mut merger = clipboard_merger();
+    let text = "a link worth pasting twice";
+    started(
+        merger.ingest(clipboard_sample(0, text)),
+        SplitReason::Initial,
+    );
+
+    // Exactly at the threshold still merges - `> idle_gap` splits, and the
+    // boundary is shared with the screen contract above.
+    let at_threshold = merged(merger.ingest(clipboard_sample(TEST_IDLE_GAP_SECONDS, text)));
+    assert_eq!(at_threshold.sample_count, 2);
+
+    let event = started(
+        merger.ingest(clipboard_sample(TEST_IDLE_GAP_SECONDS * 2 + 1, text)),
+        SplitReason::IdleGap,
+    );
+
+    assert_eq!(event.sample_count, 1);
+    assert_eq!(event.started_at, at(TEST_IDLE_GAP_SECONDS * 2 + 1));
 }

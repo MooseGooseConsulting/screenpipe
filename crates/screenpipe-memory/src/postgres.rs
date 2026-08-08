@@ -364,7 +364,7 @@ impl PgEventWriter {
             "INSERT INTO events (\
                  id, machine_id, seq, kind, started_at, ended_at, app_id, window_title, \
                  ocr_text, readable_text, ocr_text_hash, sample_count, merge_meta, title\
-             ) VALUES ($1, $2, $3, 'screen', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             ) VALUES ($1, $2, $3, $14, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&event_id)
         .bind(machine_id)
@@ -379,9 +379,14 @@ impl PgEventWriter {
         .bind(sample_count)
         .bind(merge_meta)
         .bind(event_title(event))
+        // Bound from the event, not from the call site. Hardcoded, this was
+        // `'screen'` in the statement text, so a second kind of event could
+        // reach PostgreSQL only by adding a second INSERT - and every clipboard
+        // row would have claimed to be a screenshot until someone noticed.
+        .bind(event.kind.as_code())
         .execute(&mut *transaction)
         .await
-        .context("insert allocated screen event")?;
+        .context("insert allocated event")?;
         transaction.commit().await.context("commit event start")?;
         Ok(event_id)
     }
@@ -411,7 +416,7 @@ impl PgEventWriter {
         .bind(self.machine_id)
         .execute(&mut *transaction)
         .await
-        .context("update merged screen event")?;
+        .context("update merged event")?;
         ensure!(
             result.rows_affected() == 1,
             "event merge target was not found"
@@ -518,11 +523,22 @@ impl EventSink for PgEventWriter {
     }
 }
 
+/// The `apps` row this event belongs to, or `None` when it belongs to none.
+///
+/// An event without an app key gets `app_id IS NULL` rather than an `apps` row
+/// keyed on the empty string. `events.app_id` is nullable and its index is
+/// partial on `app_id IS NOT NULL`, so the schema was already built for a row
+/// that is not attributable to an application - a clipboard capture is exactly
+/// that, and a `('')` app row would have joined every one of them together
+/// under an application that does not exist.
 async fn upsert_app(
     transaction: &mut Transaction<'_, Postgres>,
     machine_id: i64,
     event: &OpenEvent,
-) -> Result<i64> {
+) -> Result<Option<i64>> {
+    if event.latest.app_key.trim().is_empty() {
+        return Ok(None);
+    }
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO apps (machine_id, app_key, app_title, first_seen_at, last_seen_at) \
          VALUES ($1, $2, $3, $4, $4) \
@@ -536,6 +552,7 @@ async fn upsert_app(
     .bind(event.latest.captured_at)
     .fetch_one(&mut **transaction)
     .await
+    .map(Some)
     .context("upsert event application")
 }
 
@@ -713,16 +730,30 @@ impl PgEventWriter {
         let terms = query.trim();
         let ranked = !terms.is_empty();
 
+        // `text_source` intentionally follows every `search_tsv` input in the
+        // same order: a result's presentation must not omit the field that
+        // satisfied its FTS predicate. The literal-match branch below bounds
+        // the displayed input around that match; stemming and other nonliteral
+        // matches keep the complete domain so `ts_headline` can still find it.
         let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>, i32, Option<String>, Option<String>, Option<String>, String)>(
             "SELECT e.id, e.started_at, e.ended_at, e.sample_count, e.title, a.app_title, \
                     e.merge_meta ->> 'browser_url', \
                     CASE WHEN $4 THEN \
                         ts_headline('english', \
-                                    coalesce(nullif(e.readable_text, ''), e.ocr_text), \
+                                    CASE WHEN strpos(lower(text_source.value), lower($1)) > 0 THEN \
+                                        substring(text_source.value FROM greatest(1, strpos(lower(text_source.value), lower($1)) - 512) FOR 2048) \
+                                    ELSE text_source.value END, \
                                     plainto_tsquery('english', $1), \
                                     'StartSel=[, StopSel=], MaxFragments=2, FragmentDelimiter= ... , MaxWords=18, MinWords=6') \
-                    ELSE left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 160) END \
+                    ELSE left(text_source.value, 160) END \
              FROM events e \
+             CROSS JOIN LATERAL (SELECT concat_ws(E'\\n', \
+                 nullif(e.title, ''), \
+                 nullif(e.caption, ''), \
+                 nullif(e.readable_text, ''), \
+                 nullif(e.ocr_text, ''), \
+                 nullif(e.window_title, '') \
+             ) AS value) text_source \
              LEFT JOIN apps a ON a.id = e.app_id \
              WHERE e.machine_id = $2 \
                AND (NOT $4 OR e.search_tsv @@ plainto_tsquery('english', $1)) \

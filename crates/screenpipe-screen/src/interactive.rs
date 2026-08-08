@@ -129,6 +129,90 @@ pub fn probe_interactive_capability() -> InteractiveCapability {
     InteractiveCapability::Available
 }
 
+/// Whether the console session is locked, per the Terminal Services API.
+///
+/// # Why this exists when a lock probe already did
+///
+/// `probe_interactive_capability` reported `Available` on a demonstrably
+/// locked workstation. Measured on this machine, with the screen locked:
+///
+/// ```text
+/// OpenInputDesktop(DESKTOP_SWITCHDESKTOP) -> 2192      (non-null: "not locked")
+/// GetForegroundWindow                     -> 263026    (non-null: "not locked")
+/// ```
+///
+/// Both signals answer for a process sitting on the Default desktop even while
+/// the input desktop is Winlogon, so neither can see the lock. The consequence
+/// in production was 78 `capture_unavailable` gaps against 1 `desktop_locked`
+/// during a real lock - a locked laptop reported as broken capture hardware.
+///
+/// `WTSQuerySessionInformationW(WTSSessionInfoEx)` does see it. Same machine,
+/// same moment: `SessionFlags = 0`, which is `WTS_SESSIONSTATE_LOCK`. The
+/// offsets were confirmed against the same call by checking that
+/// `WTSINFOEX_LEVEL1.SessionId` matched the process's own session.
+///
+/// Returns `None` when the state cannot be determined, which callers must
+/// treat as "no opinion" rather than as either answer.
+#[cfg(windows)]
+pub fn session_is_locked() -> Option<bool> {
+    use windows::Win32::System::RemoteDesktop::{
+        WTS_CURRENT_SERVER_HANDLE, WTSFreeMemory, WTSQuerySessionInformationW, WTSSessionInfoEx,
+    };
+
+    /// `WTS_SESSIONSTATE_LOCK`. Microsoft documents this pair as reversed on
+    /// Windows Server 2008 R2 and Windows 7; this code targets Windows 10 and
+    /// later, where 0 means locked - confirmed empirically against a real lock.
+    const WTS_SESSIONSTATE_LOCK: i32 = 0;
+
+    let mut session_id = 0_u32;
+    let resolved = unsafe {
+        windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+            windows::Win32::System::Threading::GetCurrentProcessId(),
+            &mut session_id,
+        )
+    };
+    if resolved.is_err() {
+        return None;
+    }
+
+    let mut buffer = windows::core::PWSTR::null();
+    let mut returned = 0_u32;
+    let queried = unsafe {
+        WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSSessionInfoEx,
+            &mut buffer,
+            &mut returned,
+        )
+    };
+    if queried.is_err() || buffer.is_null() {
+        return None;
+    }
+
+    // WTSINFOEXW on x64: Level at 0, four bytes of padding, then
+    // WTSINFOEX_LEVEL1_W { SessionId at 8, SessionState at 12, SessionFlags at
+    // 16 }. Refuse to read the flag unless the buffer is big enough AND the
+    // session id it reports is the one we asked about - that pair is what
+    // proves the offsets rather than assuming them.
+    let mut locked = None;
+    if returned as usize >= 20 {
+        let base = buffer.0 as *const u8;
+        let reported_session = unsafe { std::ptr::read_unaligned(base.add(8) as *const u32) };
+        if reported_session == session_id {
+            let flags = unsafe { std::ptr::read_unaligned(base.add(16) as *const i32) };
+            locked = Some(flags == WTS_SESSIONSTATE_LOCK);
+        }
+    }
+    unsafe { WTSFreeMemory(buffer.0.cast()) };
+    locked
+}
+
+#[cfg(not(windows))]
+pub fn session_is_locked() -> Option<bool> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InteractiveCapability, NotInteractive, probe_interactive_capability};

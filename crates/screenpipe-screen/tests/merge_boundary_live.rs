@@ -208,6 +208,7 @@ async fn merge_boundary_lands_exactly_where_the_window_actually_changed() {
     let _foreground = lock_foreground();
 
     let mut merger = Merger::new(MergeConfig {
+        kind: screenpipe_memory::EventKind::Screen,
         // Comfortably above the real capture interval so no idle-gap split can
         // be mistaken for a content boundary.
         idle_gap: chrono::Duration::seconds(600),

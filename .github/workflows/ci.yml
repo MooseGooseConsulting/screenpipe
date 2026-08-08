@@ -85,8 +85,12 @@ jobs:
       # Two classes of test are deliberately excluded here, and each is
       # excluded for a reason that a hosted runner cannot satisfy:
       #
-      #   postgres_writer  needs a live PostgreSQL 18 server and an injected
-      #                    SCREEN_MEMORY_DATABASE_URL.
+      #   postgres_writer  needs a live PostgreSQL 18 server and a
+      #                    SCREEN_MEMORY_TEST_DATABASE_URL naming a disposable
+      #                    `_test` database. Unset, it skips rather than fails,
+      #                    so listing it here would report `ok` for a suite
+      #                    that asserted nothing - the same invisible-skip lie
+      #                    the live-desktop probe below exists to avoid.
       #   the live-desktop targets (capture_content, merge_boundary_live,
       #                    foreground_capture, browser_url_live, windows_ocr,
       #                    wgc_timeout_ab) need an unlocked interactive

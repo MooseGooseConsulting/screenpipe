@@ -4,16 +4,18 @@ use anyhow::{Context, Result, ensure};
 use chrono::Duration;
 use clap::{Parser, Subcommand};
 use screenpipe_memory::{
-    EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventReader, PgEventWriter, RunOutcome,
-    Runner, SampleSource,
+    EventKind, EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventReader, PgEventWriter,
+    RunOutcome, Runner, SampleSource,
 };
 use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
 use crate::service::{ServiceManager, ServiceRoot, ServiceStatus, WindowsTaskScheduler};
 
+mod clipboard_source;
 mod service;
 mod windows_source;
 
+use crate::clipboard_source::ClipboardSampleSource;
 use crate::windows_source::WindowsSampleSource;
 
 const DATABASE_URL_ENV: &str = "SCREEN_MEMORY_DATABASE_URL";
@@ -38,6 +40,11 @@ enum Command {
         machine_slug: String,
         #[arg(long, default_value = DEFAULT_DISPLAY_NAME)]
         display_name: String,
+        /// Turn the clipboard channel off. It is ON by default: copied text is
+        /// recorded as events of kind `clipboard`, except from applications
+        /// that mark their clipboard content as excluded, which are never read.
+        #[arg(long)]
+        no_clipboard: bool,
     },
     /// Check capture, OCR, and PostgreSQL prerequisites.
     Doctor {
@@ -84,9 +91,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             machine_slug,
             display_name,
+            no_clipboard,
         } => {
             let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
-            run_capture(&database_url, &machine_slug, &display_name).await
+            run_capture(&database_url, &machine_slug, &display_name, !no_clipboard).await
         }
         Command::Doctor {
             machine_slug,
@@ -207,7 +215,7 @@ async fn run_search(
         if request.query.trim().is_empty() {
             println!("nothing recorded in that window");
         } else {
-            println!("no matches for {:?}", request.query);
+            println!("no matches for {:?}", terminal_safe_text(&request.query));
         }
         return Ok(());
     }
@@ -219,6 +227,7 @@ async fn run_search(
             .as_deref()
             .or(hit.app_title.as_deref())
             .unwrap_or("(untitled)");
+        let label = terminal_safe_text(label);
         println!(
             "{}  {}  ({} samples, {} min)",
             hit.started_at
@@ -229,17 +238,32 @@ async fn run_search(
             minutes.max(0)
         );
         if let Some(url) = hit.browser_url.as_deref() {
-            println!("    {url}");
+            println!("    {}", terminal_safe_text(url));
         }
-        let snippet = hit.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+        let snippet = terminal_safe_text(&hit.snippet)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         if !snippet.is_empty() {
             println!("    {snippet}");
         }
-        println!("    {}", hit.event_id);
+        println!("    {}", terminal_safe_text(hit.event_id.as_str()));
         println!();
     }
     println!("{} match(es)", hits.len());
     Ok(())
+}
+
+/// Remove control characters before rendering database or CLI content locally.
+///
+/// Search results are intentionally displayed to the local operator, but a
+/// captured title, URL, or snippet must not be able to inject terminal escape
+/// sequences, cursor movement, or additional output lines.
+fn terminal_safe_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect()
 }
 
 fn required_database_url(value: Option<OsString>) -> Result<String> {
@@ -259,6 +283,21 @@ const IDLE_GAP_SECONDS: i64 = MAX_CADENCE_INTERVAL_SECONDS * 2;
 
 fn default_runner() -> Runner {
     Runner::new(MergeConfig {
+        kind: EventKind::Screen,
+        idle_gap: Duration::seconds(IDLE_GAP_SECONDS),
+        scroll_overlap: 0.35,
+    })
+}
+
+/// The clipboard channel's merger.
+///
+/// The same idle gap as the screen channel, on purpose: it is one threshold
+/// describing one thing - how long a silence has to be before what comes after
+/// it is a new activity rather than a continuation. `scroll_overlap` is
+/// carried but never consulted for this kind; a copy is not a scroll.
+fn clipboard_runner() -> Runner {
+    Runner::new(MergeConfig {
+        kind: EventKind::Clipboard,
         idle_gap: Duration::seconds(IDLE_GAP_SECONDS),
         scroll_overlap: 0.35,
     })
@@ -272,14 +311,34 @@ async fn run_iteration(
     runner.run_once(source, sink).await
 }
 
-async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str) -> Result<()> {
-    let writer = PgEventWriter::connect(database_url, machine_slug, display_name).await?;
+async fn run_capture(
+    database_url: &str,
+    machine_slug: &str,
+    display_name: &str,
+    clipboard: bool,
+) -> Result<()> {
+    let writer = std::sync::Arc::new(
+        PgEventWriter::connect(database_url, machine_slug, display_name).await?,
+    );
     let mut source = WindowsSampleSource::new();
     let mut runner = default_runner();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut consecutive_failures: u32 = 0;
     let mut consecutive_gaps: u32 = 0;
+    // Its own task, and NOT a third arm of the select below. The select's
+    // losing branches are dropped, so a clipboard arm would cancel a capture
+    // that was mid-flight - throwing away the frame, the OCR pass, and the
+    // observation - every time a copy happened to land first.
+    let _clipboard = clipboard.then(|| {
+        println!("event=clipboard_channel state=on");
+        TaskGuard(tokio::spawn(run_clipboard_channel(std::sync::Arc::clone(
+            &writer,
+        ))))
+    });
+    if !clipboard {
+        println!("event=clipboard_channel state=off");
+    }
     println!("event=runtime_ready machine_slug={machine_slug}");
 
     loop {
@@ -289,73 +348,134 @@ async fn run_capture(database_url: &str, machine_slug: &str, display_name: &str)
                 println!("event=shutdown reason=ctrl_c");
                 return Ok(());
             }
-            outcome = run_iteration(&mut runner, &mut source, &writer) => {
-                match outcome {
-                    Ok(outcome) => {
-                        print_run_outcome(&outcome);
-                        let kind = match &outcome {
-                            RunOutcome::GapRecorded {
-                                gap: screenpipe_memory::CaptureGap::DesktopLocked,
-                            } => IterationKind::DesktopLocked,
-                            RunOutcome::GapRecorded { .. } => IterationKind::Gap,
-                            _ => IterationKind::Persisted,
-                        };
-                        match next_step(kind, &mut consecutive_failures, &mut consecutive_gaps) {
-                            LoopStep::Continue => {}
-                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
-                            LoopStep::AbortGaps => {
-                                return Err(anyhow::anyhow!(
-                                    "aborting after {MAX_CONSECUTIVE_GAPS} consecutive capture gaps"
-                                ));
-                            }
-                            LoopStep::AbortFailures => unreachable!("no failure was recorded"),
-                        }
-                    }
-                    Err(error) => {
-                        // `Runner::run_once` deliberately RETAINS the
-                        // unpersisted observation and the gap counters when a
-                        // sink write fails, so the caller can retry the exact
-                        // sample. Propagating with `?` here threw that away and
-                        // ended the whole run on the first transient PostgreSQL
-                        // blip - the single largest risk to an unattended
-                        // 24-hour capture.
-                        let step = next_step(
-                            IterationKind::Failure,
-                            &mut consecutive_failures,
-                            &mut consecutive_gaps,
-                        );
-                        let category = failure_category(&error);
-                        println!(
-                            "event=capture_error category={category} consecutive={consecutive_failures}"
-                        );
-                        match step {
-                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
-                            LoopStep::AbortFailures => {
-                                // Do not spin forever on a permanent fault.
-                                // Exiting hands off to the service wrapper's
-                                // restart loop, which re-runs preflight from a
-                                // clean process.
-                                //
-                                // The raw error is deliberately NOT propagated.
-                                // `main` returns `anyhow::Result`, so Rust's
-                                // Termination impl prints the whole `{:?}`
-                                // chain to stderr - and the service wrapper now
-                                // persists stderr to a dated log file that
-                                // `uninstall` preserves. The redaction that
-                                // `failure_category` exists to guarantee would
-                                // have been abandoned on the one path that
-                                // exits.
-                                return Err(anyhow::anyhow!(
-                                    "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive capture failures (category={category})"
-                                ));
-                            }
-                            LoopStep::Continue | LoopStep::AbortGaps => {
-                                unreachable!("a failure never yields a gap decision")
-                            }
-                        }
-                    }
+            step = record_one_observation(
+                &mut runner,
+                &mut source,
+                writer.as_ref(),
+                &mut consecutive_failures,
+                &mut consecutive_gaps,
+            ) => match step {
+                LoopStep::Continue => {}
+                LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                LoopStep::AbortGaps => {
+                    return Err(anyhow::anyhow!(
+                        "aborting after {MAX_CONSECUTIVE_GAPS} consecutive capture gaps"
+                    ));
                 }
+                LoopStep::AbortFailures(category) => {
+                    // Do not spin forever on a permanent fault. Exiting hands
+                    // off to the service wrapper's restart loop, which re-runs
+                    // preflight from a clean process.
+                    //
+                    // The raw error is deliberately NOT propagated. `main`
+                    // returns `anyhow::Result`, so Rust's Termination impl
+                    // prints the whole `{:?}` chain to stderr - and the service
+                    // wrapper persists stderr to a dated log file that
+                    // `uninstall` preserves. The redaction that
+                    // `failure_category` exists to guarantee would have been
+                    // abandoned on the one path that exits.
+                    return Err(anyhow::anyhow!(
+                        "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive capture failures (category={category})"
+                    ));
+                }
+            },
+        }
+    }
+}
+
+/// Stops the task it holds when the run loop leaves, whichever way it leaves.
+///
+/// `run_capture` returns from four places - a signal, two ceilings, and a `?`
+/// on the writer - and a background channel that outlived any one of them
+/// would keep writing events for a run that had already reported itself over.
+struct TaskGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The clipboard channel: its own runner, its own merger, the shared writer.
+///
+/// It has to be its own runner. A `Runner` holds exactly one open event, and
+/// interleaving clipboard captures into the screen runner would make every
+/// copy a boundary in the screen timeline and every screen sample a boundary
+/// in the clipboard timeline - the two kinds would tear each other apart.
+///
+/// # Why this never aborts the process
+///
+/// The screen loop exits on a run of failures so the service wrapper can
+/// restart it from a clean process. This does not: the clipboard is the
+/// secondary channel, and taking down a 24-hour screen recording because
+/// copied text could not be written would cost more than it saves. A failure
+/// here backs off and retries, and says so with the same redacted category the
+/// screen loop uses. Anything serious enough to be permanent - a dead
+/// PostgreSQL, a schema that no longer validates - fails on the screen path
+/// too, and that path does exit.
+async fn run_clipboard_channel(writer: std::sync::Arc<PgEventWriter>) {
+    let mut runner = clipboard_runner();
+    let mut source = ClipboardSampleSource::new();
+    let mut consecutive_failures: u32 = 0;
+
+    loop {
+        match run_iteration(&mut runner, &mut source, writer.as_ref()).await {
+            Ok(outcome) => {
+                print_run_outcome("clipboard", &outcome);
+                consecutive_failures = 0;
             }
+            Err(error) => {
+                let category = failure_category(&error);
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                println!(
+                    "event=clipboard_error category={category} consecutive={consecutive_failures}"
+                );
+                tokio::time::sleep(failure_backoff(consecutive_failures)).await;
+            }
+        }
+    }
+}
+
+/// One turn of the run loop: take an observation, log it, and decide what the
+/// loop does next.
+///
+/// The iteration's `Result` is consumed here and never handed back. That is the
+/// point. Inline in the `tokio::select!` arm, `outcome?` and the full retry arm
+/// were indistinguishable to every test in this crate, because nothing could
+/// call the arm - and `outcome?` is what shipped. It discarded the unpersisted
+/// observation and the gap counters that `Runner::run_once` deliberately
+/// RETAINS on a sink failure so the exact sample can be retried, and it ended
+/// the whole run on the first transient PostgreSQL blip. Returning `LoopStep`
+/// rather than `Result` makes that mistake unwritable rather than merely
+/// corrected.
+async fn record_one_observation(
+    runner: &mut Runner,
+    source: &mut dyn SampleSource,
+    sink: &dyn EventSink,
+    consecutive_failures: &mut u32,
+    consecutive_gaps: &mut u32,
+) -> LoopStep {
+    match run_iteration(runner, source, sink).await {
+        Ok(outcome) => {
+            print_run_outcome("screen", &outcome);
+            let kind = match &outcome {
+                RunOutcome::GapRecorded {
+                    gap: screenpipe_memory::CaptureGap::DesktopLocked,
+                } => IterationKind::DesktopLocked,
+                RunOutcome::GapRecorded { .. } => IterationKind::Gap,
+                _ => IterationKind::Persisted,
+            };
+            next_step(kind, consecutive_failures, consecutive_gaps)
+        }
+        Err(error) => {
+            let category = failure_category(&error);
+            let step = next_step(
+                IterationKind::Failure(category),
+                consecutive_failures,
+                consecutive_gaps,
+            );
+            println!("event=capture_error category={category} consecutive={consecutive_failures}");
+            step
         }
     }
 }
@@ -377,8 +497,10 @@ enum IterationKind {
     /// a normal night. Backs off, never aborts, and never touches either
     /// streak.
     DesktopLocked,
-    /// The iteration returned an error.
-    Failure,
+    /// The iteration returned an error, already reduced to its redacted
+    /// category. The category travels with the kind so the abort message can
+    /// name it without the error text ever reaching a log line.
+    Failure(&'static str),
 }
 
 /// What the run loop should do next.
@@ -387,7 +509,7 @@ enum LoopStep {
     Continue,
     Retry(std::time::Duration),
     AbortGaps,
-    AbortFailures,
+    AbortFailures(&'static str),
 }
 
 /// The restart policy, extracted from the loop so it can be driven directly.
@@ -426,10 +548,10 @@ fn next_step(
                 LoopStep::Retry(failure_backoff(*consecutive_gaps))
             }
         }
-        IterationKind::Failure => {
+        IterationKind::Failure(category) => {
             *consecutive_failures = consecutive_failures.saturating_add(1);
             if *consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                LoopStep::AbortFailures
+                LoopStep::AbortFailures(category)
             } else {
                 LoopStep::Retry(failure_backoff(*consecutive_failures))
             }
@@ -488,24 +610,48 @@ fn failure_category(error: &anyhow::Error) -> &'static str {
         "capture"
     } else if detail.contains("session") || detail.contains("desktop") {
         "session"
+    // Everything below was reaching the log as `other`, which is the category
+    // that says nothing. Twelve consecutive `category=other` lines were
+    // observed on this machine and told us nothing whatsoever about what was
+    // wrong - and `other` is exactly what someone would be reading at 3am if a
+    // 24-hour run started failing.
+    //
+    // These are not guesses. They are the only errors that can actually reach
+    // the run loop: capture, OCR and browser-URL failures are converted to
+    // typed gaps before they get there, so what remains is the clock, the
+    // cadence arithmetic, and the event-id bookkeeping.
+    } else if detail.contains("clock") {
+        "clock"
+    } else if detail.contains("cadence") || detail.contains("chrono range") {
+        "cadence"
+    } else if detail.contains("event id") {
+        "event_id"
+    } else if detail.contains("ctrl-c") || detail.contains("signal") {
+        "shutdown"
     } else {
         "other"
     }
 }
 
-fn print_run_outcome(outcome: &RunOutcome) {
+/// The agent log's record of one persisted observation.
+///
+/// `channel` is the event kind's code, so `screen_started` keeps meaning
+/// exactly what it meant - the service wrapper's log and the seam runbook both
+/// read that line - and clipboard events are distinguishable from it at a
+/// glance rather than by inspecting the id.
+fn print_run_outcome(channel: &str, outcome: &RunOutcome) {
     match outcome {
         RunOutcome::GapRecorded { gap } => {
             println!("event=capture_gap gap={}", gap.as_code());
         }
         RunOutcome::Started { event_id, reason } => {
             println!(
-                "event=screen_started event_id={event_id} reason={}",
+                "event={channel}_started event_id={event_id} reason={}",
                 reason.as_code()
             );
         }
         RunOutcome::Merged { event_id } => {
-            println!("event=screen_merged event_id={event_id}");
+            println!("event={channel}_merged event_id={event_id}");
         }
     }
 }
@@ -574,8 +720,8 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use clap::Parser;
     use screenpipe_memory::{
-        CadenceInput, CadenceRecord, EventId, EventSink, MergeConfig, ObservationSample, OpenEvent,
-        RunOutcome, Runner, SampleRead, SampleSource, SplitReason,
+        CadenceInput, CadenceRecord, EventId, EventKind, EventSink, MergeConfig, ObservationSample,
+        OpenEvent, RunOutcome, Runner, SampleRead, SampleSource, SplitReason,
     };
 
     use super::{Cli, Command, IDLE_GAP_SECONDS, run_iteration};
@@ -689,6 +835,102 @@ mod tests {
         }
     }
 
+    /// Fails the first durable write and accepts the second, recording what it
+    /// was handed each time.
+    #[derive(Default)]
+    struct FlakyStartSink {
+        events: Mutex<Vec<OpenEvent>>,
+    }
+
+    #[async_trait]
+    impl EventSink for FlakyStartSink {
+        async fn start(&self, event: &OpenEvent, _reason: SplitReason) -> Result<EventId> {
+            let mut events = self.events.lock().unwrap();
+            events.push(event.clone());
+            if events.len() == 1 {
+                return Err(anyhow::anyhow!("PostgreSQL pool timed out"));
+            }
+            EventId::try_from("icarus_1".to_owned())
+        }
+
+        async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> Result<()> {
+            unreachable!("a start that never succeeded cannot merge")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transient_write_failure_retries_the_exact_sample_instead_of_ending_the_run() {
+        // The defect this pins is not `next_step`, which was always testable -
+        // it is the loop body around it. `outcome?` sat inside a
+        // `tokio::select!` arm that no test could call, so the `?` and the full
+        // retry arm were indistinguishable to the whole suite. The `?` is what
+        // shipped: one transient PostgreSQL blip ended a 24-hour run and took
+        // the unpersisted observation `Runner::run_once` had deliberately
+        // retained with it.
+        //
+        // `record_one_observation` returns a LoopStep and never a Result, so
+        // there is no `?` left to write. The source below panics if asked for a
+        // second sample, which is what proves the retry re-presented the same
+        // observation rather than skipping it.
+        let captured_at = Utc.with_ymd_and_hms(2026, 8, 4, 12, 0, 0).single().unwrap();
+        let mut source = OneSample(Some(SampleRead::Sample {
+            sample: ObservationSample {
+                captured_at,
+                app_key: "notepad.exe".to_owned(),
+                app_title: "Notepad".to_owned(),
+                window_title: "Goal 1".to_owned(),
+                ocr_text: "an observation worth not losing".to_owned(),
+                readable_text: "an observation worth not losing".to_owned(),
+                browser_url: None,
+            },
+            cadence: CadenceRecord::from_input(CadenceInput {
+                input_idle: Duration::zero(),
+                frame_stable_for: Duration::zero(),
+                foreground_changed: false,
+                frame_changed: false,
+            }),
+        }));
+        let sink = FlakyStartSink::default();
+        let mut runner = super::default_runner();
+        let mut failures = 0;
+        let mut gaps = 0;
+
+        let first = super::record_one_observation(
+            &mut runner,
+            &mut source,
+            &sink,
+            &mut failures,
+            &mut gaps,
+        )
+        .await;
+        assert!(
+            matches!(first, super::LoopStep::Retry(_)),
+            "a transient write failure must back off and stay in the loop, got {first:?}"
+        );
+        assert_eq!(failures, 1);
+
+        let second = super::record_one_observation(
+            &mut runner,
+            &mut source,
+            &sink,
+            &mut failures,
+            &mut gaps,
+        )
+        .await;
+        assert_eq!(second, super::LoopStep::Continue);
+        assert_eq!(
+            failures, 0,
+            "a persisted observation must clear the failure streak"
+        );
+
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2, "the retry never reached the sink");
+        assert_eq!(
+            events[0], events[1],
+            "the retry must re-present the exact observation, not a later one"
+        );
+    }
+
     #[derive(Default)]
     struct RecordingSink {
         starts: Mutex<Vec<SplitReason>>,
@@ -707,17 +949,35 @@ mod tests {
     }
 
     #[test]
-    fn run_command_defaults_to_the_icarus_machine_identity() {
+    fn run_command_defaults_to_the_icarus_machine_identity_with_the_clipboard_on() {
         let cli = Cli::try_parse_from(["screenpipe", "run"]).unwrap();
         let Command::Run {
             machine_slug,
             display_name,
+            no_clipboard,
         } = cli.command
         else {
             panic!("run command expected");
         };
         assert_eq!(machine_slug, "icarus");
         assert_eq!(display_name, "Icarus-Laptop");
+        // The default is ON, and it is asserted here rather than only in the
+        // help text: the flag inverts, so a default that flipped would be
+        // invisible to anyone reading `--no-clipboard` and would silently stop
+        // recording a whole channel.
+        assert!(
+            !no_clipboard,
+            "the clipboard channel must be on unless it is turned off"
+        );
+    }
+
+    #[test]
+    fn the_clipboard_channel_can_be_turned_off() {
+        let cli = Cli::try_parse_from(["screenpipe", "run", "--no-clipboard"]).unwrap();
+        let Command::Run { no_clipboard, .. } = cli.command else {
+            panic!("run command expected");
+        };
+        assert!(no_clipboard);
     }
 
     #[test]
@@ -766,6 +1026,7 @@ mod tests {
         }));
         let sink = RecordingSink::default();
         let mut runner = Runner::new(MergeConfig {
+            kind: EventKind::Screen,
             idle_gap: Duration::seconds(30),
             scroll_overlap: 0.35,
         });
@@ -987,6 +1248,13 @@ mod tests {
     }
 
     #[test]
+    fn search_terminal_output_removes_c0_c1_and_escape_controls() {
+        let raw = "visible\u{0000}\u{001b}[31m\u{007f}\u{009b}tail";
+
+        assert_eq!(super::terminal_safe_text(raw), "visible[31mtail");
+    }
+
+    #[test]
     fn a_locked_desktop_never_reaches_the_gap_ceiling() {
         use super::{IterationKind, LoopStep, next_step};
 
@@ -1035,8 +1303,8 @@ mod tests {
         // producing gaps would never reach its ceiling either.
         let mut failures = 0;
         let mut gaps = 0;
-        next_step(IterationKind::Failure, &mut failures, &mut gaps);
-        next_step(IterationKind::Failure, &mut failures, &mut gaps);
+        next_step(IterationKind::Failure("postgres"), &mut failures, &mut gaps);
+        next_step(IterationKind::Failure("postgres"), &mut failures, &mut gaps);
         assert_eq!(failures, 2);
 
         next_step(IterationKind::Gap, &mut failures, &mut gaps);
@@ -1058,14 +1326,57 @@ mod tests {
         let mut gaps = 0;
         for _ in 1..super::MAX_CONSECUTIVE_FAILURES {
             assert!(matches!(
-                next_step(IterationKind::Failure, &mut failures, &mut gaps),
+                next_step(IterationKind::Failure("postgres"), &mut failures, &mut gaps),
                 LoopStep::Retry(_)
             ));
         }
+        // The category survives to the abort, which is the only line the
+        // wrapper's log keeps once the process is gone.
         assert_eq!(
-            next_step(IterationKind::Failure, &mut failures, &mut gaps),
-            LoopStep::AbortFailures
+            next_step(IterationKind::Failure("postgres"), &mut failures, &mut gaps),
+            LoopStep::AbortFailures("postgres")
         );
+    }
+
+    #[test]
+    fn every_error_the_run_loop_can_see_has_a_category_of_its_own() {
+        use super::failure_category;
+
+        // `other` is the category that says nothing, and twelve consecutive
+        // `category=other` lines were observed on this machine telling us
+        // nothing about what was wrong. Capture, OCR and browser-URL failures
+        // never reach the loop - they become typed gaps first - so this list is
+        // the complete set of errors that CAN, taken from the `.context()`
+        // strings on those paths.
+        let cases = [
+            (anyhow::anyhow!("monotonic clock moved backwards"), "clock"),
+            (
+                anyhow::anyhow!("cadence interval must be nonnegative and in range"),
+                "cadence",
+            ),
+            (
+                anyhow::anyhow!("input-idle duration exceeds chrono range"),
+                "cadence",
+            ),
+            (
+                anyhow::anyhow!("frame-stability duration exceeds chrono range"),
+                "cadence",
+            ),
+            (
+                anyhow::anyhow!("merger produced merge without a durable event id"),
+                "event_id",
+            ),
+            (anyhow::anyhow!("listen for Ctrl-C"), "shutdown"),
+        ];
+
+        for (error, expected) in cases {
+            let actual = failure_category(&error);
+            assert_eq!(
+                actual, expected,
+                "{error:#} was categorised {actual}, which tells an operator nothing"
+            );
+            assert_ne!(actual, "other", "{error:#} fell through to `other`");
+        }
     }
 
     #[test]

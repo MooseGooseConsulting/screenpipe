@@ -1,6 +1,6 @@
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
-    CadenceInput, CadenceRecord, CaptureGapSummary, MergeConfig, MergeDecision, Merger,
+    CadenceInput, CadenceRecord, CaptureGapSummary, EventKind, MergeConfig, MergeDecision, Merger,
     ObservationSample, SampleRead,
 };
 
@@ -32,6 +32,7 @@ fn cadence() -> CadenceRecord {
 
 fn decision_with_sensitive_sample() -> MergeDecision {
     Merger::new(MergeConfig {
+        kind: EventKind::Screen,
         idle_gap: Duration::seconds(30),
         scroll_overlap: 0.35,
     })

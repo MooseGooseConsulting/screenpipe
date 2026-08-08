@@ -1,28 +1,19 @@
 use screenpipe_screen::{
-    BrowserUrlReader, ForegroundMetadata, UiaElementSnapshot, select_address_bar,
+    BrowserUrlReader, ForegroundMetadata, UiaElementSnapshot, select_browser_url,
 };
 use url::Url;
 
+const DOCUMENT_CONTROL: i32 = 50_030;
 const EDIT_CONTROL: i32 = 50_004;
-const BUTTON_CONTROL: i32 = 50_000;
+const GROUP_CONTROL: i32 = 50_026;
 
-fn button() -> UiaElementSnapshot {
+/// The browser's own top-level document node: the only thing whose UIA value is
+/// the committed URL.
+fn top_level_document(value: Option<&str>) -> UiaElementSnapshot {
     UiaElementSnapshot {
-        control_type: BUTTON_CONTROL,
-        name: "Reload this page".to_owned(),
-        automation_id: "reload-button".to_owned(),
-        value: None,
-        is_enabled: true,
-        is_offscreen: false,
-        has_document_ancestor: false,
-    }
-}
-
-fn address_bar(value: Option<&str>) -> UiaElementSnapshot {
-    UiaElementSnapshot {
-        control_type: EDIT_CONTROL,
-        name: "Address and search bar".to_owned(),
-        automation_id: "view_1022".to_owned(),
+        control_type: DOCUMENT_CONTROL,
+        name: "Example page".to_owned(),
+        automation_id: "RootWebArea".to_owned(),
         value: value.map(str::to_owned),
         is_enabled: true,
         is_offscreen: false,
@@ -30,10 +21,12 @@ fn address_bar(value: Option<&str>) -> UiaElementSnapshot {
     }
 }
 
-fn page_input(name: &str, automation_id: &str, value: &str) -> UiaElementSnapshot {
+/// A node living under a page document. Anything shaped like this is page
+/// content, whatever it calls itself.
+fn under_page_document(control_type: i32, automation_id: &str, value: &str) -> UiaElementSnapshot {
     UiaElementSnapshot {
-        control_type: EDIT_CONTROL,
-        name: name.to_owned(),
+        control_type,
+        name: "Page content".to_owned(),
         automation_id: automation_id.to_owned(),
         value: Some(value.to_owned()),
         is_enabled: true,
@@ -42,225 +35,186 @@ fn page_input(name: &str, automation_id: &str, value: &str) -> UiaElementSnapsho
     }
 }
 
-/// An enabled, on-screen Edit that lives in the browser *chrome* rather than
-/// under a page Document, and whose value is a perfectly parseable https URL.
-/// Only the trusted-identity check can reject one of these.
-fn chrome_edit(name: &str, automation_id: &str, value: &str) -> UiaElementSnapshot {
-    UiaElementSnapshot {
-        control_type: EDIT_CONTROL,
-        name: name.to_owned(),
-        automation_id: automation_id.to_owned(),
-        value: Some(value.to_owned()),
-        is_enabled: true,
-        is_offscreen: false,
-        has_document_ancestor: false,
-    }
-}
-
 #[test]
-fn rejects_url_valued_browser_chrome_edits_that_are_not_the_address_bar() {
-    // Every fixture that was previously expected to be rejected came from
-    // `page_input`, which hardcodes `has_document_ancestor: true` - so the
-    // document guard rejected them before the identity check ever ran, and
-    // `looks_like_address_bar` could be deleted outright with the whole suite
-    // green. In production that would report any URL-valued Edit in the
-    // browser chrome as the page URL: find-in-page with a pasted link, the
-    // bookmark-edit URL field, DevTools' network filter, an extension popup.
-    //
-    // The identity check is an AND of automation id and name, so each decoy
-    // below independently pins one half of it.
-    let decoys = [
-        (
-            "neither half matches",
-            chrome_edit("Find", "find-bar-textfield", "https://leaked.test/find"),
-        ),
-        (
-            "name matches but the automation id does not",
-            chrome_edit(
-                "Address and search bar",
-                "toolbar-omnibox-shim",
-                "https://leaked.test/name-only",
-            ),
-        ),
-        (
-            "automation id matches but the name does not",
-            chrome_edit("Bookmark URL", "view_1022", "https://leaked.test/id-only"),
-        ),
-    ];
-
-    for (description, decoy) in decoys {
+fn selects_the_top_level_document_url_for_chrome_and_edge() {
+    // The whole point of the migration: this fixture is what a browser sitting
+    // on an ordinary page publishes in steady state, with nobody touching the
+    // omnibox. The retired path returned nothing here, because the omnibox's
+    // displayed text has had its scheme elided since Chromium M69.
+    for app_key in ["chrome.exe", "CHROME.EXE", "msedge.exe", "MsEdge.exe"] {
         assert_eq!(
-            select_address_bar("chrome.exe", std::slice::from_ref(&decoy)),
-            None,
-            "a chrome edit where {description} must never be reported as the page URL"
+            select_browser_url(
+                app_key,
+                &[top_level_document(Some("https://example.test/page?q=1"))],
+            ),
+            Some(Url::parse("https://example.test/page?q=1").unwrap()),
+            "{app_key}"
         );
     }
 }
 
 #[test]
-fn prefers_the_trusted_address_bar_over_an_earlier_url_valued_chrome_edit() {
-    // Ordering matters: `find_map` takes the first element that passes every
-    // guard. A decoy placed before the real address bar proves the identity
-    // check is what discriminates, not position.
+fn rejects_a_page_node_impersonating_the_document_automation_id() {
+    // A page author controls the HTML `id` attribute, and Chromium derives a
+    // node's automation id from it. A page that names an element
+    // `RootWebArea` - even one Chromium exposes as a Document, which ARIA
+    // `role="document"` does not - is still page content, and its provenance
+    // is what says so.
+    let impersonators = [
+        (
+            "a Document-typed page node",
+            under_page_document(DOCUMENT_CONTROL, "RootWebArea", "https://leaked.test/page"),
+        ),
+        (
+            "an ARIA role=document group",
+            under_page_document(GROUP_CONTROL, "RootWebArea", "https://leaked.test/aria"),
+        ),
+        (
+            "a page input claiming the id",
+            under_page_document(EDIT_CONTROL, "RootWebArea", "https://leaked.test/input"),
+        ),
+    ];
+
+    for (description, impersonator) in impersonators {
+        assert_eq!(
+            select_browser_url("chrome.exe", std::slice::from_ref(&impersonator)),
+            None,
+            "{description} must never be reported as the page URL"
+        );
+    }
+}
+
+#[test]
+fn rejects_nodes_that_miss_either_half_of_the_document_identity() {
+    // The identity is an AND of control type and automation id, so each decoy
+    // independently pins one half. Every one of these sits OUTSIDE any
+    // document, so only the identity check can reject it.
+    let decoys = [
+        (
+            "the control type is not Document",
+            UiaElementSnapshot {
+                control_type: EDIT_CONTROL,
+                value: Some("https://leaked.test/edit".to_owned()),
+                ..top_level_document(None)
+            },
+        ),
+        (
+            "the automation id is not the Chromium constant",
+            UiaElementSnapshot {
+                automation_id: "view_1012".to_owned(),
+                value: Some("https://leaked.test/omnibox".to_owned()),
+                ..top_level_document(None)
+            },
+        ),
+        (
+            "the automation id differs only in case",
+            UiaElementSnapshot {
+                automation_id: "rootwebarea".to_owned(),
+                value: Some("https://leaked.test/case".to_owned()),
+                ..top_level_document(None)
+            },
+        ),
+    ];
+
+    for (description, decoy) in decoys {
+        assert_eq!(
+            select_browser_url("chrome.exe", std::slice::from_ref(&decoy)),
+            None,
+            "a node where {description} must never be reported as the page URL"
+        );
+    }
+}
+
+#[test]
+fn two_top_level_documents_yield_absent_rather_than_a_guess() {
+    // Edge split-screen, a docked DevTools window, and side panels each publish
+    // their own top-level document. Nothing in the tree says which one the user
+    // is looking at, and a browser event carrying the wrong URL is worse than
+    // one carrying none.
     let elements = vec![
-        chrome_edit("Find", "find-bar-textfield", "https://leaked.test/find"),
-        address_bar(Some("https://example.test/real-page")),
+        top_level_document(Some("https://left.example.test/pane")),
+        top_level_document(Some("https://right.example.test/pane")),
+    ];
+
+    assert_eq!(select_browser_url("msedge.exe", &elements), None);
+}
+
+#[test]
+fn an_offscreen_document_is_not_the_focused_tab() {
+    // A background tab's document stays in the tree and keeps its URL.
+    let elements = vec![
+        UiaElementSnapshot {
+            is_offscreen: true,
+            ..top_level_document(Some("https://background.example.test/tab"))
+        },
+        top_level_document(Some("https://foreground.example.test/tab")),
     ];
 
     assert_eq!(
-        select_address_bar("chrome.exe", &elements),
+        select_browser_url("chrome.exe", &elements).map(|url| url.host_str().unwrap().to_owned()),
+        Some("foreground.example.test".to_owned())
+    );
+}
+
+#[test]
+fn a_nested_frame_document_never_wins_over_the_top_level_one() {
+    // Out-of-process iframe roots are themselves `kRootWebArea` and carry the
+    // same automation id. Only provenance separates them, and the ordering here
+    // proves it is provenance rather than position: the frame comes first.
+    let elements = vec![
+        under_page_document(
+            DOCUMENT_CONTROL,
+            "RootWebArea",
+            "https://ads.example.test/iframe",
+        ),
+        top_level_document(Some("https://example.test/real-page")),
+    ];
+
+    assert_eq!(
+        select_browser_url("chrome.exe", &elements),
         Some(Url::parse("https://example.test/real-page").unwrap())
     );
 }
 
 #[test]
-fn selects_the_enabled_visible_chrome_address_bar() {
-    let elements = vec![
-        button(),
-        address_bar(Some("https://example.test/chrome?q=1")),
-    ];
+fn ignores_document_snapshots_for_non_browsers() {
+    let elements = vec![top_level_document(Some("https://example.test"))];
 
-    assert_eq!(
-        select_address_bar("CHROME.EXE", &elements),
-        Some(Url::parse("https://example.test/chrome?q=1").unwrap())
-    );
+    assert_eq!(select_browser_url("notepad.exe", &elements), None);
 }
 
 #[test]
-fn selects_the_current_chrome_address_bar_automation_id() {
-    let mut current_chrome_address_bar =
-        address_bar(Some("https://github.com/MooseGooseConsulting/screenpipe"));
-    current_chrome_address_bar.automation_id = "view_1012".to_owned();
-
-    assert_eq!(
-        select_address_bar("chrome.exe", &[current_chrome_address_bar]),
-        Some(Url::parse("https://github.com/MooseGooseConsulting/screenpipe").unwrap())
-    );
+fn rejects_every_non_http_scheme_a_browser_actually_shows() {
+    // These are real top-level documents with real values. Refusing them is a
+    // policy decision, not a parse failure: a memory index has no use for the
+    // inspector's own URL, and `file://` is a local path.
+    for value in [
+        "devtools://devtools/bundled/inspector.html",
+        "chrome://settings/privacy",
+        "edge://settings/privacy",
+        "chrome-extension://abcdefghijklmnop/options.html",
+        "file:///C:/private.txt",
+        "about:blank",
+    ] {
+        assert_eq!(
+            select_browser_url("chrome.exe", &[top_level_document(Some(value))]),
+            None,
+            "{value} must not be recorded as a browser URL"
+        );
+    }
 }
 
 #[test]
-fn selects_the_enabled_visible_edge_address_bar() {
-    let elements = vec![
-        UiaElementSnapshot {
-            control_type: EDIT_CONTROL,
-            name: "Search".to_owned(),
-            automation_id: "toolbar-search".to_owned(),
-            value: Some("not a URL".to_owned()),
-            is_enabled: true,
-            is_offscreen: false,
-            has_document_ancestor: false,
-        },
-        address_bar(Some("https://github.com/MooseGooseConsulting/screenpipe")),
-    ];
-
-    assert_eq!(
-        select_address_bar("msedge.exe", &elements),
-        Some(Url::parse("https://github.com/MooseGooseConsulting/screenpipe").unwrap())
-    );
-}
-
-#[test]
-fn skips_url_looking_page_inputs_before_the_browser_address_bar() {
-    let elements = vec![
-        page_input(
-            "Email address",
-            "email-address",
-            "https://accounts.example.test/private-profile",
-        ),
-        page_input(
-            "Delivery destination",
-            "shipping-address",
-            "https://orders.example.test/private-order",
-        ),
-        page_input(
-            "Address and search bar",
-            "page-location",
-            "https://search.example.test/private-search",
-        ),
-        address_bar(Some("https://example.test/safe-browser-location")),
-    ];
-
-    assert_eq!(
-        select_address_bar("chrome.exe", &elements).map(|url| url.path().to_owned()),
-        Some("/safe-browser-location".to_owned())
-    );
-}
-
-#[test]
-fn rejects_page_inputs_with_address_like_names_and_identifiers() {
-    let elements = vec![
-        page_input(
-            "Email address",
-            "customer-email",
-            "https://accounts.example.test/private-profile",
-        ),
-        page_input(
-            "Shipping destination",
-            "shipping-address",
-            "https://orders.example.test/private-order",
-        ),
-        page_input(
-            "Address and search bar for profile",
-            "profile-location",
-            "https://profile.example.test/private-profile",
-        ),
-        page_input(
-            "Address and search bar",
-            "page-location",
-            "https://search.example.test/private-search",
-        ),
-    ];
-
-    assert!(select_address_bar("msedge.exe", &elements).is_none());
-}
-
-#[test]
-fn rejects_an_exact_address_bar_collision_under_page_document() {
-    let exact_collision = page_input(
-        "Address and search bar",
-        "view_1022",
-        "https://page.example.test/private-page-value",
-    );
-
-    assert!(select_address_bar("chrome.exe", &[exact_collision]).is_none());
-}
-
-#[test]
-fn ignores_address_bar_snapshots_for_non_browsers() {
-    let elements = vec![address_bar(Some("https://example.test"))];
-
-    assert_eq!(select_address_bar("notepad.exe", &elements), None);
-}
-
-#[test]
-fn rejects_a_disabled_or_offscreen_address_bar() {
-    let mut disabled = address_bar(Some("https://example.test/disabled"));
-    disabled.is_enabled = false;
-    let mut offscreen = address_bar(Some("https://example.test/offscreen"));
-    offscreen.is_offscreen = true;
-
-    assert_eq!(
-        select_address_bar("chrome.exe", &[disabled, offscreen]),
-        None
-    );
-}
-
-#[test]
-fn rejects_malformed_and_non_http_address_values() {
-    let malformed = address_bar(Some("not a URL"));
-    let file_url = address_bar(Some("file:///C:/private.txt"));
-
-    assert_eq!(
-        select_address_bar("chrome.exe", &[malformed, file_url]),
-        None
-    );
-}
-
-#[test]
-fn returns_none_when_a_browser_has_no_address_bar_value() {
-    let elements = vec![button(), address_bar(None)];
-
-    assert_eq!(select_address_bar("msedge.exe", &elements), None);
+fn returns_none_when_the_document_has_no_readable_value() {
+    // Tier 3 of the ladder. Absent is legal - the event carries app and window
+    // title only - and must never be papered over by reconstructing a scheme.
+    for value in [None, Some(""), Some("   "), Some("example.test/elided")] {
+        assert_eq!(
+            select_browser_url("msedge.exe", &[top_level_document(value)]),
+            None,
+            "{value:?} must not become a URL"
+        );
+    }
 }
 
 #[test]
@@ -299,7 +253,7 @@ fn reader_treats_a_stale_browser_window_as_optional_metadata() {
 fn snapshot_debug_output_redacts_the_uia_value() {
     let page_value =
         "https://accounts.example.test/UIA_PAGE_VALUE_SECRET_66d9?token=UIA_QUERY_SECRET_a4e1";
-    let snapshot = page_input("Email address", "email-address", page_value);
+    let snapshot = under_page_document(EDIT_CONTROL, "email-address", page_value);
     let debug = format!("{snapshot:?}");
 
     assert!(!debug.contains(page_value));

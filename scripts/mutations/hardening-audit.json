@@ -156,8 +156,8 @@
   {
     "id": "locked-desktop-probe-deleted",
     "file": "crates/screenpipe-cli/src/windows_source.rs",
-    "find": "        if let Some(gap) = capture_gap_for_interactive_capability(self.ops.interactive_capability())\n        {",
-    "replace": "        if let Some(gap) = None::<CaptureGap> {",
+    "find": "        if self.ops.desktop_is_locked() {",
+    "replace": "        if false {",
     "package": "screenpipe-cli",
     "claim": "a locked desktop is detected before capture is attempted"
   },
@@ -188,7 +188,7 @@
   {
     "id": "lock-transition-blamed-on-capture",
     "file": "crates/screenpipe-cli/src/windows_source.rs",
-    "find": "                let gap = capture_gap_for_interactive_capability(self.ops.interactive_capability())\n                    .unwrap_or(CaptureGap::CaptureUnavailable);",
+    "find": "                let gap = if self.ops.desktop_is_locked() {\n                    CaptureGap::DesktopLocked\n                } else {\n                    capture_gap_for_interactive_capability(self.ops.interactive_capability())\n                        .unwrap_or(CaptureGap::CaptureUnavailable)\n                };",
     "replace": "                let gap = CaptureGap::CaptureUnavailable;",
     "package": "screenpipe-cli",
     "claim": "a capture failure during a lock transition is attributed to the lock, not the capture device"
@@ -200,5 +200,21 @@
     "replace": ".unwrap_or(CaptureGap::DesktopLocked)",
     "package": "screenpipe-cli",
     "claim": "a genuine capture fault on a live desktop is not excused as a lock"
+  },
+  {
+    "id": "clock-and-cadence-errors-fall-through-to-other",
+    "file": "crates/screenpipe-cli/src/main.rs",
+    "find": "    } else if detail.contains(\"clock\") {\n        \"clock\"",
+    "replace": "    } else if false {\n        \"clock\"",
+    "package": "screenpipe-cli",
+    "claim": "every error the run loop can see has a category of its own, not `other`"
+  },
+  {
+    "id": "lock-detection-falls-back-to-the-broken-probe",
+    "file": "crates/screenpipe-cli/src/windows_source.rs",
+    "find": "        screenpipe_screen::session_is_locked().unwrap_or(false)",
+    "replace": "        !matches!(\n            screenpipe_screen::probe_interactive_capability(),\n            screenpipe_screen::InteractiveCapability::Available\n        )",
+    "package": "screenpipe-cli",
+    "claim": "lock detection uses the Terminal Services session flag, not the desktop probe that answers Available while locked"
   }
 ]
