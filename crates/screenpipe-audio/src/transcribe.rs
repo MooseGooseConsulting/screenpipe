@@ -305,8 +305,8 @@ fn is_credible_no_speech_probability(probability: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_TRANSCRIBABLE_SAMPLES, ModelPath, SegmentCandidate, Transcript, WhisperError,
-        transcript_from_segments,
+        MIN_TRANSCRIBABLE_SAMPLES, ModelPath, NO_SPEECH_CEILING, SegmentCandidate, Transcript,
+        WhisperError, transcript_from_segments,
     };
     use crate::capture::SAMPLE_RATE_HZ;
 
@@ -347,26 +347,36 @@ mod tests {
     }
 
     #[test]
-    fn invalid_no_speech_probability_is_dropped_at_segment_acceptance() {
-        let transcript = transcript_from_segments(
-            2,
-            [
-                SegmentCandidate {
-                    probability: f32::NAN,
-                    text: Ok("discarded".to_owned()),
-                },
-                SegmentCandidate {
-                    probability: 0.2,
-                    text: Ok("kept".to_owned()),
-                },
-            ],
-        );
+    fn segment_acceptance_enforces_the_complete_probability_boundary() {
+        let next_above_ceiling = f32::from_bits(NO_SPEECH_CEILING.to_bits() + 1);
+        let cases = [
+            ("zero", 0.0, true),
+            ("ceiling", NO_SPEECH_CEILING, true),
+            ("interior", 0.2, true),
+            ("above_ceiling", next_above_ceiling, false),
+            ("negative", -f32::EPSILON, false),
+            ("above_one", 1.0 + f32::EPSILON, false),
+            ("positive_infinity", f32::INFINITY, false),
+            ("negative_infinity", f32::NEG_INFINITY, false),
+            ("nan", f32::NAN, false),
+        ];
 
-        assert_eq!(transcript.text, "kept");
-        assert_eq!(transcript.raw, "kept");
-        assert_eq!(transcript.avg_no_speech_prob, Some(0.2));
-        assert_eq!(transcript.segments, 2);
-        assert_eq!(transcript.dropped_segments, 1);
+        for (category, probability, should_accept) in cases {
+            let transcript = transcript_from_segments(
+                1,
+                [SegmentCandidate {
+                    probability,
+                    text: Ok("fixed".to_owned()),
+                }],
+            );
+
+            assert_eq!(transcript.is_empty(), !should_accept, "category={category}");
+            assert_eq!(
+                transcript.dropped_segments == 0,
+                should_accept,
+                "category={category}"
+            );
+        }
     }
 
     #[test]
