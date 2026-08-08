@@ -1552,6 +1552,115 @@ fn clipboard_read(second: u32, text: &str) -> screenpipe_memory::SampleRead {
 }
 
 #[tokio::test]
+async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_discipline()
+-> Result<()> {
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let screen_id = writer
+            .write_start(
+                &event(0, "notepad.exe", "Notepad", "notes", "screen text", None),
+                SplitReason::Initial,
+            )
+            .await?;
+        let copied = "clipboard search fixture";
+        let mut runner = screenpipe_memory::Runner::new(screenpipe_memory::MergeConfig {
+            kind: EventKind::Clipboard,
+            idle_gap: Duration::seconds(60),
+            scroll_overlap: 0.35,
+        });
+        let mut source = ScriptedSource(
+            [
+                clipboard_read(1, copied),
+                clipboard_read(3, copied),
+                clipboard_read(5, "different clipboard fixture"),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let first = runner.run_once(&mut source, &writer).await?;
+        let merged = runner.run_once(&mut source, &writer).await?;
+        let second = runner.run_once(&mut source, &writer).await?;
+        let (first_id, second_id) = match (&first, &merged, &second) {
+            (
+                screenpipe_memory::RunOutcome::Started {
+                    event_id: first_id,
+                    reason: SplitReason::Initial,
+                },
+                screenpipe_memory::RunOutcome::Merged {
+                    event_id: merged_id,
+                },
+                screenpipe_memory::RunOutcome::Started {
+                    event_id: second_id,
+                    reason: SplitReason::TextHashChange,
+                },
+            ) if merged_id == first_id => (first_id.clone(), second_id.clone()),
+            other => anyhow::bail!("clipboard channel produced {other:?}"),
+        };
+        ensure!(
+            (screen_id.as_str(), first_id.as_str(), second_id.as_str())
+                == ("icarus_1", "icarus_2", "icarus_3")
+        );
+        let row = sqlx::query(
+            "SELECT kind, started_at, ended_at, ocr_text, readable_text, ocr_text_hash, \
+                    sample_count, app_id, window_title, title, merge_meta \
+             FROM events WHERE id = $1",
+        )
+        .bind(&first_id)
+        .fetch_one(&db.pool)
+        .await?;
+        ensure!(row.try_get::<String, _>("kind")? == "clipboard");
+        ensure!(row.try_get::<chrono::DateTime<Utc>, _>("started_at")? == at(1));
+        ensure!(row.try_get::<chrono::DateTime<Utc>, _>("ended_at")? == at(3));
+        ensure!(row.try_get::<i32, _>("sample_count")? == 2);
+        ensure!(row.try_get::<String, _>("ocr_text")? == copied);
+        ensure!(row.try_get::<String, _>("readable_text")? == copied);
+        ensure!(
+            row.try_get::<String, _>("ocr_text_hash")?
+                == screenpipe_memory::TextIdentity::from_ocr(copied).exact_hash
+        );
+        ensure!(row.try_get::<Option<i64>, _>("app_id")?.is_none());
+        ensure!(row.try_get::<String, _>("window_title")?.is_empty());
+        ensure!(row.try_get::<Option<String>, _>("title")? == Some("Clipboard".to_owned()));
+        let meta: Value = row.try_get("merge_meta")?;
+        ensure!(meta["merge_contract_version"] == json!(MERGE_CONTRACT_VERSION));
+        ensure!(meta["start_reason"] == json!("initial"));
+        ensure!(meta["last_decision"] == json!("merge"));
+        ensure!(meta["sample_count"] == json!(2));
+        let second_row = sqlx::query(
+            "SELECT kind, ocr_text, sample_count, merge_meta FROM events WHERE id = $1",
+        )
+        .bind(&second_id)
+        .fetch_one(&db.pool)
+        .await?;
+        ensure!(second_row.try_get::<String, _>("kind")? == "clipboard");
+        ensure!(second_row.try_get::<i32, _>("sample_count")? == 1);
+        ensure!(
+            second_row.try_get::<Value, _>("merge_meta")?["start_reason"]
+                == json!("text_hash_change")
+        );
+        let screen_kind: String = sqlx::query_scalar("SELECT kind FROM events WHERE id = $1")
+            .bind(&screen_id)
+            .fetch_one(&db.pool)
+            .await?;
+        ensure!(screen_kind == "screen");
+        let hits = writer
+            .search(&screenpipe_memory::SearchRequest {
+                query: "clipboard search".to_owned(),
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        ensure!(hits.iter().any(|hit| hit.event_id == first_id));
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
 async fn clipboard_timestamp_regressions_round_trip_as_distinct_valid_events() -> Result<()> {
     let Some(db) = TestDatabase::create().await? else {
         return Ok(());
