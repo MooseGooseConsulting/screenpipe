@@ -4,8 +4,8 @@ use anyhow::{Context, Result, ensure};
 use chrono::Duration;
 use clap::{Parser, Subcommand};
 use screenpipe_memory::{
-    EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventWriter, RunOutcome, Runner,
-    SampleSource,
+    EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventReader, PgEventWriter, RunOutcome,
+    Runner, SampleSource,
 };
 use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
@@ -51,6 +51,9 @@ enum Command {
         /// Words to look for. Ranked, not literal. May be omitted if --since
         /// or --until is given.
         query: Vec<String>,
+        /// Existing machine to read without creating or changing its identity.
+        #[arg(long, default_value = DEFAULT_MACHINE_SLUG)]
+        machine_slug: String,
         #[arg(long, default_value_t = 10)]
         limit: i64,
         /// Only events that were still going after this. Accepts `90m`, `4h`,
@@ -94,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Search {
             query,
+            machine_slug,
             limit,
             since,
             until,
@@ -105,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
                 since: since.as_deref().map(parse_when).transpose()?,
                 until: until.as_deref().map(parse_when).transpose()?,
             };
-            run_search(&database_url, &request).await
+            run_search(&database_url, &machine_slug, &request).await
         }
         Command::Service { action } => run_service_action(action),
     }
@@ -143,16 +147,37 @@ fn parse_when(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
         );
     }
     if let Some(rest) = raw.strip_suffix('m') {
+        ensure!(
+            !rest.starts_with('-'),
+            "relative times must not be negative"
+        );
         let minutes: i64 = rest.parse().context("minutes must be a whole number")?;
-        return Ok(chrono::Utc::now() - ChronoDuration::minutes(minutes));
+        let duration = ChronoDuration::try_minutes(minutes).context("minutes is too large")?;
+        return chrono::Utc::now()
+            .checked_sub_signed(duration)
+            .context("relative time is too large");
     }
     if let Some(rest) = raw.strip_suffix('h') {
+        ensure!(
+            !rest.starts_with('-'),
+            "relative times must not be negative"
+        );
         let hours: i64 = rest.parse().context("hours must be a whole number")?;
-        return Ok(chrono::Utc::now() - ChronoDuration::hours(hours));
+        let duration = ChronoDuration::try_hours(hours).context("hours is too large")?;
+        return chrono::Utc::now()
+            .checked_sub_signed(duration)
+            .context("relative time is too large");
     }
     if let Some(rest) = raw.strip_suffix('d') {
+        ensure!(
+            !rest.starts_with('-'),
+            "relative times must not be negative"
+        );
         let days: i64 = rest.parse().context("days must be a whole number")?;
-        return Ok(chrono::Utc::now() - ChronoDuration::days(days));
+        let duration = ChronoDuration::try_days(days).context("days is too large")?;
+        return chrono::Utc::now()
+            .checked_sub_signed(duration)
+            .context("relative time is too large");
     }
     let date = NaiveDate::parse_from_str(&raw, "%Y-%m-%d").with_context(|| {
         format!(
@@ -162,14 +187,13 @@ fn parse_when(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     local_midnight(date)
 }
 
-async fn run_search(database_url: &str, request: &screenpipe_memory::SearchRequest) -> Result<()> {
-    // Connects with the same writer used by `run`, so search is subject to the
-    // identical schema and server-version guards. A read path that accepts a
-    // database the writer would refuse could show results from a shape nothing
-    // else in this system agrees with.
-    let writer =
-        PgEventWriter::connect(database_url, DEFAULT_MACHINE_SLUG, DEFAULT_DISPLAY_NAME).await?;
-    let hits = writer.search(request).await?;
+async fn run_search(
+    database_url: &str,
+    machine_slug: &str,
+    request: &screenpipe_memory::SearchRequest,
+) -> Result<()> {
+    let reader = PgEventReader::connect(database_url, machine_slug).await?;
+    let hits = reader.search(request).await?;
 
     if hits.is_empty() {
         if request.query.trim().is_empty() {
@@ -688,6 +712,29 @@ mod tests {
         assert_eq!(display_name, "Icarus-Laptop");
     }
 
+    #[test]
+    fn search_command_scopes_reads_to_the_explicit_machine() {
+        let cli = Cli::try_parse_from([
+            "screenpipe",
+            "search",
+            "--machine-slug",
+            "laptop_b",
+            "release",
+        ])
+        .unwrap();
+        let Command::Search {
+            machine_slug,
+            query,
+            ..
+        } = cli.command
+        else {
+            panic!("search command expected");
+        };
+
+        assert_eq!(machine_slug, "laptop_b");
+        assert_eq!(query, ["release"]);
+    }
+
     #[tokio::test]
     async fn run_iteration_wires_a_sample_through_runner_and_sink() {
         let captured_at = Utc.with_ymd_and_hms(2026, 8, 4, 12, 0, 0).single().unwrap();
@@ -828,11 +875,13 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(today, expected);
+        let yesterday = parse_when("yesterday").unwrap();
         assert_eq!(
-            (today - parse_when("yesterday").unwrap()).num_hours(),
-            24,
-            "yesterday must be exactly one day before today"
+            yesterday.with_timezone(&Local).date_naive(),
+            today.with_timezone(&Local).date_naive().pred_opt().unwrap(),
+            "yesterday must select the preceding local calendar date, including across DST"
         );
+        assert!(yesterday < today, "yesterday must precede today");
 
         // Absolute dates.
         assert_eq!(
@@ -859,6 +908,36 @@ mod tests {
         );
         assert!(parse_when("").is_err());
         assert!(parse_when("4 hours").is_err());
+    }
+
+    #[test]
+    fn relative_time_rejects_a_leading_minus_instead_of_searching_the_future() {
+        use super::parse_when;
+
+        for value in ["-1m", "-4h", "-3d"] {
+            let error = parse_when(value).expect_err("{value} must not become a future window");
+            assert!(
+                format!("{error:#}").contains("must not be negative"),
+                "{value} returned the wrong error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_time_rejects_an_interval_that_chrono_cannot_represent() {
+        use super::parse_when;
+
+        for value in [
+            "9223372036854775807m",
+            "9223372036854775807h",
+            "9223372036854775807d",
+        ] {
+            let error = parse_when(value).expect_err("{value} must not panic or wrap");
+            assert!(
+                format!("{error:#}").contains("is too large"),
+                "{value} returned the wrong error: {error:#}"
+            );
+        }
     }
 
     #[test]

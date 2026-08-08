@@ -5,8 +5,7 @@ use anyhow::{Context, Result, ensure};
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
     CadenceInput, CadenceRecord, CaptureGapSummary, HashLedger, MERGE_CONTRACT_VERSION,
-    MINIMUM_SERVER_VERSION_NUM, MergeDecisionKind, ObservationSample, OpenEvent, PgEventWriter,
-    SplitReason,
+    MergeDecisionKind, ObservationSample, OpenEvent, PgEventReader, PgEventWriter, SplitReason,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -109,7 +108,7 @@ struct TestDatabase {
 const TEST_DATABASE_SUFFIX: &str = "_test";
 
 fn database_name(database_url: &str) -> Option<&str> {
-    let after_scheme = database_url.split("://").nth(1)?;
+    let after_scheme = database_url.split_once("://")?.1;
     let path = after_scheme.split_once('/')?.1;
     let name = path.split(['?', '#']).next()?;
     (!name.is_empty()).then_some(name)
@@ -931,73 +930,6 @@ async fn no_disposable_writer_schemas_remain() -> Result<()> {
 }
 
 #[tokio::test]
-async fn connect_refuses_an_unsupported_server_before_touching_it() -> Result<()> {
-    // The PostgreSQL 18 floor was moved into `connect` because `run_capture`
-    // never calls `preflight` - only `doctor` does - so the guard was
-    // unreachable on the one path that writes for 24 hours.
-    //
-    // That fix then survived a mutation deleting the call, because the version
-    // comes from `current_setting('server_version_num')`, a preset GUC no test
-    // can override: there was no way to present an old server without owning
-    // one. `connect_with_server_version` takes the number as a parameter for
-    // exactly this reason.
-    let db = TestDatabase::create().await?;
-    let test_result = async {
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&db.scoped_url)
-            .await
-            .context("connect a pool for the version guard")?;
-
-        // One below the floor. PostgreSQL 17.9 would report 170_009.
-        let rejected = PgEventWriter::connect_with_server_version(
-            pool.clone(),
-            MINIMUM_SERVER_VERSION_NUM - 1,
-            "icarus",
-            "Icarus-Laptop",
-        )
-        .await;
-        let error = rejected
-            .err()
-            .context("an unsupported server version must be refused")?;
-        ensure!(
-            format!("{error:#}").contains("PostgreSQL 18 or newer"),
-            "expected a version refusal, got: {error:#}"
-        );
-
-        // The refusal must land BEFORE any write. A guard that rejects after
-        // upserting the machine row has already touched a server it declared
-        // unsupported.
-        let machines: i64 = sqlx::query_scalar("SELECT count(*) FROM machines")
-            .fetch_one(&pool)
-            .await
-            .context("count machines after the refusal")?;
-        ensure!(
-            machines == 0,
-            "the writer wrote to an unsupported server before rejecting it: {machines} machine row(s)"
-        );
-
-        // Positive control: at the floor exactly, the same call must succeed.
-        // Without this the guard could reject everything and still pass.
-        let accepted = PgEventWriter::connect_with_server_version(
-            pool.clone(),
-            MINIMUM_SERVER_VERSION_NUM,
-            "icarus",
-            "Icarus-Laptop",
-        )
-        .await;
-        ensure!(
-            accepted.is_ok(),
-            "a server at the minimum supported version must be accepted: {:#}",
-            accepted.err().expect("checked is_ok")
-        );
-        Ok(())
-    }
-    .await;
-    db.finish(test_result).await
-}
-
-#[tokio::test]
 async fn search_finds_by_words_by_time_and_by_both() -> Result<()> {
     // The read path. Until it existed this system was write-only: it recorded
     // continuously and offered no way to ask it anything, which made every
@@ -1104,6 +1036,103 @@ async fn search_finds_by_words_by_time_and_by_both() -> Result<()> {
                 .await
                 .is_err(),
             "a blank query with no time window must be refused, not answered with everything"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn explicit_machine_search_connection_never_upserts_a_machine() -> Result<()> {
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        writer
+            .write_start(
+                &event(1, "notepad.exe", "Notepad", "notes", "searchable", None),
+                SplitReason::Initial,
+            )
+            .await?;
+        let before: (i64, String, i64) = sqlx::query_as(
+            "SELECT id, display_name, next_event_seq FROM machines WHERE slug = $1",
+        )
+        .bind("icarus")
+        .fetch_one(&db.pool)
+        .await?;
+
+        let reader = PgEventReader::connect(&db.scoped_url, "icarus").await?;
+        let hits = reader
+            .search(&screenpipe_memory::SearchRequest {
+                query: "searchable".to_owned(),
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        let after: (i64, String, i64) = sqlx::query_as(
+            "SELECT id, display_name, next_event_seq FROM machines WHERE slug = $1",
+        )
+        .bind("icarus")
+        .fetch_one(&db.pool)
+        .await?;
+
+        ensure!(
+            hits.len() == 1,
+            "the explicit machine reader did not return its recorded event"
+        );
+        ensure!(
+            before == after,
+            "search must not upsert or otherwise mutate the explicit machine: before={before:?} after={after:?}"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn writer_backfills_missing_titles_once_for_existing_events() -> Result<()> {
+    let db = TestDatabase::create().await?;
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let event_id = writer
+            .write_start(
+                &event(
+                    1,
+                    "notepad.exe",
+                    "  Notepad  Editor  ",
+                    "  project notes  ",
+                    "text",
+                    None,
+                ),
+                SplitReason::Initial,
+            )
+            .await?;
+        sqlx::query("UPDATE events SET title = NULL WHERE id = $1")
+            .bind(&event_id)
+            .execute(&db.pool)
+            .await?;
+
+        let _ = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let first: (Option<String>, String) =
+            sqlx::query_as("SELECT title, xmin::text FROM events WHERE id = $1")
+                .bind(&event_id)
+                .fetch_one(&db.pool)
+                .await?;
+        let _ = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let second: (Option<String>, String) =
+            sqlx::query_as("SELECT title, xmin::text FROM events WHERE id = $1")
+                .bind(&event_id)
+                .fetch_one(&db.pool)
+                .await?;
+
+        ensure!(
+            first.0 == Some("Notepad Editor - project notes".to_owned()),
+            "the title migration did not backfill the event: {first:?}"
+        );
+        ensure!(
+            first == second,
+            "a completed title migration must not rewrite rows: first={first:?} second={second:?}"
         );
         Ok(())
     }

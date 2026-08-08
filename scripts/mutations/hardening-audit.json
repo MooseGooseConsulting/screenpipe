@@ -112,12 +112,33 @@
     "claim": "the capture task has no execution time limit, so it survives past three days"
   },
   {
-    "id": "connect-skips-the-postgres-18-floor",
+    "id": "postgres-version-floor-is-bypassed",
     "file": "crates/screenpipe-memory/src/postgres.rs",
-    "find": "        ensure_supported_server_version(server_version_num)?;\n        validate_authoritative_schema(&pool).await?;\n        let machine_id",
-    "replace": "        let _ = server_version_num;\n        validate_authoritative_schema(&pool).await?;\n        let machine_id",
+    "find": "        server_version_num >= MINIMUM_SERVER_VERSION_NUM,",
+    "replace": "        true,",
     "package": "screenpipe-memory",
-    "claim": "the PostgreSQL 18 floor is enforced on the path that actually writes, not only in doctor"
+    "filter": "server_versions_below_postgres_18_are_rejected",
+    "claim": "the PostgreSQL 18 floor rejects unsupported server versions"
+  },
+  {
+    "id": "merge-contract-version-is-replaced",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "        \"merge_contract_version\": event.merge_contract_version,",
+    "replace": "        \"merge_contract_version\": 0,",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "filter": "starts_allocate_icarus_ids_and_persist_authoritative_event_fields",
+    "claim": "persisted merge metadata retains the event merge-contract version"
+  },
+  {
+    "id": "screen-start-title-bind-is-cleared",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "        .bind(merge_meta)\n        .bind(event_title(event))\n        .execute(&mut *transaction)",
+    "replace": "        .bind(merge_meta)\n        .bind(None::<String>)\n        .execute(&mut *transaction)",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "filter": "starts_allocate_icarus_ids_and_persist_authoritative_event_fields",
+    "claim": "the event-start title SQL bind persists the derived search title"
   },
   {
     "id": "upsert-app-freezes-last-seen-at",

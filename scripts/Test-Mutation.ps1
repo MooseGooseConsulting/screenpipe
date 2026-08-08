@@ -125,6 +125,7 @@ foreach ($mutation in $mutations) {
 
         $output = & cargo @cargoArgs 2>&1
         $exit = $LASTEXITCODE
+        $outputText = $output | Out-String
 
         # A mutation that does not compile is not evidence about the tests.
         # Match only genuine compiler diagnostics: cargo also prints a bare
@@ -142,13 +143,9 @@ foreach ($mutation in $mutations) {
         # produce under "no evidence either way", and
         # `idle-gap-margin-collapses-to-one-second` was reported UNAUDITED when
         # the test had in fact stopped the build.
-        $constAssertionFired = @($output | Where-Object {
-                $_ -match 'error\[E0080\]' -and $_ -match 'evaluation panicked'
-            }).Count -gt 0
+        $constAssertionFired = $outputText -match '(?s)error\[E0080\].*evaluation panicked'
 
-        $compileFailed = -not $constAssertionFired -and @($output | Where-Object {
-                $_ -match 'error\[E\d+\]' -or $_ -match 'could not compile'
-            }).Count -gt 0
+        $compileFailed = -not $constAssertionFired -and $outputText -match 'error\[E\d+\]|could not compile'
 
         # A KILL requires POSITIVE evidence that tests actually ran.
         #

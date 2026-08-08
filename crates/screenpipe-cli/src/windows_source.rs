@@ -1059,5 +1059,10 @@ mod tests {
             SampleRead::Gap(CaptureGap::CaptureUnavailable),
             "a genuine capture fault on a live desktop must not be excused as a lock"
         );
+        assert_ne!(
+            read,
+            SampleRead::Gap(CaptureGap::DesktopLocked),
+            "an available desktop and a locked desktop must remain distinct session gaps"
+        );
     }
 }
