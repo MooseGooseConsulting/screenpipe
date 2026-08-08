@@ -58,7 +58,7 @@ jobs:
         run: gitleaks detect --source . --no-git --redact --verbose --exit-code 1
 
   build:
-    name: Build and test (windows)
+    name: Build and test, non-audio (windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +80,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --exclude screenpipe-audio --all-targets
 
       # Two classes of test are deliberately excluded here, and each is
       # excluded for a reason that a hosted runner cannot satisfy:
@@ -104,6 +104,7 @@ jobs:
       - name: Test (deterministic targets)
         run: >
           cargo test --workspace
+          --exclude screenpipe-audio
           --lib --bins
           --test cadence
           --test merge_contract
@@ -115,3 +116,70 @@ jobs:
       - name: Verify the workspace stayed pruned
         shell: pwsh
         run: ./scripts/verify-pruned.ps1
+
+  audio:
+    name: Audio crate and CLI feature (windows, LLVM 18.1.8, Ninja 1.12.1)
+    runs-on: windows-latest
+    env:
+      LLVM_VERSION: 18.1.8
+      # SHA-256 values published in the matching Microsoft winget-pkgs
+      # manifests for these official GitHub release artifacts.
+      LLVM_SHA256: 94AF030060D88CC17E9F00EF1663EBDC1126B35E16BEBDFA1E807984B70ABD8F
+      NINJA_VERSION: 1.12.1
+      NINJA_SHA256: F550FEC705B6D6FF58F2DB3C374C2277A37691678D6ABA463ADCBB129108467A
+      LIBCLANG_PATH: C:\Program Files\LLVM\bin
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned LLVM and libclang
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-$env:LLVM_VERSION-win64.exe"
+          $uri = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
+          Invoke-WebRequest -Uri $uri -OutFile $installer
+          $actualSha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+          if (-not [string]::Equals($actualSha256, $env:LLVM_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "LLVM installer SHA-256 did not match the pinned value"
+          }
+          Start-Process -FilePath $installer -ArgumentList '/S' -Wait -WindowStyle Hidden
+          if (-not (Test-Path -LiteralPath (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
+            throw "LLVM $env:LLVM_VERSION did not install libclang.dll"
+          }
+          & (Join-Path $env:LIBCLANG_PATH 'clang.exe') --version
+
+      - name: Install pinned Ninja
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "ninja-$env:NINJA_VERSION-win.zip"
+          $installRoot = Join-Path $env:RUNNER_TOOL_CACHE "ninja\$env:NINJA_VERSION\x64"
+          $uri = "https://github.com/ninja-build/ninja/releases/download/v$env:NINJA_VERSION/ninja-win.zip"
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          if (-not [string]::Equals($actualSha256, $env:NINJA_SHA256, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Ninja archive SHA-256 did not match the pinned value"
+          }
+          New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+          Expand-Archive -LiteralPath $archive -DestinationPath $installRoot -Force
+          $ninja = Join-Path $installRoot 'ninja.exe'
+          $actualVersion = (& $ninja --version).Trim()
+          if ($actualVersion -ne $env:NINJA_VERSION) {
+            throw "expected Ninja $env:NINJA_VERSION, got $actualVersion"
+          }
+          $installRoot | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Output "Ninja $actualVersion is configured with CMAKE_GENERATOR=$env:CMAKE_GENERATOR"
+
+      - name: Install the pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test the audio crate
+        run: cargo test -p screenpipe-audio
+
+      - name: Check the CLI audio feature
+        run: cargo check -p screenpipe-cli --features audio

@@ -13,6 +13,99 @@ pub struct ObservationSample {
     pub browser_url: Option<String>,
 }
 
+/// Additive context for channels whose observation is more than an instant.
+///
+/// [`ObservationSample`] keeps its original public field shape so downstream
+/// struct literals remain source-compatible. New channels carry span and
+/// source facts beside that stable sample through this envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservationEnvelope {
+    sample: ObservationSample,
+    observed_until: DateTime<Utc>,
+    audio: Option<AudioMeta>,
+}
+
+impl ObservationEnvelope {
+    pub fn instant(sample: ObservationSample) -> Self {
+        let observed_until = sample.captured_at;
+        Self {
+            sample,
+            observed_until,
+            audio: None,
+        }
+    }
+
+    pub fn spanning(
+        sample: ObservationSample,
+        observed_until: DateTime<Utc>,
+        audio: AudioMeta,
+    ) -> Self {
+        Self {
+            sample,
+            observed_until,
+            audio: Some(audio),
+        }
+    }
+
+    pub fn sample(&self) -> &ObservationSample {
+        &self.sample
+    }
+
+    pub fn into_sample(self) -> ObservationSample {
+        self.sample
+    }
+
+    pub fn observed_until(&self) -> DateTime<Utc> {
+        self.observed_until
+    }
+
+    pub fn audio(&self) -> Option<&AudioMeta> {
+        self.audio.as_ref()
+    }
+}
+
+impl From<ObservationSample> for ObservationEnvelope {
+    fn from(sample: ObservationSample) -> Self {
+        Self::instant(sample)
+    }
+}
+
+/// What produced an audio observation, and how much to believe it.
+///
+/// This exists because none of it fits anywhere else: the transcript goes in
+/// the text columns and the channel is recoverable from `app_key`, but "which
+/// model said this, and did it think it was hearing speech at all" has no
+/// column and is the difference between a transcript worth reading and one the
+/// model invented over room tone.
+///
+/// Every field is a code or a model name. Nothing here is a device name, a
+/// path, or any part of what was said.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioMeta {
+    /// `system_audio` or `microphone`.
+    pub channel: &'static str,
+    /// `console` or `communications` - the Windows endpoint role, not a
+    /// device.
+    pub device_category: &'static str,
+    pub engine: &'static str,
+    /// The model file's stem, e.g. `ggml-base.en`. Never its path.
+    pub model: String,
+    pub vad_engine: &'static str,
+    pub vad_aggressiveness: &'static str,
+    /// The language the model was told to assume, if it was told one.
+    pub language: Option<String>,
+    /// Mean no-speech probability across the kept segments, in parts per
+    /// thousand.
+    ///
+    /// An integer rather than the `f32` whisper reports, so that
+    /// `ObservationSample` stays `Eq` - which the merger, the runner, and their
+    /// tests all rely on. Three digits is already more precision than a
+    /// confidence heuristic deserves.
+    pub avg_no_speech_permille: Option<u16>,
+    /// Why the utterance ended: `silence`, `max_length`, or `stream_closed`.
+    pub closed_by: &'static str,
+}
+
 impl fmt::Debug for ObservationSample {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
 
-use crate::{EventId, EventSink, OpenEvent, SplitReason};
+use crate::{AudioMeta, EventEnvelope, EventId, EventSink, OpenEvent, SplitReason};
 
 const REQUIRED_COLUMNS_SQL: &str = r#"
 WITH expected(table_name, column_name, type_name, not_null, generated) AS (
@@ -341,6 +341,24 @@ impl PgEventWriter {
     }
 
     pub async fn write_start(&self, event: &OpenEvent, reason: SplitReason) -> Result<String> {
+        self.write_start_with_audio(event, reason, None).await
+    }
+
+    pub async fn write_start_envelope(
+        &self,
+        envelope: &EventEnvelope,
+        reason: SplitReason,
+    ) -> Result<String> {
+        self.write_start_with_audio(envelope.event(), reason, envelope.audio())
+            .await
+    }
+
+    async fn write_start_with_audio(
+        &self,
+        event: &OpenEvent,
+        reason: SplitReason,
+        audio: Option<&AudioMeta>,
+    ) -> Result<String> {
         let sample_count = checked_sample_count(event)?;
         let mut transaction = self.pool.begin().await.context("begin event start")?;
         let (machine_id, slug, sequence) = sqlx::query_as::<_, (i64, String, i64)>(
@@ -359,7 +377,7 @@ impl PgEventWriter {
         );
         let app_id = upsert_app(&mut transaction, machine_id, event).await?;
         let event_id = format!("{slug}_{sequence}");
-        let merge_meta = merge_meta(event, reason);
+        let merge_meta = merge_meta(event, reason, audio);
         sqlx::query(
             "INSERT INTO events (\
                  id, machine_id, seq, kind, started_at, ended_at, app_id, window_title, \
@@ -392,10 +410,28 @@ impl PgEventWriter {
     }
 
     pub async fn write_merge(&self, event_id: &str, event: &OpenEvent) -> Result<()> {
+        self.write_merge_with_audio(event_id, event, None).await
+    }
+
+    pub async fn write_merge_envelope(
+        &self,
+        event_id: &str,
+        envelope: &EventEnvelope,
+    ) -> Result<()> {
+        self.write_merge_with_audio(event_id, envelope.event(), envelope.audio())
+            .await
+    }
+
+    async fn write_merge_with_audio(
+        &self,
+        event_id: &str,
+        event: &OpenEvent,
+        audio: Option<&AudioMeta>,
+    ) -> Result<()> {
         let sample_count = checked_sample_count(event)?;
         let mut transaction = self.pool.begin().await.context("begin event merge")?;
         let app_id = upsert_app(&mut transaction, self.machine_id, event).await?;
-        let merge_meta = merge_meta(event, event.start_reason);
+        let merge_meta = merge_meta(event, event.start_reason, audio);
         let result = sqlx::query(
             "UPDATE events SET \
                  ended_at = $1, app_id = $2, window_title = $3, ocr_text = $4, \
@@ -521,6 +557,14 @@ impl EventSink for PgEventWriter {
     async fn merge(&self, event_id: &str, event: &OpenEvent) -> Result<()> {
         self.write_merge(event_id, event).await
     }
+
+    async fn start_envelope(&self, event: &EventEnvelope, reason: SplitReason) -> Result<EventId> {
+        EventId::try_from(self.write_start_envelope(event, reason).await?)
+    }
+
+    async fn merge_envelope(&self, event_id: &str, event: &EventEnvelope) -> Result<()> {
+        self.write_merge_envelope(event_id, event).await
+    }
 }
 
 /// The `apps` row this event belongs to, or `None` when it belongs to none.
@@ -605,8 +649,8 @@ fn event_title(event: &OpenEvent) -> Option<String> {
     Some(joined.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
-    json!({
+fn merge_meta(event: &OpenEvent, start_reason: SplitReason, audio: Option<&AudioMeta>) -> Value {
+    let mut meta = json!({
         "merge_contract_version": event.merge_contract_version,
         "start_reason": start_reason.as_code(),
         "last_decision": event.last_decision.as_code(),
@@ -636,12 +680,42 @@ fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
             "desktop_locked": event.capture_gaps.desktop_locked,
         },
         "browser_url": event.latest.browser_url,
-    })
+    });
+
+    // Added rather than always present. A screen or clipboard row carrying
+    // `"audio": null` would be asserting something about a channel it has
+    // nothing to do with, and every reader of this JSONB would have to know to
+    // ignore it.
+    if let Some(audio) = audio {
+        meta["audio"] = json!({
+            "channel": audio.channel,
+            "device_category": audio.device_category,
+            "engine": audio.engine,
+            "model": audio.model,
+            "vad_engine": audio.vad_engine,
+            "vad_aggressiveness": audio.vad_aggressiveness,
+            "language": audio.language,
+            // Parts per thousand. See AudioMeta for why this is not the f32
+            // whisper reports.
+            "avg_no_speech_permille": audio.avg_no_speech_permille,
+            "closed_by": audio.closed_by,
+        });
+    }
+
+    meta
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MINIMUM_SERVER_VERSION_NUM, ensure_supported_server_version};
+    use chrono::{Duration, TimeZone, Utc};
+    use serde_json::json;
+
+    use super::{MINIMUM_SERVER_VERSION_NUM, ensure_supported_server_version, merge_meta};
+    use crate::{
+        AudioMeta, CadenceInput, CadenceRecord, CaptureGapSummary, EventEnvelope, EventKind,
+        HashLedger, MERGE_CONTRACT_VERSION, MergeDecisionKind, ObservationSample, OpenEvent,
+        SplitReason,
+    };
 
     #[test]
     fn server_versions_below_postgres_18_are_rejected() {
@@ -662,6 +736,71 @@ mod tests {
             ensure_supported_server_version(accepted)
                 .unwrap_or_else(|error| panic!("{accepted} must be accepted: {error:#}"));
         }
+    }
+
+    #[test]
+    fn event_envelope_audio_is_serialized_into_persistence_metadata() {
+        let captured_at = Utc.with_ymd_and_hms(2026, 8, 8, 12, 0, 0).unwrap();
+        let exact_hash = "fixed-test-hash".to_owned();
+        let event = OpenEvent {
+            kind: EventKind::Audio,
+            merge_contract_version: MERGE_CONTRACT_VERSION,
+            started_at: captured_at,
+            ended_at: captured_at + Duration::seconds(2),
+            latest: ObservationSample {
+                captured_at,
+                app_key: "audio:loopback".to_owned(),
+                app_title: "System Audio".to_owned(),
+                window_title: String::new(),
+                ocr_text: "fixed fixture".to_owned(),
+                readable_text: "fixed fixture".to_owned(),
+                browser_url: None,
+            },
+            merge_hash: "fixed-merge-hash".to_owned(),
+            latest_exact_ocr_hash: exact_hash.clone(),
+            start_reason: SplitReason::Initial,
+            last_decision: MergeDecisionKind::Start,
+            latest_cadence: CadenceRecord::from_input(CadenceInput {
+                input_idle: Duration::zero(),
+                frame_stable_for: Duration::zero(),
+                foreground_changed: false,
+                frame_changed: false,
+            }),
+            capture_gaps: CaptureGapSummary::default(),
+            sample_count: 1,
+            hash_counts: HashLedger::from_hashes([exact_hash]),
+        };
+        let envelope = EventEnvelope::with_audio(
+            event,
+            AudioMeta {
+                channel: "system_audio",
+                device_category: "communications",
+                engine: "whisper-rs",
+                model: "ggml-base.en".to_owned(),
+                vad_engine: "webrtc-vad",
+                vad_aggressiveness: "quality",
+                language: Some("en".to_owned()),
+                avg_no_speech_permille: Some(30),
+                closed_by: "silence",
+            },
+        );
+
+        let metadata = merge_meta(envelope.event(), SplitReason::Initial, envelope.audio());
+
+        assert_eq!(
+            metadata["audio"],
+            json!({
+                "channel": "system_audio",
+                "device_category": "communications",
+                "engine": "whisper-rs",
+                "model": "ggml-base.en",
+                "vad_engine": "webrtc-vad",
+                "vad_aggressiveness": "quality",
+                "language": "en",
+                "avg_no_speech_permille": 30,
+                "closed_by": "silence",
+            })
+        );
     }
 }
 

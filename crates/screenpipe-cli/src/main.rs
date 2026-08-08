@@ -11,16 +11,28 @@ use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
 use crate::service::{ServiceManager, ServiceRoot, ServiceStatus, WindowsTaskScheduler};
 
+#[cfg(feature = "audio")]
+mod audio_source;
 mod clipboard_source;
 mod service;
 mod windows_source;
 
 use crate::clipboard_source::ClipboardSampleSource;
+use crate::service::ServiceKind;
 use crate::windows_source::WindowsSampleSource;
 
 const DATABASE_URL_ENV: &str = "SCREEN_MEMORY_DATABASE_URL";
 const DEFAULT_MACHINE_SLUG: &str = "icarus";
 const DEFAULT_DISPLAY_NAME: &str = "Icarus-Laptop";
+
+/// Overrides where the whisper model is looked for.
+#[cfg(feature = "audio")]
+const WHISPER_MODEL_ENV: &str = "SCREEN_MEMORY_WHISPER_MODEL";
+
+/// Where the model lives if nothing says otherwise. Beside the service's own
+/// binaries, under the same runtime root everything else in this system uses.
+#[cfg(feature = "audio")]
+const DEFAULT_MODEL_RELATIVE: &str = r"screen-memory\models\ggml-base.en.bin";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -76,6 +88,19 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    /// Record and transcribe audio. OFF unless you run or install it.
+    ///
+    /// Nothing under here starts as a side effect of anything else: `run`
+    /// records only while it is in the foreground, and `service install`
+    /// registers a task of its own that `screenpipe service install` never
+    /// touches. Before enabling either, read
+    /// `docs/build/tracks/audio-channel.md` section 6 - this channel can record
+    /// other people, and whether that is lawful where you are is not something
+    /// this program can decide.
+    Audio {
+        #[command(subcommand)]
+        action: AudioAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -83,6 +108,58 @@ enum ServiceAction {
     Install,
     Uninstall,
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum AudioAction {
+    /// Capture, transcribe, and record until interrupted.
+    Run {
+        #[arg(long, default_value = DEFAULT_MACHINE_SLUG)]
+        machine_slug: String,
+        #[arg(long, default_value = DEFAULT_DISPLAY_NAME)]
+        display_name: String,
+        /// Record the microphone instead of system audio.
+        ///
+        /// A separate decision from enabling the channel, and a much larger
+        /// one: loopback hears what came out of the speakers, a microphone
+        /// hears the room and everyone in it.
+        #[arg(long)]
+        microphone: bool,
+        /// Path to a ggml whisper model. Defaults to
+        /// `%LOCALAPPDATA%\screen-memory\models\ggml-base.en.bin`, or
+        /// `SCREEN_MEMORY_WHISPER_MODEL` if that is set.
+        #[arg(long)]
+        model: Option<String>,
+        /// Voice-detection sensitivity: quality, low_bitrate, aggressive,
+        /// very_aggressive. Least aggressive by default.
+        #[arg(long, default_value = "quality")]
+        vad: String,
+        /// Language to assume, e.g. `en`. Detected per utterance when omitted.
+        #[arg(long)]
+        language: Option<String>,
+        /// Threads for transcription. Defaults to half the machine's, capped at
+        /// four, so a channel that is off by default cannot take the machine
+        /// over when it is on.
+        #[arg(long)]
+        threads: Option<i32>,
+    },
+    /// Check the audio endpoint, the model, and PostgreSQL - and record
+    /// nothing.
+    Doctor {
+        #[arg(long, default_value = DEFAULT_MACHINE_SLUG)]
+        machine_slug: String,
+        #[arg(long, default_value = DEFAULT_DISPLAY_NAME)]
+        display_name: String,
+        #[arg(long)]
+        microphone: bool,
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Manage the audio channel's own scheduled task.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -119,7 +196,81 @@ async fn main() -> anyhow::Result<()> {
             };
             run_search(&database_url, &machine_slug, &request).await
         }
-        Command::Service { action } => run_service_action(action),
+        Command::Service { action } => run_service_action(action, ServiceKind::Screen),
+        Command::Audio { action } => run_audio_action(action).await,
+    }
+}
+
+/// Dispatches the audio subcommands.
+///
+/// `service` works in every build, because a binary that cannot record must
+/// still be able to REMOVE a task that a previous one installed - discovering
+/// that you cannot turn it off without rebuilding would be the worst possible
+/// property for this particular channel.
+async fn run_audio_action(action: AudioAction) -> Result<()> {
+    match action {
+        // Install is the exception to the exception. Registering a task that
+        // runs `audio run` from a binary that refuses `audio run` produces a
+        // scheduled job doing nothing but failing and restarting every ten
+        // seconds, forever, and the operator's only evidence is a log they have
+        // no reason to read. Uninstall and status stay open in every build.
+        #[cfg(not(feature = "audio"))]
+        AudioAction::Service {
+            action: ServiceAction::Install,
+        } => Err(anyhow::anyhow!(
+            "this build cannot record audio, so installing its service would register a task \
+             that only fails and restarts. Rebuild with `cargo build --release --features audio` \
+             and install from that binary. Uninstall and status work from any build."
+        )),
+        AudioAction::Service { action } => run_service_action(action, ServiceKind::Audio),
+        #[cfg(feature = "audio")]
+        AudioAction::Run {
+            machine_slug,
+            display_name,
+            microphone,
+            model,
+            vad,
+            language,
+            threads,
+        } => {
+            let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
+            audio::run(
+                &database_url,
+                &machine_slug,
+                &display_name,
+                audio::Options {
+                    microphone,
+                    model,
+                    vad,
+                    language,
+                    threads,
+                },
+            )
+            .await
+        }
+        #[cfg(feature = "audio")]
+        AudioAction::Doctor {
+            machine_slug,
+            display_name,
+            microphone,
+            model,
+        } => {
+            let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
+            audio::doctor(
+                &database_url,
+                &machine_slug,
+                &display_name,
+                microphone,
+                model,
+            )
+            .await
+        }
+        #[cfg(not(feature = "audio"))]
+        _ => Err(anyhow::anyhow!(
+            "this build has no audio channel. It is a compile-time feature, off by default: \
+             rebuild with `cargo build --release --features audio` to get one that can record \
+             audio, and read docs/build/tracks/audio-channel.md section 6 first."
+        )),
     }
 }
 
@@ -684,19 +835,452 @@ async fn run_doctor(database_url: &str, machine_slug: &str, display_name: &str) 
     Ok(())
 }
 
-fn run_service_action(action: ServiceAction) -> anyhow::Result<()> {
+fn run_service_action(action: ServiceAction, kind: ServiceKind) -> anyhow::Result<()> {
     let service_root = ServiceRoot::current_user()?;
     let mut manager = ServiceManager::new(WindowsTaskScheduler);
     let status = match action {
         ServiceAction::Install => {
             let current_exe = std::env::current_exe().context("resolve running executable")?;
-            manager.install(&service_root, &current_exe)?
+            manager.install(&service_root, kind, &current_exe)?
         }
-        ServiceAction::Uninstall => manager.uninstall(&service_root)?,
-        ServiceAction::Status => manager.status(&service_root)?,
+        ServiceAction::Uninstall => manager.uninstall(&service_root, kind)?,
+        ServiceAction::Status => manager.status(&service_root, kind)?,
     };
+    println!("task_name={}", kind.task_name());
     print_service_status(&status);
     Ok(())
+}
+
+/// The audio channel's run loop, doctor, and configuration.
+///
+/// Everything specific to audio lives in this module so that the
+/// `#[cfg(feature = "audio")]` boundary is one line rather than scattered
+/// across the file. Without the feature, none of this is compiled and the
+/// binary cannot open a microphone even in principle.
+#[cfg(feature = "audio")]
+mod audio {
+    use anyhow::{Context, Result, ensure};
+    use screenpipe_audio::{
+        AudioCapture, CaptureError, Channel, DeviceCategory, ModelPath, VadAggressiveness,
+    };
+    use screenpipe_memory::{EventKind, MergeConfig, PgEventWriter, Runner};
+
+    use crate::audio_source::{AudioConfig, AudioSampleSource, CaptureStopped};
+    use crate::{
+        DEFAULT_MODEL_RELATIVE, IDLE_GAP_SECONDS, IterationKind, LoopStep,
+        MAX_CONSECUTIVE_FAILURES, MAX_CONSECUTIVE_GAPS, WHISPER_MODEL_ENV, failure_category,
+        next_step, print_run_outcome, run_iteration,
+    };
+
+    /// Most threads transcription may use.
+    ///
+    /// Half the machine, capped here. A channel that is off by default has no
+    /// business taking a laptop over when it is on, and `base.en` runs faster
+    /// than real time well below this.
+    const MAX_TRANSCRIBE_THREADS: i32 = 4;
+
+    pub(crate) struct Options {
+        pub(crate) microphone: bool,
+        pub(crate) model: Option<String>,
+        pub(crate) vad: String,
+        pub(crate) language: Option<String>,
+        pub(crate) threads: Option<i32>,
+    }
+
+    /// The audio channel's merger.
+    ///
+    /// The same idle gap as the screen and clipboard channels, for the same
+    /// reason: it is one threshold describing one thing, how long a silence has
+    /// to be before what follows is a new activity rather than a continuation.
+    /// `scroll_overlap` is carried but never consulted for this kind - speech
+    /// is not scrolled.
+    fn audio_runner() -> Runner {
+        Runner::new(MergeConfig {
+            kind: EventKind::Audio,
+            idle_gap: chrono::Duration::seconds(IDLE_GAP_SECONDS),
+            scroll_overlap: 0.35,
+        })
+    }
+
+    fn channel_of(microphone: bool) -> Channel {
+        if microphone {
+            Channel::Microphone
+        } else {
+            Channel::Loopback
+        }
+    }
+
+    /// Where the model is, in the order the operator would expect: the flag
+    /// they just typed, then the variable they set, then the default.
+    fn resolve_model(explicit: Option<String>) -> Result<ModelPath> {
+        if let Some(path) = explicit {
+            return ModelPath::new(&path)
+                .map_err(anyhow::Error::from)
+                .context("the --model path does not point at a file");
+        }
+        if let Some(path) = std::env::var_os(WHISPER_MODEL_ENV) {
+            return ModelPath::new(&path)
+                .map_err(anyhow::Error::from)
+                .with_context(|| format!("{WHISPER_MODEL_ENV} does not point at a file"));
+        }
+        let local = std::env::var_os("LOCALAPPDATA")
+            .context("LOCALAPPDATA is not set, so the default model location cannot be resolved")?;
+        let default = std::path::Path::new(&local).join(DEFAULT_MODEL_RELATIVE);
+        ModelPath::new(&default).map_err(anyhow::Error::from).context(
+            "no whisper model at the default location; download a ggml model there or pass --model",
+        )
+    }
+
+    fn resolve_threads(explicit: Option<i32>) -> i32 {
+        if let Some(threads) = explicit {
+            return threads.clamp(1, 64);
+        }
+        let cores = std::thread::available_parallelism()
+            .map(|count| i32::try_from(count.get()).unwrap_or(1))
+            .unwrap_or(1);
+        (cores / 2).clamp(1, MAX_TRANSCRIBE_THREADS)
+    }
+
+    fn is_capture_stopped(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<CaptureStopped>().is_some()
+    }
+
+    trait AudioCaptureProbe {
+        fn open(&self, channel: Channel) -> Result<DeviceCategory, CaptureError>;
+    }
+
+    struct WasapiCaptureProbe;
+
+    impl AudioCaptureProbe for WasapiCaptureProbe {
+        fn open(&self, channel: Channel) -> Result<DeviceCategory, CaptureError> {
+            let capture = AudioCapture::open(channel)?;
+            let category = capture.category();
+            drop(capture);
+            Ok(category)
+        }
+    }
+
+    fn probe_audio_stream(
+        channel: Channel,
+        probe: &impl AudioCaptureProbe,
+    ) -> Result<DeviceCategory, CaptureError> {
+        probe.open(channel)
+    }
+
+    fn audio_next_step(
+        outcome: &screenpipe_memory::RunOutcome,
+        consecutive_failures: &mut u32,
+        consecutive_gaps: &mut u32,
+    ) -> LoopStep {
+        let kind = match outcome {
+            screenpipe_memory::RunOutcome::GapRecorded {
+                gap: screenpipe_memory::CaptureGap::OcrUnavailable,
+            } => IterationKind::Failure("transcription"),
+            screenpipe_memory::RunOutcome::GapRecorded {
+                gap: screenpipe_memory::CaptureGap::DesktopLocked,
+            } => IterationKind::DesktopLocked,
+            screenpipe_memory::RunOutcome::GapRecorded { .. } => IterationKind::Gap,
+            screenpipe_memory::RunOutcome::Started { .. }
+            | screenpipe_memory::RunOutcome::Merged { .. } => IterationKind::Persisted,
+        };
+        next_step(kind, consecutive_failures, consecutive_gaps)
+    }
+
+    /// Opens the configured stream, immediately closes it, and records nothing.
+    pub(crate) async fn doctor(
+        database_url: &str,
+        machine_slug: &str,
+        display_name: &str,
+        microphone: bool,
+        model: Option<String>,
+    ) -> Result<()> {
+        let channel = channel_of(microphone);
+        println!("doctor audio_channel={}", channel.as_code());
+
+        let category = probe_audio_stream(channel, &WasapiCaptureProbe)
+            .map_err(anyhow::Error::from)
+            .context("open the default audio endpoint with the configured stream format")?;
+        println!(
+            "doctor audio_endpoint=available role={}",
+            category.as_code()
+        );
+
+        // Loaded, not merely found: a truncated download is a file that exists.
+        let model = resolve_model(model)?;
+        let engine = screenpipe_audio::WhisperEngine::load(model, 1, None)
+            .map_err(anyhow::Error::from)
+            .context("load the whisper model")?;
+        println!(
+            "doctor whisper_model=loadable model={}",
+            engine.model_label()
+        );
+
+        let writer = PgEventWriter::connect(database_url, machine_slug, display_name)
+            .await
+            .context("verify PostgreSQL connection and machine identity")?;
+        let report = writer.preflight().await?;
+        ensure!(
+            report.machine_slug == machine_slug && report.display_name == display_name,
+            "PostgreSQL machine identity does not match requested identity"
+        );
+        println!(
+            "doctor postgres=available version={} schema=present machine_slug={} display_name={}",
+            report.server_version, report.machine_slug, report.display_name
+        );
+        println!("doctor recorded=nothing");
+        Ok(())
+    }
+
+    /// Records until interrupted.
+    ///
+    /// Inference and source faults back off and eventually hand control to the
+    /// service wrapper for a clean model/stream restart. Silence produces no
+    /// observation at all, so it never advances either ceiling.
+    pub(crate) async fn run(
+        database_url: &str,
+        machine_slug: &str,
+        display_name: &str,
+        options: Options,
+    ) -> Result<()> {
+        let channel = channel_of(options.microphone);
+        let aggressiveness = VadAggressiveness::from_code(&options.vad).with_context(|| {
+            format!(
+                "--vad must be one of quality, low_bitrate, aggressive, very_aggressive (got {:?})",
+                options.vad
+            )
+        })?;
+        let model = resolve_model(options.model)?;
+        let threads = resolve_threads(options.threads);
+
+        if options.microphone {
+            // Said out loud, every time, at the top of the log. This channel
+            // records the room and anyone in it, and that must never be a thing
+            // somebody discovers from a database row.
+            println!("event=audio_microphone state=on note=records_the_room_and_anyone_in_it");
+        }
+
+        let writer = PgEventWriter::connect(database_url, machine_slug, display_name).await?;
+        let mut source = AudioSampleSource::start(AudioConfig {
+            channel,
+            model,
+            aggressiveness,
+            threads,
+            language: options.language,
+        })?;
+        let mut runner = audio_runner();
+        let mut consecutive_failures: u32 = 0;
+        let mut consecutive_gaps: u32 = 0;
+        println!("event=audio_runtime_ready machine_slug={machine_slug}");
+
+        let shutdown = tokio::signal::ctrl_c();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                signal = &mut shutdown => {
+                    signal.context("listen for Ctrl-C")?;
+                    println!("event=shutdown reason=ctrl_c");
+                    return Ok(());
+                }
+                step = run_iteration(&mut runner, &mut source, &writer) => match step {
+                    Ok(outcome) => {
+                        print_run_outcome("audio", &outcome);
+                        match audio_next_step(
+                            &outcome,
+                            &mut consecutive_failures,
+                            &mut consecutive_gaps,
+                        ) {
+                            LoopStep::Continue => {}
+                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                            LoopStep::AbortGaps => {
+                                return Err(anyhow::anyhow!(
+                                    "aborting after {MAX_CONSECUTIVE_GAPS} consecutive audio capture gaps"
+                                ));
+                            }
+                            LoopStep::AbortFailures(category) => {
+                                return Err(anyhow::anyhow!(
+                                    "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive audio processing failures (category={category})"
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) if is_capture_stopped(&error) => {
+                        // Not retryable. The WASAPI stream and the model live
+                        // on threads that have exited; backing off would print
+                        // the same line every second until logoff. Exiting
+                        // hands off to the service wrapper's restart loop,
+                        // which re-opens everything from a clean process.
+                        println!("event=shutdown reason=capture_stopped");
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        let category = failure_category(&error);
+                        let step = next_step(
+                            IterationKind::Failure(category),
+                            &mut consecutive_failures,
+                            &mut consecutive_gaps,
+                        );
+                        println!(
+                            "event=audio_error category={category} consecutive={consecutive_failures}"
+                        );
+                        match step {
+                            LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                            LoopStep::AbortFailures(category) => {
+                                return Err(anyhow::anyhow!(
+                                    "aborting after {MAX_CONSECUTIVE_FAILURES} consecutive audio processing failures (category={category})"
+                                ));
+                            }
+                            LoopStep::Continue | LoopStep::AbortGaps => unreachable!(
+                                "a failure iteration can only retry or reach its failure ceiling"
+                            ),
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::cell::Cell;
+
+        use super::{
+            AudioCaptureProbe, MAX_TRANSCRIBE_THREADS, audio_next_step, channel_of,
+            is_capture_stopped, probe_audio_stream, resolve_threads,
+        };
+        use crate::audio_source::CaptureStopped;
+        use crate::{LoopStep, MAX_CONSECUTIVE_FAILURES};
+        use screenpipe_audio::{CaptureError, Channel, DeviceCategory};
+        use screenpipe_memory::{CaptureGap, RunOutcome};
+
+        struct FakeCaptureProbe {
+            opened: Cell<Option<Channel>>,
+            fail: bool,
+        }
+
+        impl AudioCaptureProbe for FakeCaptureProbe {
+            fn open(&self, channel: Channel) -> Result<DeviceCategory, CaptureError> {
+                self.opened.set(Some(channel));
+                if self.fail {
+                    Err(CaptureError::FormatUnsupported)
+                } else {
+                    Ok(DeviceCategory::Communications)
+                }
+            }
+        }
+
+        #[test]
+        fn the_default_channel_is_loopback() {
+            // Loopback hears what came out of the speakers. The microphone
+            // hears the room. Only one of those can be a default.
+            assert_eq!(channel_of(false), Channel::Loopback);
+            assert_eq!(channel_of(true), Channel::Microphone);
+        }
+
+        #[test]
+        fn transcription_threads_stay_inside_a_budget() {
+            assert!(resolve_threads(None) >= 1);
+            assert!(resolve_threads(None) <= MAX_TRANSCRIBE_THREADS);
+            // An explicit request is honoured, but not a nonsensical one: zero
+            // or a negative would reach whisper.cpp and be undefined there.
+            assert_eq!(resolve_threads(Some(7)), 7);
+            assert_eq!(resolve_threads(Some(0)), 1);
+            assert_eq!(resolve_threads(Some(-3)), 1);
+        }
+
+        #[test]
+        fn capture_shutdown_classification_is_typed_not_message_matched() {
+            let typed = anyhow::Error::new(CaptureStopped).context("read the next observation");
+            let same_text = anyhow::anyhow!("the audio capture threads stopped");
+
+            assert!(is_capture_stopped(&typed));
+            assert!(!is_capture_stopped(&same_text));
+        }
+
+        #[test]
+        fn doctor_probe_opens_the_requested_stream_and_propagates_open_failure() {
+            let available = FakeCaptureProbe {
+                opened: Cell::new(None),
+                fail: false,
+            };
+            assert_eq!(
+                probe_audio_stream(Channel::Microphone, &available).unwrap(),
+                DeviceCategory::Communications
+            );
+            assert_eq!(available.opened.get(), Some(Channel::Microphone));
+
+            let unavailable = FakeCaptureProbe {
+                opened: Cell::new(None),
+                fail: true,
+            };
+            assert_eq!(
+                probe_audio_stream(Channel::Loopback, &unavailable).unwrap_err(),
+                CaptureError::FormatUnsupported
+            );
+            assert_eq!(unavailable.opened.get(), Some(Channel::Loopback));
+        }
+
+        #[test]
+        fn transcription_gaps_back_off_and_reach_the_restart_ceiling() {
+            let transcription_gap = RunOutcome::GapRecorded {
+                gap: CaptureGap::OcrUnavailable,
+            };
+            let mut failures = 0;
+            let mut gaps = 0;
+
+            for expected in 1..MAX_CONSECUTIVE_FAILURES {
+                assert!(matches!(
+                    audio_next_step(&transcription_gap, &mut failures, &mut gaps),
+                    LoopStep::Retry(_)
+                ));
+                assert_eq!(failures, expected);
+                assert_eq!(gaps, 0);
+            }
+            assert_eq!(
+                audio_next_step(&transcription_gap, &mut failures, &mut gaps),
+                LoopStep::AbortFailures("transcription")
+            );
+
+            failures = 7;
+            assert!(matches!(
+                audio_next_step(
+                    &RunOutcome::GapRecorded {
+                        gap: CaptureGap::CaptureUnavailable,
+                    },
+                    &mut failures,
+                    &mut gaps,
+                ),
+                LoopStep::Retry(_)
+            ));
+            assert_eq!(failures, 7, "a source gap is not a transcription result");
+            assert_eq!(gaps, 1);
+
+            failures = 7;
+            gaps = 3;
+            assert!(matches!(
+                audio_next_step(
+                    &RunOutcome::GapRecorded {
+                        gap: CaptureGap::DesktopLocked,
+                    },
+                    &mut failures,
+                    &mut gaps,
+                ),
+                LoopStep::Retry(_)
+            ));
+            assert_eq!((failures, gaps), (7, 3));
+
+            assert_eq!(
+                audio_next_step(
+                    &RunOutcome::Merged {
+                        event_id: "synthetic-event".to_owned(),
+                    },
+                    &mut failures,
+                    &mut gaps,
+                ),
+                LoopStep::Continue
+            );
+            assert_eq!((failures, gaps), (0, 0));
+        }
+    }
 }
 
 fn print_service_status(status: &ServiceStatus) {

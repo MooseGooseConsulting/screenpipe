@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, ensure};
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
-    CadenceInput, CadenceRecord, CaptureGapSummary, EventKind, HashLedger, MERGE_CONTRACT_VERSION,
-    MergeDecisionKind, ObservationSample, OpenEvent, PgEventReader, PgEventWriter, SplitReason,
+    CadenceInput, CadenceRecord, CaptureGapSummary, EventEnvelope, EventKind, HashLedger,
+    MERGE_CONTRACT_VERSION, MergeDecisionKind, ObservationSample, OpenEvent, PgEventReader,
+    PgEventWriter, SplitReason,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -1653,6 +1654,114 @@ async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_dis
             })
             .await?;
         ensure!(hits.iter().any(|hit| hit.event_id == first_id));
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn an_audio_event_persists_its_kind_its_title_and_its_audio_metadata() -> Result<()> {
+    // The audio channel needs no DDL - that is the claim - so this test is what
+    // proves it: an `audio` row goes into the same `events` table, through the
+    // same writer, and gets a title from the same `apps` join, with the
+    // transcript-specific facts riding in merge_meta.
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let mut utterance = event(
+            0,
+            "audio:loopback",
+            "System Audio",
+            "",
+            "raw transcript",
+            None,
+        );
+        utterance.kind = EventKind::Audio;
+        utterance.latest.readable_text = "cleaned transcript".to_owned();
+        let utterance = EventEnvelope::with_audio(
+            utterance,
+            screenpipe_memory::AudioMeta {
+                channel: "system_audio",
+                device_category: "communications",
+                engine: "whisper-rs",
+                model: "ggml-base.en".to_owned(),
+                vad_engine: "webrtc-vad",
+                vad_aggressiveness: "quality",
+                language: Some("en".to_owned()),
+                avg_no_speech_permille: Some(30),
+                closed_by: "silence",
+            },
+        );
+
+        let id = writer
+            .write_start_envelope(&utterance, SplitReason::Initial)
+            .await?;
+        let row = sqlx::query(
+            "SELECT kind, title, ocr_text, readable_text, merge_meta FROM events WHERE id = $1",
+        )
+        .bind(&id)
+        .fetch_one(&db.pool)
+        .await?;
+
+        ensure!(row.try_get::<String, _>("kind")? == "audio");
+        // No window title, so the title is the channel alone - which is the
+        // point of giving audio a real apps row when the clipboard has none.
+        ensure!(
+            row.try_get::<Option<String>, _>("title")? == Some("System Audio".to_owned()),
+            "audio title: {:?}",
+            row.try_get::<Option<String>, _>("title")?
+        );
+        // Raw beside readable, the same split the screen channel writes.
+        ensure!(row.try_get::<String, _>("ocr_text")? == "raw transcript");
+        ensure!(row.try_get::<String, _>("readable_text")? == "cleaned transcript");
+
+        let meta: Value = row.try_get("merge_meta")?;
+        ensure!(
+            meta["audio"]
+                == json!({
+                    "channel": "system_audio",
+                    "device_category": "communications",
+                    "engine": "whisper-rs",
+                    "model": "ggml-base.en",
+                    "vad_engine": "webrtc-vad",
+                    "vad_aggressiveness": "quality",
+                    "language": "en",
+                    "avg_no_speech_permille": 30,
+                    "closed_by": "silence",
+                }),
+            "persisted audio merge_meta drifted: {meta:#}"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn a_screen_event_persists_no_audio_key_at_all() -> Result<()> {
+    // Absent, not null. Every reader of merge_meta would otherwise have to know
+    // that a screen row's `audio` field means nothing.
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let screen = event(0, "notepad.exe", "Notepad", "notes", "ordinary text", None);
+
+        let id = writer.write_start(&screen, SplitReason::Initial).await?;
+        let meta: Value = sqlx::query("SELECT merge_meta FROM events WHERE id = $1")
+            .bind(&id)
+            .fetch_one(&db.pool)
+            .await?
+            .try_get("merge_meta")?;
+
+        ensure!(
+            meta.get("audio").is_none(),
+            "a screen row claimed something about audio: {meta:#}"
+        );
         Ok(())
     }
     .await;

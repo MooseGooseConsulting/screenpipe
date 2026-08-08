@@ -1,0 +1,31 @@
+[package]
+name = "screenpipe-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# WASAPI, not cpal. The one capture mode this channel needs on Windows is
+# loopback, and cpal does not expose it; the pinned upstream carried a FORK of
+# cpal to get it. `wasapi` exposes it directly, which is the whole reason a
+# platform-specific crate is the smaller dependency here.
+wasapi = "0.23"
+
+# The same VAD the pinned upstream chose, and for the same reason: it is the
+# WebRTC module, it runs on 10/20/30 ms frames of 16-bit PCM, and it costs
+# almost nothing. Voice activity is what bounds an utterance, so this decides
+# where one audio event ends - not the transcriber.
+webrtc-vad = "0.4"
+
+# whisper.cpp. Default features only: no cuda, no vulkan, no metal. This runs
+# on a laptop next to a screen recorder that is already holding a CPU budget,
+# and a GPU build would put an audio channel that is off by default in
+# contention with whatever the operator is actually doing.
+whisper-rs = { version = "0.16", default-features = false }
+
+[dev-dependencies]
+hound = "3.5"

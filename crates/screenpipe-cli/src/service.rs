@@ -96,12 +96,78 @@ pub(crate) struct ServiceSpec {
     pub(crate) wrapper_contents: String,
 }
 
+/// Which channel a registered task records.
+///
+/// Two tasks, two wrappers, and two copies of the executable - not one task
+/// that does both. The screen recorder is installed as part of Goal 1 and is
+/// expected to be running; the audio channel is off until somebody installs it
+/// deliberately, and the two must be able to be started, stopped, and removed
+/// without touching each other. Sharing one binary path would break exactly
+/// that: uninstalling audio would delete the file the screen service runs.
+///
+/// The copies are also genuinely different artifacts. The audio channel only
+/// exists in a build made with `--features audio`, so the file installed here
+/// is not interchangeable with the default one.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServiceKind {
+    Screen,
+    Audio,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ServiceKind {
+    pub(crate) const fn task_name(self) -> &'static str {
+        match self {
+            Self::Screen => "MooseGoose Screen Memory",
+            Self::Audio => "MooseGoose Screen Memory Audio",
+        }
+    }
+
+    const fn binary_name(self) -> &'static str {
+        match self {
+            Self::Screen => "screenpipe.exe",
+            Self::Audio => "screenpipe-audio.exe",
+        }
+    }
+
+    const fn wrapper_name(self) -> &'static str {
+        match self {
+            Self::Screen => "run-screenpipe.ps1",
+            Self::Audio => "run-screenpipe-audio.ps1",
+        }
+    }
+
+    /// Log file stem. Separate files, because a transcript failure and a
+    /// capture failure are different outages and reading one should not mean
+    /// reading around the other.
+    const fn log_stem(self) -> &'static str {
+        match self {
+            Self::Screen => "screenpipe-agent",
+            Self::Audio => "screenpipe-audio-agent",
+        }
+    }
+
+    /// The subcommand the wrapper runs.
+    ///
+    /// The audio wrapper names no channel flag on purpose: `audio run` defaults
+    /// to loopback only, and turning the microphone on is a second decision
+    /// that has to be made by editing this wrapper - not something an install
+    /// can do on the operator's behalf.
+    const fn agent_subcommand(self) -> &'static str {
+        match self {
+            Self::Screen => "run",
+            Self::Audio => "audio run",
+        }
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl ServiceSpec {
-    pub(crate) fn for_current_user(root: &ServiceRoot) -> Self {
+    pub(crate) fn for_current_user(root: &ServiceRoot, kind: ServiceKind) -> Self {
         let root_path = root.local_app_data.join("screen-memory");
-        let binary_path = root_path.join(r"bin\screenpipe.exe");
-        let wrapper_path = root_path.join("run-screenpipe.ps1");
+        let binary_path = root_path.join("bin").join(kind.binary_name());
+        let wrapper_path = root_path.join(kind.wrapper_name());
         let action = TaskAction {
             executable: "powershell.exe",
             arguments: format!(
@@ -117,6 +183,8 @@ impl ServiceSpec {
         };
         let escaped_agent = binary_path.to_string_lossy().replace('\'', "''");
         let escaped_log_directory = root_path.join("logs").to_string_lossy().replace('\'', "''");
+        let log_stem = kind.log_stem();
+        let agent_subcommand = kind.agent_subcommand();
         // Task Scheduler runs this wrapper hidden, so without redirection every
         // `screen_started`, `capture_gap`, and `capture_error` line the agent
         // prints goes to a console nobody can read and dies with the process -
@@ -149,9 +217,9 @@ if (-not (Test-Path -LiteralPath $logDirectory)) {{
     New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
 }}
 while ($true) {{
-    $log = Join-Path $logDirectory ('screenpipe-agent-{{0:yyyy-MM-dd}}.log' -f (Get-Date))
+    $log = Join-Path $logDirectory ('{log_stem}-{{0:yyyy-MM-dd}}.log' -f (Get-Date))
     Add-Content -LiteralPath $log -Encoding utf8 -Value ("=== agent start {{0:o}} ===" -f (Get-Date).ToUniversalTime())
-    doppler run -p homelab -c dev_personal -- $agent run --machine-slug icarus --display-name Icarus-Laptop 2>&1 |
+    doppler run -p homelab -c dev_personal -- $agent {agent_subcommand} --machine-slug icarus --display-name Icarus-Laptop 2>&1 |
         ForEach-Object {{ Add-Content -LiteralPath $log -Encoding utf8 -Value ([string]$_) }}
     Add-Content -LiteralPath $log -Encoding utf8 -Value ("=== agent exited {{0:o}} exit={{1}} ===" -f (Get-Date).ToUniversalTime(), $LASTEXITCODE)
     Start-Sleep -Seconds 10
@@ -160,7 +228,7 @@ while ($true) {{
         );
 
         Self {
-            task_name: "MooseGoose Screen Memory",
+            task_name: kind.task_name(),
             root_path,
             binary_path,
             wrapper_path,
@@ -283,9 +351,10 @@ impl<S: TaskScheduler> ServiceManager<S> {
     pub(crate) fn install(
         &mut self,
         root: &ServiceRoot,
+        kind: ServiceKind,
         current_exe: &Path,
     ) -> Result<ServiceStatus> {
-        let spec = ServiceSpec::for_current_user(root);
+        let spec = ServiceSpec::for_current_user(root, kind);
         assert_owned_artifact(&spec, &spec.binary_path)?;
         assert_owned_artifact(&spec, &spec.wrapper_path)?;
         if !current_exe.is_file() {
@@ -317,8 +386,12 @@ impl<S: TaskScheduler> ServiceManager<S> {
             .context("query installed service status")
     }
 
-    pub(crate) fn uninstall(&mut self, root: &ServiceRoot) -> Result<ServiceStatus> {
-        let spec = ServiceSpec::for_current_user(root);
+    pub(crate) fn uninstall(
+        &mut self,
+        root: &ServiceRoot,
+        kind: ServiceKind,
+    ) -> Result<ServiceStatus> {
+        let spec = ServiceSpec::for_current_user(root, kind);
         assert_owned_artifact(&spec, &spec.binary_path)?;
         assert_owned_artifact(&spec, &spec.wrapper_path)?;
         self.scheduler
@@ -336,8 +409,12 @@ impl<S: TaskScheduler> ServiceManager<S> {
             .context("query uninstalled service status")
     }
 
-    pub(crate) fn status(&mut self, root: &ServiceRoot) -> Result<ServiceStatus> {
-        let spec = ServiceSpec::for_current_user(root);
+    pub(crate) fn status(
+        &mut self,
+        root: &ServiceRoot,
+        kind: ServiceKind,
+    ) -> Result<ServiceStatus> {
+        let spec = ServiceSpec::for_current_user(root, kind);
         self.scheduler
             .status(spec.task_name, &spec.binary_path)
             .context("query service status")
@@ -537,8 +614,13 @@ if (-not [int]::TryParse($env:SCREENPIPE_CALLER_PID, [ref]$callerPid)) {
 # service directory - regardless of whether the agent was up. A status check
 # that reports the health of the process asking the question is exactly the
 # fabricated status this is meant to rule out.
+$expectedProcessName = [System.IO.Path]::GetFileName($env:SCREENPIPE_SERVICE_BINARY)
+if ([string]::IsNullOrWhiteSpace($expectedProcessName)) {
+    throw "SCREENPIPE_SERVICE_BINARY has no executable name."
+}
+$wqlProcessName = $expectedProcessName.Replace("'", "''")
 $processRunning = @(
-    Get-CimInstance Win32_Process -Filter "Name = 'screenpipe.exe'" |
+    Get-CimInstance Win32_Process -Filter "Name = '$wqlProcessName'" |
         Where-Object {
             $_.ProcessId -ne $callerPid -and
             [string]::Equals(
@@ -625,9 +707,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ServiceManager, ServiceRoot, ServiceSpec, ServiceStatus, TaskAction, TaskLogonType,
-        TaskPrincipal, TaskRunLevel, TaskScheduler, TaskState, TaskTrigger, TaskUser,
-        install_task_script, parse_status_output, status_task_script, stop_task_script,
+        ServiceKind, ServiceManager, ServiceRoot, ServiceSpec, ServiceStatus, TaskAction,
+        TaskLogonType, TaskPrincipal, TaskRunLevel, TaskScheduler, TaskState, TaskTrigger,
+        TaskUser, install_task_script, parse_status_output, status_task_script, stop_task_script,
         uninstall_task_script,
     };
 
@@ -841,7 +923,9 @@ $parseErrors = $null
         let root = ServiceRoot::for_test(local_app_data);
         let mut manager = ServiceManager::new(FakeTaskScheduler::default());
 
-        let error = manager.install(&root, &source).unwrap_err();
+        let error = manager
+            .install(&root, ServiceKind::Screen, &source)
+            .unwrap_err();
 
         assert!(format!("{error:#}").contains("reparse point"));
         assert!(!junction_target.join("screenpipe.exe").exists());
@@ -864,7 +948,7 @@ $parseErrors = $null
         let root = ServiceRoot::for_test(local_app_data);
         let mut manager = ServiceManager::new(FakeTaskScheduler::default());
 
-        let error = manager.uninstall(&root).unwrap_err();
+        let error = manager.uninstall(&root, ServiceKind::Screen).unwrap_err();
 
         assert!(format!("{error:#}").contains("reparse point"));
         assert_eq!(fs::read(binary).unwrap(), b"preserve-binary");
@@ -874,7 +958,7 @@ $parseErrors = $null
     #[test]
     fn service_spec_targets_the_interactive_user_task() {
         let root = ServiceRoot::for_test(Path::new(r"C:\Users\pmacl\AppData\Local").to_owned());
-        let spec = ServiceSpec::for_current_user(&root);
+        let spec = ServiceSpec::for_current_user(&root, ServiceKind::Screen);
         assert_eq!(spec.task_name, "MooseGoose Screen Memory");
         assert_eq!(
             spec.action,
@@ -899,7 +983,7 @@ $parseErrors = $null
     fn service_spec_uses_accessible_workstation_doppler_namespace_and_keeps_local_artifacts_safe() {
         let local_app_data = Path::new(r"C:\Users\pmacl\AppData\Local");
         let root = ServiceRoot::for_test(local_app_data.to_owned());
-        let spec = ServiceSpec::for_current_user(&root);
+        let spec = ServiceSpec::for_current_user(&root, ServiceKind::Screen);
         let expected_root = local_app_data.join("screen-memory");
 
         assert_eq!(spec.root_path, expected_root);
@@ -955,7 +1039,7 @@ $parseErrors = $null
             r"C:\Users\O'Brien\AppData\Local",
         ] {
             let root = ServiceRoot::for_test(Path::new(local_app_data).to_owned());
-            let spec = ServiceSpec::for_current_user(&root);
+            let spec = ServiceSpec::for_current_user(&root, ServiceKind::Screen);
 
             let errors = powershell_parse_errors(&spec.wrapper_contents);
 
@@ -974,7 +1058,7 @@ $parseErrors = $null
         // launch a wrapper that dies on a syntax error at every logon instead
         // of starting the agent.
         let root = ServiceRoot::for_test(Path::new(r"C:\Users\O'Brien\AppData\Local").to_owned());
-        let spec = ServiceSpec::for_current_user(&root);
+        let spec = ServiceSpec::for_current_user(&root, ServiceKind::Screen);
 
         let agent_line = spec
             .wrapper_contents
@@ -1006,8 +1090,10 @@ $parseErrors = $null
         let (_temp, local_app_data, source) = service_fixture();
         let mut manager = ServiceManager::new(FakeTaskScheduler::default());
 
-        let status = manager.install(&local_app_data, &source).unwrap();
-        let spec = ServiceSpec::for_current_user(&local_app_data);
+        let status = manager
+            .install(&local_app_data, ServiceKind::Screen, &source)
+            .unwrap();
+        let spec = ServiceSpec::for_current_user(&local_app_data, ServiceKind::Screen);
 
         assert_eq!(
             fs::read(&spec.binary_path).unwrap(),
@@ -1024,13 +1110,18 @@ $parseErrors = $null
                 process_running: false,
             }
         );
-        assert_eq!(manager.status(&local_app_data).unwrap(), status);
+        assert_eq!(
+            manager
+                .status(&local_app_data, ServiceKind::Screen)
+                .unwrap(),
+            status
+        );
     }
 
     #[test]
     fn reinstall_repairs_owned_artifacts_without_touching_siblings() {
         let (_temp, local_app_data, source) = service_fixture();
-        let spec = ServiceSpec::for_current_user(&local_app_data);
+        let spec = ServiceSpec::for_current_user(&local_app_data, ServiceKind::Screen);
         fs::create_dir_all(spec.binary_path.parent().unwrap()).unwrap();
         fs::write(&spec.binary_path, b"stale-binary").unwrap();
         fs::write(&spec.wrapper_path, "stale-wrapper").unwrap();
@@ -1038,8 +1129,12 @@ $parseErrors = $null
         fs::write(&sibling, "owned by another checkpoint").unwrap();
         let mut manager = ServiceManager::new(FakeTaskScheduler::default());
 
-        manager.install(&local_app_data, &source).unwrap();
-        manager.install(&local_app_data, &source).unwrap();
+        manager
+            .install(&local_app_data, ServiceKind::Screen, &source)
+            .unwrap();
+        manager
+            .install(&local_app_data, ServiceKind::Screen, &source)
+            .unwrap();
 
         assert_eq!(
             fs::read(&spec.binary_path).unwrap(),
@@ -1059,12 +1154,14 @@ $parseErrors = $null
     fn install_from_the_already_copied_binary_does_not_truncate_it() {
         let temp = tempfile::tempdir().unwrap();
         let root = ServiceRoot::for_test(temp.path().join("LocalAppData"));
-        let spec = ServiceSpec::for_current_user(&root);
+        let spec = ServiceSpec::for_current_user(&root, ServiceKind::Screen);
         fs::create_dir_all(spec.binary_path.parent().unwrap()).unwrap();
         fs::write(&spec.binary_path, b"running-installed-binary").unwrap();
         let mut manager = ServiceManager::new(FakeTaskScheduler::default());
 
-        manager.install(&root, &spec.binary_path).unwrap();
+        manager
+            .install(&root, ServiceKind::Screen, &spec.binary_path)
+            .unwrap();
 
         assert_eq!(
             fs::read(&spec.binary_path).unwrap(),
@@ -1075,16 +1172,20 @@ $parseErrors = $null
     #[test]
     fn uninstall_removes_only_the_exact_task_binary_and_wrapper() {
         let (_temp, local_app_data, source) = service_fixture();
-        let spec = ServiceSpec::for_current_user(&local_app_data);
+        let spec = ServiceSpec::for_current_user(&local_app_data, ServiceKind::Screen);
         let mut manager = ServiceManager::new(FakeTaskScheduler::default());
-        manager.install(&local_app_data, &source).unwrap();
+        manager
+            .install(&local_app_data, ServiceKind::Screen, &source)
+            .unwrap();
         let sibling = spec.root_path.join("preserve-me.txt");
         let log = spec.root_path.join(r"logs\postgresql.log");
         fs::create_dir_all(log.parent().unwrap()).unwrap();
         fs::write(&sibling, "preserve").unwrap();
         fs::write(&log, "preserve").unwrap();
 
-        let status = manager.uninstall(&local_app_data).unwrap();
+        let status = manager
+            .uninstall(&local_app_data, ServiceKind::Screen)
+            .unwrap();
 
         assert!(!spec.binary_path.exists());
         assert!(!spec.wrapper_path.exists());
@@ -1108,14 +1209,19 @@ $parseErrors = $null
         };
         let mut manager = ServiceManager::new(scheduler);
 
-        let error = manager.install(&local_app_data, &source).unwrap_err();
+        let error = manager
+            .install(&local_app_data, ServiceKind::Screen, &source)
+            .unwrap_err();
 
         assert!(
             format!("{error:#}").contains("injected task registration failure"),
             "scheduler cause must remain available through service context"
         );
         assert_eq!(
-            manager.status(&local_app_data).unwrap().task_state,
+            manager
+                .status(&local_app_data, ServiceKind::Screen)
+                .unwrap()
+                .task_state,
             TaskState::Absent
         );
     }
@@ -1123,7 +1229,7 @@ $parseErrors = $null
     #[test]
     fn stop_failure_prevents_reinstall_from_mutating_the_installed_binary() {
         let (_temp, local_app_data, source) = service_fixture();
-        let spec = ServiceSpec::for_current_user(&local_app_data);
+        let spec = ServiceSpec::for_current_user(&local_app_data, ServiceKind::Screen);
         fs::create_dir_all(spec.binary_path.parent().unwrap()).unwrap();
         fs::write(&spec.binary_path, b"still-running-binary").unwrap();
         let before = directory_snapshot(&spec.root_path);
@@ -1137,7 +1243,9 @@ $parseErrors = $null
         };
         let mut manager = ServiceManager::new(scheduler);
 
-        let error = manager.install(&local_app_data, &source).unwrap_err();
+        let error = manager
+            .install(&local_app_data, ServiceKind::Screen, &source)
+            .unwrap_err();
 
         assert!(format!("{error:#}").contains("injected task stop failure"));
         assert_eq!(
@@ -1177,7 +1285,9 @@ $parseErrors = $null
         };
         let mut manager = ServiceManager::new(scheduler);
 
-        let status = manager.install(&local_app_data, &source).unwrap();
+        let status = manager
+            .install(&local_app_data, ServiceKind::Screen, &source)
+            .unwrap();
 
         assert_eq!(status.task_state, TaskState::Ready);
         assert!(!status.process_running);
@@ -1186,7 +1296,7 @@ $parseErrors = $null
     #[test]
     fn uninstall_stops_an_active_installation_before_deleting_artifacts() {
         let (_temp, local_app_data, _source) = service_fixture();
-        let spec = ServiceSpec::for_current_user(&local_app_data);
+        let spec = ServiceSpec::for_current_user(&local_app_data, ServiceKind::Screen);
         fs::create_dir_all(spec.binary_path.parent().unwrap()).unwrap();
         fs::write(&spec.binary_path, b"running-installed-binary").unwrap();
         fs::write(&spec.wrapper_path, &spec.wrapper_contents).unwrap();
@@ -1199,7 +1309,9 @@ $parseErrors = $null
         };
         let mut manager = ServiceManager::new(scheduler);
 
-        let status = manager.uninstall(&local_app_data).unwrap();
+        let status = manager
+            .uninstall(&local_app_data, ServiceKind::Screen)
+            .unwrap();
 
         assert_eq!(status.task_state, TaskState::Absent);
         assert!(!status.process_running);
@@ -1580,6 +1692,38 @@ $parseErrors = $null
         assert!(
             as_other.process_running,
             "status missed a genuinely running agent at the owned path"
+        );
+    }
+
+    #[test]
+    fn status_script_matches_the_audio_service_executable_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let owned_path = temp.path().join(r"bin\screenpipe-audio.exe");
+        let mut agent = spawn_process_at(&owned_path);
+        std::thread::sleep(std::time::Duration::from_millis(900));
+
+        let output = super::run_powershell(
+            status_task_script(),
+            &[
+                (
+                    "SCREENPIPE_TASK_NAME",
+                    "MooseGoose Goal 1 Absent Audio Status Control".to_owned(),
+                ),
+                (
+                    "SCREENPIPE_SERVICE_BINARY",
+                    owned_path.to_string_lossy().into_owned(),
+                ),
+                ("SCREENPIPE_CALLER_PID", std::process::id().to_string()),
+            ],
+        );
+
+        let _ = agent.kill();
+        let _ = agent.wait();
+
+        let status = parse_status_output(&output.expect("status script failed")).unwrap();
+        assert!(
+            status.process_running,
+            "status missed the running audio agent at the exact owned path"
         );
     }
 

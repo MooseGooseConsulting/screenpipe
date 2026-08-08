@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use crate::{
-    CadenceRecord, CaptureGap, CaptureGapSummary, MergeDecision, Merger, ObservationSample,
-    OpenEvent, SplitReason, TextIdentity,
+    CadenceRecord, CaptureGap, CaptureGapSummary, EnvelopeMergeDecision, EventEnvelope, Merger,
+    ObservationEnvelope, ObservationSample, OpenEvent, SplitReason, TextIdentity,
 };
 
 // The `Sample` variant is ~216 bytes against `Gap`'s 1. Boxing to even that
@@ -21,10 +21,36 @@ pub enum SampleRead {
     Gap(CaptureGap),
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservationRead {
+    Sample {
+        observation: ObservationEnvelope,
+        cadence: CadenceRecord,
+    },
+    Gap(CaptureGap),
+}
+
+impl From<SampleRead> for ObservationRead {
+    fn from(read: SampleRead) -> Self {
+        match read {
+            SampleRead::Sample { sample, cadence } => Self::Sample {
+                observation: sample.into(),
+                cadence,
+            },
+            SampleRead::Gap(gap) => Self::Gap(gap),
+        }
+    }
+}
+
 /// Capture boundary. Implementations must be movable to the runner task.
 #[async_trait]
 pub trait SampleSource: Send {
     async fn next_sample(&mut self) -> Result<SampleRead>;
+
+    async fn next_observation(&mut self) -> Result<ObservationRead> {
+        Ok(self.next_sample().await?.into())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +82,14 @@ impl TryFrom<String> for EventId {
 pub trait EventSink: Send + Sync {
     async fn start(&self, event: &OpenEvent, reason: SplitReason) -> Result<EventId>;
     async fn merge(&self, event_id: &str, event: &OpenEvent) -> Result<()>;
+
+    async fn start_envelope(&self, event: &EventEnvelope, reason: SplitReason) -> Result<EventId> {
+        self.start(event.event(), reason).await
+    }
+
+    async fn merge_envelope(&self, event_id: &str, event: &EventEnvelope) -> Result<()> {
+        self.merge(event_id, event.event()).await
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,7 +114,7 @@ pub struct Runner {
     // gap record; independent terminal-gap durability is deferred to Context
     // Pipeline V2 and is intentionally not added in this PR.
     pending_gaps: CaptureGapSummary,
-    pending_sample: Option<(ObservationSample, CadenceRecord)>,
+    pending_sample: Option<(ObservationEnvelope, CadenceRecord)>,
 }
 
 impl Runner {
@@ -109,13 +143,16 @@ impl Runner {
         let (sample, cadence) = if let Some(pending) = self.pending_sample.clone() {
             pending
         } else {
-            let read = source.next_sample().await?;
+            let read = source.next_observation().await?;
             let pending = match read {
-                SampleRead::Gap(gap) => return Ok(self.record_gap(gap)),
-                SampleRead::Sample { sample, cadence } => (sample, cadence),
+                ObservationRead::Gap(gap) => return Ok(self.record_gap(gap)),
+                ObservationRead::Sample {
+                    observation,
+                    cadence,
+                } => (observation, cadence),
             };
 
-            if TextIdentity::from_ocr(&pending.0.ocr_text)
+            if TextIdentity::from_ocr(&pending.0.sample().ocr_text)
                 .normalized
                 .is_empty()
             {
@@ -127,10 +164,11 @@ impl Runner {
         };
 
         let mut staged_merger = self.merger.clone();
-        let decision = staged_merger.ingest_with_metadata(sample, cadence, self.pending_gaps);
+        let decision =
+            staged_merger.ingest_envelope_with_metadata(sample, cadence, self.pending_gaps);
         match decision {
-            MergeDecision::Start { reason, event } => {
-                let event_id = sink.start(&event, reason).await?;
+            EnvelopeMergeDecision::Start { reason, event } => {
+                let event_id = sink.start_envelope(&event, reason).await?;
                 self.merger = staged_merger;
                 self.current_event_id = Some(event_id.clone());
                 self.pending_gaps = CaptureGapSummary::default();
@@ -140,12 +178,12 @@ impl Runner {
                     reason,
                 })
             }
-            MergeDecision::Merge { event } => {
+            EnvelopeMergeDecision::Merge { event } => {
                 let event_id = self
                     .current_event_id
                     .clone()
                     .context("merger produced merge without a durable event id")?;
-                sink.merge(event_id.as_str(), &event).await?;
+                sink.merge_envelope(event_id.as_str(), &event).await?;
                 self.merger = staged_merger;
                 self.pending_gaps = CaptureGapSummary::default();
                 self.pending_sample = None;

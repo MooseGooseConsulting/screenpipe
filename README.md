@@ -19,6 +19,8 @@ The workspace contains only:
   boundary;
 - `screenpipe-memory`: deterministic OCR identity, merge decisions, cadence,
   and capture-to-sink orchestration;
+- `screenpipe-audio`: opt-in WASAPI capture, VAD utterance segmentation, and
+  local transcription;
 - `screenpipe-cli`: the minimal `run`, `doctor`, and `service` command surface.
 
 There is no desktop UI, cloud sync, marketplace, updater, SQLite runtime,
@@ -26,12 +28,41 @@ summarization, embedding, MCP server, or model-based merge decision.
 
 ## Build and offline verification
 
+The audio commands use a one-time online bootstrap for pinned Ninja 1.12.1
+unless that exact binary is already present; verification itself stays local.
+
 ```powershell
 cargo fmt --all -- --check
-cargo test --workspace
-cargo check --workspace
+cargo test --workspace --exclude screenpipe-audio
+cargo check --workspace --exclude screenpipe-audio
+
+$ninjaVersion = '1.12.1'
+$ninjaRoot = Join-Path $env:LOCALAPPDATA "screen-memory\tools\ninja\$ninjaVersion"
+$ninja = Join-Path $ninjaRoot 'ninja.exe'
+if (-not (Test-Path -LiteralPath $ninja)) {
+    $archive = Join-Path $env:TEMP "ninja-$ninjaVersion-win.zip"
+    $uri = "https://github.com/ninja-build/ninja/releases/download/v$ninjaVersion/ninja-win.zip"
+    Invoke-WebRequest -Uri $uri -OutFile $archive
+    New-Item -ItemType Directory -Path $ninjaRoot -Force | Out-Null
+    Expand-Archive -LiteralPath $archive -DestinationPath $ninjaRoot -Force
+}
+$env:PATH = "$ninjaRoot;$env:PATH"
+$env:CMAKE_GENERATOR = 'Ninja'
+if ((& $ninja --version).Trim() -ne $ninjaVersion) {
+    throw "Ninja $ninjaVersion is required"
+}
+$env:LIBCLANG_PATH = "$env:LOCALAPPDATA\screen-memory\llvm\bin"
+cargo test -p screenpipe-audio
+cargo check -p screenpipe-cli --features audio
 powershell -NoProfile -File .\scripts\verify-pruned.ps1
 ```
+
+Audio is a workspace member but not a default member, so the ordinary build
+stays free of the whisper.cpp toolchain. CI is configured not to omit it: a
+dedicated Windows job installs LLVM/libclang 18.1.8 and Ninja 1.12.1, sets
+`CMAKE_GENERATOR=Ninja`, tests the audio crate, and checks the CLI with its
+`audio` feature enabled. Hosted success remains a pull-request check rather
+than a claim made by this document.
 
 The three interactive Windows tests remain ignored by default. They require an
 unlocked desktop with a controlled foreground window and must not be treated as
@@ -99,6 +130,114 @@ thing being scrolled past.
 A clipboard event has no application: `events.app_id` is NULL and no `apps`
 row is created, because the foreground window at poll time is not reliably
 where the copy came from.
+
+## Audio channel
+
+Speech is transcribed locally and recorded as `events` of kind `audio`, in the
+same table, under the same `{slug}_{seq}` identifiers, through the same writer.
+**It is OFF**, and it is off in two independent ways:
+
+1. **It is not in this binary.** `audio` is a Cargo feature, disabled by
+   default. Without it there is no capture path, no whisper model, and no code
+   that can open a microphone - and the build needs neither CMake nor libclang.
+2. **Even in a build that has it, it records nothing until it is started.**
+   `screenpipe run` does not start it and `screenpipe service install` does not
+   install it. It has its own subcommand and its own scheduled task.
+
+```powershell
+# A build that CAN record audio. Uses the pinned Ninja setup above and needs
+# libclang for whisper.cpp.
+$ninjaVersion = '1.12.1'
+$ninjaRoot = Join-Path $env:LOCALAPPDATA "screen-memory\tools\ninja\$ninjaVersion"
+$env:PATH = "$ninjaRoot;$env:PATH"
+$env:CMAKE_GENERATOR = 'Ninja'
+if ((& (Join-Path $ninjaRoot 'ninja.exe') --version).Trim() -ne $ninjaVersion) {
+    throw "Ninja $ninjaVersion is required; run the offline verification setup first"
+}
+$env:LIBCLANG_PATH = "$env:LOCALAPPDATA\screen-memory\llvm\bin"
+cargo build --release -p screenpipe-cli --features audio
+
+# Prove the endpoint, the model and the database work. Records nothing.
+doppler run -p homelab -c dev_personal -- .\target\release\screenpipe.exe audio doctor
+
+# Record, in the foreground, until Ctrl-C.
+doppler run -p homelab -c dev_personal -- .\target\release\screenpipe.exe audio run
+```
+
+The model is a ggml whisper file, `ggml-base.en.bin` by default, looked for at
+`%LOCALAPPDATA%\screen-memory\models\`, overridable with
+`SCREEN_MEMORY_WHISPER_MODEL` or `--model`. Nothing downloads it automatically:
+a channel that is off by default has no business fetching 141 MB on its own.
+
+### What it records, and what it refuses
+
+- **System audio, not the microphone.** The default is loopback: what came back
+  through the speakers. It hears the far side of a call and not the operator's
+  own voice. `--microphone` records the room instead, and everyone audible in
+  it; that is a second, separate decision, it is never implied by turning the
+  channel on, and every run that does it prints
+  `event=audio_microphone state=on` at the top of the log.
+- **Never a device name.** Windows exposes strings like `Microphone (Realtek
+  High Definition Audio)`, which identify hardware in a particular person's
+  house. None of them are read. What is recorded is the endpoint ROLE -
+  `console` or `communications` - which says whether this stream follows the
+  device a call would actually use.
+- **Never near-silence.** Whisper does not return nothing for nothing; it
+  returns its best guess, which over room tone is a caption artefact. Audio
+  shorter than 250 ms is not transcribed at all, segments the model itself
+  scores above 0.6 no-speech are dropped, and an utterance with nothing left
+  writes no row - it logs `event=audio_discarded reason=no_speech`.
+- **Never the transcript in a log line.** whisper.cpp will print segments to
+  stdout if asked; every one of those switches is off, and the channel's own
+  diagnostics are fixed strings that carry no length, timing, or hash of what
+  was said.
+
+### Boundaries
+
+Silence decides. A WebRTC voice-activity detector runs on 20 ms frames: three
+voiced frames open an utterance, 600 ms of silence closes it, the 200 ms before
+the trigger is kept so the first consonant is not clipped, and the trailing
+silence is cut before the audio reaches the model. Whisper is never asked where
+speech starts.
+
+Each separately closed utterance window is its own event, even when its
+normalized transcript is identical to an earlier one. People can say the same
+thing twice, and both occurrences must remain durable. Deduplication is scoped
+to one VAD identity: only chunks with the same utterance start/end window and
+the same normalized transcript merge. Near-silence hallucinations are rejected
+by the no-speech filters above rather than erased by cross-utterance content
+deduplication.
+
+An audio event has an application, unlike a clipboard event: `audio:loopback`
+or `audio:microphone`, titled `System Audio` or `Microphone`. `window_title` is
+empty - attaching the foreground window would need a live channel to the screen
+recorder that does not exist, and a guess would put `Zoom` on a video playing in
+a browser.
+
+`merge_meta.audio` carries the engine, the model's file stem, the VAD and its
+sensitivity, the endpoint role, why the utterance ended, and the model's own
+mean no-speech probability in parts per thousand. Screen and clipboard rows
+carry no `audio` key at all.
+
+An audio event's window is real: `ended_at - started_at` is how long the speech
+ran. That takes a deliberate mechanism, because every other observation in this
+system happens at an instant - a frame is read at a moment, a copy happens at a
+moment - and an utterance runs for seconds. `ObservationEnvelope` carries that
+end beside the source-compatible `ObservationSample`, and the merger measures
+the idle gap from it. Without it the "silence" between two turns would include
+the length of the first one, and a 30-second sentence followed by a 35-second
+pause would split at a 60-second threshold that 35 seconds of silence never
+crossed.
+
+### Three threads, and why
+
+Capture owns the WASAPI stream and must never block: the audio engine's buffer
+is finite, and a stalled reader loses audio with no record that it happened. It
+hands closed utterances to a transcription thread and, if that thread is more
+than eight utterances behind, drops them and says so
+(`event=audio_dropped reason=transcriber_backlog`) rather than wait. The
+transcription thread owns the model and is the expensive one. The async loop
+owns the database. Dropping happens at the cheap end, never at the durable one.
 
 ## Runtime and secrets contract
 

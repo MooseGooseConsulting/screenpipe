@@ -2,9 +2,25 @@
 members = [
     "crates/screenpipe-screen",
     "crates/screenpipe-memory",
+    "crates/screenpipe-audio",
     "crates/screenpipe-cli",
 ]
-exclude = ["vendor/xcap"]
+
+# `screenpipe-audio` is a workspace member so it can be selected explicitly,
+# but it is deliberately absent from `default-members`. A bare `cargo build`
+# or `cargo test` covers the screen, memory, and CLI packages without requiring
+# the audio channel's CMake/libclang toolchain. Audio remains available by
+# name: `cargo test -p screenpipe-audio`.
+#
+# That is the first of the two layers that keep this channel off. The second is
+# the `audio` feature on screenpipe-cli: without it the binary has no audio
+# subcommand at all. See crates/screenpipe-audio/src/lib.rs.
+default-members = [
+    "crates/screenpipe-screen",
+    "crates/screenpipe-memory",
+    "crates/screenpipe-cli",
+]
+exclude = ["vendor/wasapi", "vendor/xcap"]
 resolver = "2"
 
 [workspace.package]
@@ -19,4 +35,5 @@ lto = true
 strip = true
 
 [patch.crates-io]
+wasapi = { path = "vendor/wasapi" }
 xcap = { path = "vendor/xcap" }
