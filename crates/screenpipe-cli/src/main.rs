@@ -4,8 +4,8 @@ use anyhow::{Context, Result, ensure};
 use chrono::Duration;
 use clap::{Parser, Subcommand};
 use screenpipe_memory::{
-    EventKind, EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventWriter, RunOutcome,
-    Runner, SampleSource,
+    EventKind, EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventReader, PgEventWriter,
+    RunOutcome, Runner, SampleSource,
 };
 use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
@@ -58,6 +58,9 @@ enum Command {
         /// Words to look for. Ranked, not literal. May be omitted if --since
         /// or --until is given.
         query: Vec<String>,
+        /// Existing machine to read without creating or changing its identity.
+        #[arg(long, default_value = DEFAULT_MACHINE_SLUG)]
+        machine_slug: String,
         #[arg(long, default_value_t = 10)]
         limit: i64,
         /// Only events that were still going after this. Accepts `90m`, `4h`,
@@ -102,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Search {
             query,
+            machine_slug,
             limit,
             since,
             until,
@@ -113,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
                 since: since.as_deref().map(parse_when).transpose()?,
                 until: until.as_deref().map(parse_when).transpose()?,
             };
-            run_search(&database_url, &request).await
+            run_search(&database_url, &machine_slug, &request).await
         }
         Command::Service { action } => run_service_action(action),
     }
@@ -126,24 +130,32 @@ async fn main() -> anyhow::Result<()> {
 /// words mean to someone looking back at their own day; a bare `YYYY-MM-DD` is
 /// local midnight on that date. Everything is converted to UTC at the boundary
 /// so the query never depends on the server's timezone.
+fn midnight_in_timezone<Tz>(
+    timezone: Tz,
+    date: chrono::NaiveDate,
+) -> Result<chrono::DateTime<chrono::Utc>>
+where
+    Tz: chrono::TimeZone,
+{
+    let naive = date.and_hms_opt(0, 0, 0).context("build local midnight")?;
+    Ok(timezone
+        .from_local_datetime(&naive)
+        .single()
+        .context("ambiguous local midnight (daylight-saving boundary)")?
+        .with_timezone(&chrono::Utc))
+}
+
 fn parse_when(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
-    use chrono::{Duration as ChronoDuration, Local, NaiveDate, TimeZone};
+    use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 
     let raw = value.trim().to_ascii_lowercase();
-    let local_midnight = |date: chrono::NaiveDate| -> Result<chrono::DateTime<chrono::Utc>> {
-        let naive = date.and_hms_opt(0, 0, 0).context("build local midnight")?;
-        Ok(Local
-            .from_local_datetime(&naive)
-            .single()
-            .context("ambiguous local midnight (daylight-saving boundary)")?
-            .with_timezone(&chrono::Utc))
-    };
 
     if raw == "today" {
-        return local_midnight(Local::now().date_naive());
+        return midnight_in_timezone(Local, Local::now().date_naive());
     }
     if raw == "yesterday" {
-        return local_midnight(
+        return midnight_in_timezone(
+            Local,
             Local::now()
                 .date_naive()
                 .pred_opt()
@@ -151,33 +163,53 @@ fn parse_when(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
         );
     }
     if let Some(rest) = raw.strip_suffix('m') {
+        ensure!(
+            !rest.starts_with('-'),
+            "relative times must not be negative"
+        );
         let minutes: i64 = rest.parse().context("minutes must be a whole number")?;
-        return Ok(chrono::Utc::now() - ChronoDuration::minutes(minutes));
+        let duration = ChronoDuration::try_minutes(minutes).context("minutes is too large")?;
+        return chrono::Utc::now()
+            .checked_sub_signed(duration)
+            .context("relative time is too large");
     }
     if let Some(rest) = raw.strip_suffix('h') {
+        ensure!(
+            !rest.starts_with('-'),
+            "relative times must not be negative"
+        );
         let hours: i64 = rest.parse().context("hours must be a whole number")?;
-        return Ok(chrono::Utc::now() - ChronoDuration::hours(hours));
+        let duration = ChronoDuration::try_hours(hours).context("hours is too large")?;
+        return chrono::Utc::now()
+            .checked_sub_signed(duration)
+            .context("relative time is too large");
     }
     if let Some(rest) = raw.strip_suffix('d') {
+        ensure!(
+            !rest.starts_with('-'),
+            "relative times must not be negative"
+        );
         let days: i64 = rest.parse().context("days must be a whole number")?;
-        return Ok(chrono::Utc::now() - ChronoDuration::days(days));
+        let duration = ChronoDuration::try_days(days).context("days is too large")?;
+        return chrono::Utc::now()
+            .checked_sub_signed(duration)
+            .context("relative time is too large");
     }
     let date = NaiveDate::parse_from_str(&raw, "%Y-%m-%d").with_context(|| {
         format!(
             "could not read {value:?} as a time: try 90m, 4h, 3d, today, yesterday, or 2026-08-06"
         )
     })?;
-    local_midnight(date)
+    midnight_in_timezone(Local, date)
 }
 
-async fn run_search(database_url: &str, request: &screenpipe_memory::SearchRequest) -> Result<()> {
-    // Connects with the same writer used by `run`, so search is subject to the
-    // identical schema and server-version guards. A read path that accepts a
-    // database the writer would refuse could show results from a shape nothing
-    // else in this system agrees with.
-    let writer =
-        PgEventWriter::connect(database_url, DEFAULT_MACHINE_SLUG, DEFAULT_DISPLAY_NAME).await?;
-    let hits = writer.search(request).await?;
+async fn run_search(
+    database_url: &str,
+    machine_slug: &str,
+    request: &screenpipe_memory::SearchRequest,
+) -> Result<()> {
+    let reader = PgEventReader::connect(database_url, machine_slug).await?;
+    let hits = reader.search(request).await?;
 
     if hits.is_empty() {
         if request.query.trim().is_empty() {
@@ -932,6 +964,29 @@ mod tests {
         assert!(no_clipboard);
     }
 
+    #[test]
+    fn search_command_scopes_reads_to_the_explicit_machine() {
+        let cli = Cli::try_parse_from([
+            "screenpipe",
+            "search",
+            "--machine-slug",
+            "laptop_b",
+            "release",
+        ])
+        .unwrap();
+        let Command::Search {
+            machine_slug,
+            query,
+            ..
+        } = cli.command
+        else {
+            panic!("search command expected");
+        };
+
+        assert_eq!(machine_slug, "laptop_b");
+        assert_eq!(query, ["release"]);
+    }
+
     #[tokio::test]
     async fn run_iteration_wires_a_sample_through_runner_and_sink() {
         let captured_at = Utc.with_ymd_and_hms(2026, 8, 4, 12, 0, 0).single().unwrap();
@@ -1073,11 +1128,13 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(today, expected);
+        let yesterday = parse_when("yesterday").unwrap();
         assert_eq!(
-            (today - parse_when("yesterday").unwrap()).num_hours(),
-            24,
-            "yesterday must be exactly one day before today"
+            yesterday.with_timezone(&Local).date_naive(),
+            today.with_timezone(&Local).date_naive().pred_opt().unwrap(),
+            "yesterday must select the preceding local calendar date"
         );
+        assert!(yesterday < today, "yesterday must precede today");
 
         // Absolute dates.
         assert_eq!(
@@ -1104,6 +1161,74 @@ mod tests {
         );
         assert!(parse_when("").is_err());
         assert!(parse_when("4 hours").is_err());
+    }
+
+    #[test]
+    fn local_midnight_keeps_named_chicago_dst_dates_on_their_calendar_day() {
+        use super::midnight_in_timezone;
+        use chrono::{Duration, NaiveDate};
+        use chrono_tz::America::Chicago;
+
+        let spring_start = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+        let spring_end = spring_start.succ_opt().unwrap();
+        let fall_start = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let fall_end = fall_start.succ_opt().unwrap();
+
+        let spring_before = midnight_in_timezone(Chicago, spring_start).unwrap();
+        let spring_after = midnight_in_timezone(Chicago, spring_end).unwrap();
+        let fall_before = midnight_in_timezone(Chicago, fall_start).unwrap();
+        let fall_after = midnight_in_timezone(Chicago, fall_end).unwrap();
+
+        assert_eq!(
+            spring_before.with_timezone(&Chicago).date_naive(),
+            spring_start
+        );
+        assert_eq!(
+            spring_after.with_timezone(&Chicago).date_naive(),
+            spring_end
+        );
+        assert_eq!(fall_before.with_timezone(&Chicago).date_naive(), fall_start);
+        assert_eq!(fall_after.with_timezone(&Chicago).date_naive(), fall_end);
+        assert_ne!(
+            spring_after - spring_before,
+            Duration::days(1),
+            "the spring transition is a calendar day, not a fixed UTC duration"
+        );
+        assert_ne!(
+            fall_after - fall_before,
+            Duration::days(1),
+            "the fall transition is a calendar day, not a fixed UTC duration"
+        );
+    }
+
+    #[test]
+    fn relative_time_rejects_a_leading_minus_instead_of_searching_the_future() {
+        use super::parse_when;
+
+        for value in ["-1m", "-4h", "-3d"] {
+            let error = parse_when(value).expect_err("{value} must not become a future window");
+            assert!(
+                format!("{error:#}").contains("must not be negative"),
+                "{value} returned the wrong error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_time_rejects_an_interval_that_chrono_cannot_represent() {
+        use super::parse_when;
+
+        for value in [
+            "9223372036854775807m",
+            "9223372036854775807h",
+            "9223372036854775807d",
+        ] {
+            let error = parse_when(value).expect_err("{value} must not panic or wrap");
+            assert!(
+                format!("{error:#}").contains("is too large"),
+                "{value} returned the wrong error: {error:#}"
+            );
+        }
     }
 
     #[test]

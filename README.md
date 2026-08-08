@@ -140,6 +140,20 @@ but do not replace it with `require`: `require` would keep encryption while
 removing certificate validation. The live endpoint now supports the stronger
 `verify-full` mode.
 
+## Search and local output privacy
+
+Search reads only an existing machine identity; it never creates or updates a
+machine. Supply ranked words, a time window, or both:
+
+```powershell
+doppler run -p homelab -c dev_personal -- .\target\release\screenpipe.exe search --machine-slug icarus --since yesterday --limit 10 release notes
+```
+
+Search prints local terminal results. Those results can include matched OCR
+snippets and stored browser URLs, so treat the terminal as sensitive output and
+do not redirect it to files, logs, shared consoles, or other private-output
+destinations unless that disclosure is intended.
+
 ## Per-user service contract
 
 The service lifecycle owns exactly these current-user artifacts:

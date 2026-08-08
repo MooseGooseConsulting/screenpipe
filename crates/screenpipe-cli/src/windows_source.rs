@@ -7,8 +7,8 @@ use screenpipe_memory::{
     CadenceInput, CadenceRecord, CaptureGap, ObservationSample, SampleRead, SampleSource,
 };
 use screenpipe_screen::{
-    BrowserUrlReader, ForegroundMetadata, FrameFingerprint, TransientFrame, WindowsCapture,
-    WindowsLastInput, WindowsOcr,
+    BrowserUrlReader, ForegroundMetadata, FrameFingerprint, InteractiveCapability, NotInteractive,
+    TransientFrame, WindowsCapture, WindowsLastInput, WindowsOcr,
 };
 
 const RETRY_CADENCE: Duration = Duration::from_secs(2);
@@ -52,6 +52,9 @@ trait WindowsSampleOps: Send {
     /// returned a window while the screen was locked - which is why a real
     /// lock produced 78 `capture_unavailable` gaps against 1 `desktop_locked`.
     fn desktop_is_locked(&mut self) -> bool;
+
+    /// Whether an interactive desktop can provide meaningful capture content.
+    fn interactive_capability(&mut self) -> InteractiveCapability;
 }
 
 struct LiveWindowsOps;
@@ -63,6 +66,10 @@ impl WindowsSampleOps for LiveWindowsOps {
         // read as either answer - defaulting to "locked" would stop capture on
         // a healthy machine.
         screenpipe_screen::session_is_locked().unwrap_or(false)
+    }
+
+    fn interactive_capability(&mut self) -> InteractiveCapability {
+        screenpipe_screen::probe_interactive_capability()
     }
 
     async fn sleep(&mut self, duration: Duration) {
@@ -89,6 +96,20 @@ impl WindowsSampleOps for LiveWindowsOps {
         BrowserUrlReader
             .read_for_foreground(metadata)
             .map(|url| url.map(|url| url.to_string()))
+    }
+}
+
+fn capture_gap_for_interactive_capability(capability: InteractiveCapability) -> Option<CaptureGap> {
+    match capability {
+        InteractiveCapability::Available => None,
+        InteractiveCapability::Unavailable(NotInteractive::DesktopLocked) => {
+            Some(CaptureGap::DesktopLocked)
+        }
+        InteractiveCapability::Unavailable(
+            NotInteractive::NoActiveConsoleSession
+            | NotInteractive::WrongSession
+            | NotInteractive::NoForegroundWindow,
+        ) => Some(CaptureGap::CaptureUnavailable),
     }
 }
 
@@ -153,6 +174,15 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
             return Ok(SampleRead::Gap(CaptureGap::DesktopLocked));
         }
 
+        // Only the explicit lock reason takes the never-abort path. The other
+        // unavailable reasons describe absent capture capacity, not a normal
+        // locked desktop, and remain ordinary capture gaps for restart policy.
+        if let Some(gap) = capture_gap_for_interactive_capability(self.ops.interactive_capability())
+        {
+            self.next_sleep = Some(RETRY_CADENCE);
+            return Ok(SampleRead::Gap(gap));
+        }
+
         let (frame, metadata) = match self.ops.capture_foreground().await {
             Ok(capture) => capture,
             Err(_) => {
@@ -174,7 +204,8 @@ impl<Ops: WindowsSampleOps> Source<Ops> {
                 let gap = if self.ops.desktop_is_locked() {
                     CaptureGap::DesktopLocked
                 } else {
-                    CaptureGap::CaptureUnavailable
+                    capture_gap_for_interactive_capability(self.ops.interactive_capability())
+                        .unwrap_or(CaptureGap::CaptureUnavailable)
                 };
                 return Ok(SampleRead::Gap(gap));
             }
@@ -323,7 +354,9 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use screenpipe_memory::{CaptureGap, SampleRead, SampleSource};
-    use screenpipe_screen::{ForegroundMetadata, TransientFrame};
+    use screenpipe_screen::{
+        ForegroundMetadata, InteractiveCapability, NotInteractive, TransientFrame,
+    };
 
     use super::{Source, WindowsSampleOps, WindowsSampleSource, cadence_record};
 
@@ -346,7 +379,7 @@ mod tests {
         input_idle: VecDeque<Result<Duration>>,
         browser_urls: VecDeque<Result<Option<String>>>,
         desktop_locked: bool,
-        desktop_answers: VecDeque<bool>,
+        capability_answers: VecDeque<InteractiveCapability>,
     }
 
     impl TestOps {
@@ -366,13 +399,16 @@ mod tests {
                 input_idle: input_idle.into_iter().collect(),
                 browser_urls: browser_urls.into_iter().collect(),
                 desktop_locked: false,
-                desktop_answers: VecDeque::new(),
+                capability_answers: VecDeque::new(),
             }
         }
 
         /// Answer the desktop probe from a script, in order.
-        fn with_desktop_answers(mut self, answers: impl IntoIterator<Item = bool>) -> Self {
-            self.desktop_answers = answers.into_iter().collect();
+        fn with_capability_answers(
+            mut self,
+            answers: impl IntoIterator<Item = InteractiveCapability>,
+        ) -> Self {
+            self.capability_answers = answers.into_iter().collect();
             self
         }
 
@@ -391,6 +427,10 @@ mod tests {
     #[async_trait]
     impl WindowsSampleOps for TestOps {
         fn desktop_is_locked(&mut self) -> bool {
+            self.desktop_locked
+        }
+
+        fn interactive_capability(&mut self) -> InteractiveCapability {
             // Every pre-existing test predates the desktop probe and asserts
             // behaviour that only happens on an unlocked desktop. Defaulting to
             // `true` keeps them meaning what they meant; the locked fixtures
@@ -399,9 +439,9 @@ mod tests {
             // A queue rather than a flag, because the defect this models is
             // precisely that the answer CHANGES between the pre-capture probe
             // and the post-failure one.
-            self.desktop_answers
+            self.capability_answers
                 .pop_front()
-                .unwrap_or(self.desktop_locked)
+                .unwrap_or(InteractiveCapability::Available)
         }
 
         async fn sleep(&mut self, duration: Duration) {
@@ -471,7 +511,10 @@ mod tests {
                     [],
                     [],
                 )
-                .with_desktop_answers([false, true]),
+                .with_capability_answers([
+                    InteractiveCapability::Available,
+                    InteractiveCapability::Unavailable(NotInteractive::DesktopLocked),
+                ]),
             )
         }
 
@@ -1058,6 +1101,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_lock_unavailable_reasons_remain_capture_gaps() {
+        for reason in [
+            NotInteractive::NoActiveConsoleSession,
+            NotInteractive::WrongSession,
+            NotInteractive::NoForegroundWindow,
+        ] {
+            let harness = Harness::new();
+            let mut source = Source::new(
+                TestOps::new(
+                    Arc::clone(&harness.clock),
+                    Arc::clone(&harness.calls),
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                .with_capability_answers([InteractiveCapability::Unavailable(reason)]),
+            );
+
+            let read = source.next_sample().await.unwrap();
+
+            assert_eq!(
+                read,
+                SampleRead::Gap(CaptureGap::CaptureUnavailable),
+                "{reason:?} is unavailable capture capacity, not a desktop lock"
+            );
+            assert_ne!(
+                read,
+                SampleRead::Gap(CaptureGap::DesktopLocked),
+                "{reason:?} must not inherit the never-abort lock route"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_lock_caught_mid_transition_is_not_blamed_on_capture() {
         // Locking a workstation stops capture working BEFORE OpenInputDesktop
         // starts refusing, so the pre-capture probe answers "available" for the
@@ -1095,6 +1173,11 @@ mod tests {
             read,
             SampleRead::Gap(CaptureGap::CaptureUnavailable),
             "a genuine capture fault on a live desktop must not be excused as a lock"
+        );
+        assert_ne!(
+            read,
+            SampleRead::Gap(CaptureGap::DesktopLocked),
+            "an available desktop and a locked desktop must remain distinct session gaps"
         );
     }
 }

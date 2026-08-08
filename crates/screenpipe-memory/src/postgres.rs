@@ -222,6 +222,12 @@ pub struct PgEventWriter {
     machine_slug: String,
 }
 
+/// A machine-scoped PostgreSQL reader that never creates or updates identity
+/// rows while establishing a search connection.
+pub struct PgEventReader {
+    writer: PgEventWriter,
+}
+
 /// Returned only when `preflight` succeeded, which means
 /// `validate_authoritative_schema` already passed. There is deliberately no
 /// `schema_present` field: it was a hardcoded `true`, so it reported schema
@@ -271,7 +277,7 @@ impl PgEventWriter {
     /// The order matters and is asserted: the version check runs BEFORE any
     /// schema validation or write, so an unsupported server is rejected
     /// without this writer having touched it.
-    pub async fn connect_with_server_version(
+    async fn connect_with_server_version(
         pool: PgPool,
         server_version_num: i32,
         slug: &str,
@@ -279,6 +285,7 @@ impl PgEventWriter {
     ) -> Result<Self> {
         ensure_supported_server_version(server_version_num)?;
         validate_authoritative_schema(&pool).await?;
+        backfill_event_titles(&pool).await?;
         let machine_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO machines (slug, display_name) VALUES ($1, $2) \
              ON CONFLICT (slug) DO UPDATE SET display_name = EXCLUDED.display_name \
@@ -419,6 +426,72 @@ impl PgEventWriter {
     }
 }
 
+impl PgEventReader {
+    /// Connect to an already-recorded machine without changing its identity.
+    pub async fn connect(database_url: &str, slug: &str) -> Result<Self> {
+        if database_url.trim().is_empty() {
+            bail!("PostgreSQL database URL is blank");
+        }
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(database_url)
+            .await
+            .context("connect PostgreSQL event reader")?;
+        let server_version_num =
+            sqlx::query_scalar::<_, i32>("SELECT current_setting('server_version_num')::integer")
+                .fetch_one(&pool)
+                .await
+                .context("read PostgreSQL server version")?;
+        ensure_supported_server_version(server_version_num)?;
+        validate_authoritative_schema(&pool).await?;
+        let machine_id = sqlx::query_scalar::<_, i64>("SELECT id FROM machines WHERE slug = $1")
+            .bind(slug)
+            .fetch_one(&pool)
+            .await
+            .context("read search machine identity")?;
+        Ok(Self {
+            writer: PgEventWriter {
+                pool,
+                machine_id,
+                machine_slug: slug.to_owned(),
+            },
+        })
+    }
+
+    pub async fn search(&self, request: &SearchRequest) -> Result<Vec<SearchHit>> {
+        self.writer.search(request).await
+    }
+}
+
+async fn backfill_event_titles(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"WITH title_candidates AS (
+               SELECT e.id,
+                   NULLIF(
+                       concat_ws(
+                           ' - ',
+                           NULLIF(btrim(regexp_replace(a.app_title, '\s+', ' ', 'g')), ''),
+                           NULLIF(btrim(regexp_replace(e.window_title, '\s+', ' ', 'g')), '')
+                       ),
+                       ''
+                   ) AS title
+               FROM events e
+               LEFT JOIN apps a ON e.app_id = a.id
+               WHERE e.title IS NULL
+           )
+           UPDATE events e
+           SET title = title_candidates.title
+           FROM title_candidates
+           WHERE e.id = title_candidates.id
+             AND e.title IS NULL
+             AND title_candidates.title IS NOT NULL"#,
+    )
+    .execute(pool)
+    .await
+    .context("backfill missing event titles")?;
+    Ok(())
+}
+
 async fn validate_authoritative_schema(pool: &PgPool) -> Result<()> {
     for (component, statement) in [
         ("columns", REQUIRED_COLUMNS_SQL),
@@ -556,9 +629,10 @@ fn merge_meta(event: &OpenEvent, start_reason: SplitReason) -> Value {
             "capture_unavailable": event.capture_gaps.capture_unavailable,
             "ocr_unavailable": event.capture_gaps.ocr_unavailable,
             "empty_ocr": event.capture_gaps.empty_ocr,
-            // The durable record that a lock happened. merge_meta.capture_gaps
-            // is the only place a seam run can read it back after the fact -
-            // the agent log rotates and the process restarts, this does not.
+            // This is persisted only when a later content event flushes the
+            // runner's pending counters. A terminal lock gap is not durable in
+            // this PR; independent gap persistence is deferred to Context
+            // Pipeline V2.
             "desktop_locked": event.capture_gaps.desktop_locked,
         },
         "browser_url": event.latest.browser_url,
@@ -661,7 +735,7 @@ impl PgEventWriter {
                     e.merge_meta ->> 'browser_url', \
                     CASE WHEN $4 THEN \
                         ts_headline('english', \
-                                    left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 20000), \
+                                    coalesce(nullif(e.readable_text, ''), e.ocr_text), \
                                     plainto_tsquery('english', $1), \
                                     'StartSel=[, StopSel=], MaxFragments=2, FragmentDelimiter= ... , MaxWords=18, MinWords=6') \
                     ELSE left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 160) END \

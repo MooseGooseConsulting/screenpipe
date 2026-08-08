@@ -5,6 +5,7 @@
     "find": "if self.counts.len() >= MAX_TRACKED_HASHES",
     "replace": "if self.counts.len() >= usize::MAX",
     "package": "screenpipe-memory",
+    "test": "merge_contract",
     "claim": "the per-event hash ledger is bounded, so one event cannot accumulate a key per sample"
   },
   {
@@ -13,6 +14,7 @@
     "find": "self.evicted = self.evicted.saturating_add(1);",
     "replace": "self.evicted = self.evicted;",
     "package": "screenpipe-memory",
+    "test": "merge_contract",
     "claim": "evicted hashes are counted, so merge_meta distinguishes a truncated ledger from a complete census"
   },
   {
@@ -21,6 +23,7 @@
     "find": "&& let Some(oldest) = self.order.pop_front()",
     "replace": "&& let Some(oldest) = self.order.pop_back()",
     "package": "screenpipe-memory",
+    "test": "merge_contract",
     "claim": "eviction is oldest-first, so `contains` answers \"seen recently\""
   },
   {
@@ -112,12 +115,33 @@
     "claim": "the capture task has no execution time limit, so it survives past three days"
   },
   {
-    "id": "connect-skips-the-postgres-18-floor",
+    "id": "postgres-version-floor-is-bypassed",
     "file": "crates/screenpipe-memory/src/postgres.rs",
-    "find": "        ensure_supported_server_version(server_version_num)?;\n        validate_authoritative_schema(&pool).await?;\n        let machine_id",
-    "replace": "        let _ = server_version_num;\n        validate_authoritative_schema(&pool).await?;\n        let machine_id",
+    "find": "        server_version_num >= MINIMUM_SERVER_VERSION_NUM,",
+    "replace": "        true,",
     "package": "screenpipe-memory",
-    "claim": "the PostgreSQL 18 floor is enforced on the path that actually writes, not only in doctor"
+    "filter": "server_versions_below_postgres_18_are_rejected",
+    "claim": "the PostgreSQL 18 floor rejects unsupported server versions"
+  },
+  {
+    "id": "merge-contract-version-is-replaced",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "        \"merge_contract_version\": event.merge_contract_version,",
+    "replace": "        \"merge_contract_version\": 0,",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "filter": "starts_allocate_icarus_ids_and_persist_authoritative_event_fields",
+    "claim": "persisted merge metadata retains the event merge-contract version"
+  },
+  {
+    "id": "screen-start-title-bind-is-cleared",
+    "file": "crates/screenpipe-memory/src/postgres.rs",
+    "find": "        .bind(merge_meta)\n        .bind(event_title(event))\n        .execute(&mut *transaction)",
+    "replace": "        .bind(merge_meta)\n        .bind(None::<String>)\n        .execute(&mut *transaction)",
+    "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "filter": "starts_allocate_icarus_ids_and_persist_authoritative_event_fields",
+    "claim": "the event-start title SQL bind persists the derived search title"
   },
   {
     "id": "upsert-app-freezes-last-seen-at",
@@ -125,6 +149,8 @@
     "find": "             app_title = EXCLUDED.app_title, last_seen_at = EXCLUDED.last_seen_at \\",
     "replace": "             app_title = EXCLUDED.app_title \\",
     "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "filter": "repeated_app_sightings_preserve_first_seen_and_advance_last_seen",
     "claim": "a repeat app sighting advances apps.last_seen_at"
   },
   {
@@ -138,8 +164,8 @@
   {
     "id": "locked-desktop-collapses-into-capture-unavailable",
     "file": "crates/screenpipe-cli/src/windows_source.rs",
-    "find": "            return Ok(SampleRead::Gap(CaptureGap::DesktopLocked));",
-    "replace": "            return Ok(SampleRead::Gap(CaptureGap::CaptureUnavailable));",
+    "find": "            Some(CaptureGap::DesktopLocked)",
+    "replace": "            Some(CaptureGap::CaptureUnavailable)",
     "package": "screenpipe-cli",
     "claim": "a lock is its own gap kind, not collapsed into a capture failure"
   },
@@ -162,7 +188,7 @@
   {
     "id": "lock-transition-blamed-on-capture",
     "file": "crates/screenpipe-cli/src/windows_source.rs",
-    "find": "                let gap = if self.ops.desktop_is_locked() {\n                    CaptureGap::DesktopLocked\n                } else {\n                    CaptureGap::CaptureUnavailable\n                };",
+    "find": "                let gap = if self.ops.desktop_is_locked() {\n                    CaptureGap::DesktopLocked\n                } else {\n                    capture_gap_for_interactive_capability(self.ops.interactive_capability())\n                        .unwrap_or(CaptureGap::CaptureUnavailable)\n                };",
     "replace": "                let gap = CaptureGap::CaptureUnavailable;",
     "package": "screenpipe-cli",
     "claim": "a capture failure during a lock transition is attributed to the lock, not the capture device"
@@ -170,8 +196,8 @@
   {
     "id": "every-capture-failure-excused-as-a-lock",
     "file": "crates/screenpipe-cli/src/windows_source.rs",
-    "find": "                    CaptureGap::DesktopLocked\n                } else {\n                    CaptureGap::CaptureUnavailable\n                };",
-    "replace": "                    CaptureGap::DesktopLocked\n                } else {\n                    CaptureGap::DesktopLocked\n                };",
+    "find": ".unwrap_or(CaptureGap::CaptureUnavailable)",
+    "replace": ".unwrap_or(CaptureGap::DesktopLocked)",
     "package": "screenpipe-cli",
     "claim": "a genuine capture fault on a live desktop is not excused as a lock"
   },

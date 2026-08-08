@@ -13,9 +13,7 @@ pub use merge::{
     MAX_EVENT_SAMPLES, MAX_TRACKED_HASHES, MERGE_CONTRACT_VERSION, MergeConfig, MergeDecision,
     MergeDecisionKind, Merger, OpenEvent, SplitReason,
 };
-pub use postgres::{
-    MINIMUM_SERVER_VERSION_NUM, PgEventWriter, PgPreflight, SearchHit, SearchRequest,
-};
+pub use postgres::{PgEventReader, PgEventWriter, PgPreflight, SearchHit, SearchRequest};
 pub use runner::{EventId, EventSink, RunOutcome, Runner, SampleRead, SampleSource};
 pub use sample::ObservationSample;
 pub use text_hash::{TextIdentity, jaccard_overlap};
