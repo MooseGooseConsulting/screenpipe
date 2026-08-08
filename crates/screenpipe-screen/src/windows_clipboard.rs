@@ -13,6 +13,7 @@
 //!    carries it in one variant and `as_code` returns a fixed category for
 //!    every variant including that one.
 
+use std::mem::size_of;
 use std::os::windows::ffi::OsStringExt;
 
 use anyhow::{Context, Result, bail};
@@ -29,6 +30,9 @@ use windows::core::PCWSTR;
 /// else; the same local-constant pattern as `DESKTOP_SWITCHDESKTOP` and
 /// `PROCESS_QUERY_LIMITED_INFORMATION` elsewhere in this crate.
 const CF_UNICODETEXT: u32 = 13;
+
+/// Maximum allocation inspected for one copied Unicode-text generation.
+const MAX_CLIPBOARD_ALLOCATION_BYTES: usize = 16 * 1024 * 1024;
 
 /// Set by an application that wants its clipboard content left alone by
 /// monitors and recorders. Presence alone is the refusal - the format is
@@ -165,7 +169,7 @@ impl ClipboardRead {
 /// refused `OpenClipboard`. It comes back [`ClipboardRead::Unavailable`],
 /// which does NOT consume the generation, so the observation survives the lock
 /// and is captured on the first poll after the machine is unlocked.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ClipboardWatcher {
     last_sequence: Option<u32>,
 }
@@ -331,7 +335,14 @@ fn read_unicode_text() -> Result<Option<String>> {
     }
     let handle: HANDLE =
         unsafe { GetClipboardData(CF_UNICODETEXT) }.context("read clipboard Unicode text")?;
-    let Some(locked) = LockedGlobal::lock(HGLOBAL(handle.0)) else {
+    let global = HGLOBAL(handle.0);
+    // Check the advertised allocation before taking a lock or allocating a
+    // Rust string. The NUL terminator cannot make a hostile over-allocation
+    // safe: `GlobalSize` describes the whole Win32 block we would scan.
+    if unsafe { GlobalSize(global) } > MAX_CLIPBOARD_ALLOCATION_BYTES {
+        return Ok(None);
+    }
+    let Some(locked) = LockedGlobal::lock(global) else {
         bail!("cannot lock the clipboard's text buffer");
     };
 

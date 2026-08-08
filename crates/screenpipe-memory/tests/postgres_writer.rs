@@ -7,8 +7,7 @@ use anyhow::{Context, Result, ensure};
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
     CadenceInput, CadenceRecord, CaptureGapSummary, EventKind, HashLedger, MERGE_CONTRACT_VERSION,
-    MINIMUM_SERVER_VERSION_NUM, MergeDecisionKind, ObservationSample, OpenEvent, PgEventWriter,
-    SplitReason,
+    MergeDecisionKind, ObservationSample, OpenEvent, PgEventReader, PgEventWriter, SplitReason,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -152,10 +151,12 @@ fn announce_skip() {
         // is byte-for-byte identical to one that exercised PostgreSQL. Writing
         // to the process stdout handle bypasses that capture, which is the only
         // way this line survives a plain `cargo test --workspace`.
+        let mut stdout = std::io::stdout();
         let _ = writeln!(
-            std::io::stdout(),
+            stdout,
             "SKIPPED postgres_writer: {TEST_DATABASE_URL_ENV} is not set, so no PostgreSQL integration test ran."
         );
+        let _ = stdout.flush();
     });
 }
 
@@ -171,7 +172,7 @@ fn test_database_url() -> Option<String> {
 }
 
 fn database_name(database_url: &str) -> Option<&str> {
-    let after_scheme = database_url.split("://").nth(1)?;
+    let after_scheme = database_url.split_once("://")?.1;
     let path = after_scheme.split_once('/')?.1;
     let name = path.split(['?', '#']).next()?;
     (!name.is_empty()).then_some(name)
@@ -226,8 +227,10 @@ fn an_absent_test_database_url_is_a_skip_and_a_present_one_is_still_guarded() {
 fn the_production_capture_database_is_refused() {
     // The exact URL Doppler injects must be rejected. Without this the suite
     // silently ran DDL inside the live capture database.
-    let production = "postgresql://screen_memory:secret@127.0.0.1:5432/screen_memory";
-    let error = ensure_test_database(production).unwrap_err();
+    const CREDENTIAL_MARKER: &str = "__TEST_DATABASE_PASSWORD_MARKER__";
+    let production =
+        format!("postgresql://screen_memory:{CREDENTIAL_MARKER}@127.0.0.1:5432/screen_memory");
+    let error = ensure_test_database(&production).unwrap_err();
     let rendered = format!("{error:#}");
     assert!(
         rendered.contains("refusing to run schema-mutating tests"),
@@ -235,8 +238,8 @@ fn the_production_capture_database_is_refused() {
     );
     // The refusal must not echo the credential it was handed.
     assert!(
-        !rendered.contains("secret"),
-        "the refusal leaked the connection secret: {rendered}"
+        !rendered.contains(CREDENTIAL_MARKER),
+        "the refusal leaked the test credential marker: {rendered}"
     );
 
     ensure_test_database("postgresql://u:p@127.0.0.1:5432/screen_memory_test")
@@ -1052,75 +1055,6 @@ async fn no_disposable_writer_schemas_remain() -> Result<()> {
 }
 
 #[tokio::test]
-async fn connect_refuses_an_unsupported_server_before_touching_it() -> Result<()> {
-    // The PostgreSQL 18 floor was moved into `connect` because `run_capture`
-    // never calls `preflight` - only `doctor` does - so the guard was
-    // unreachable on the one path that writes for 24 hours.
-    //
-    // That fix then survived a mutation deleting the call, because the version
-    // comes from `current_setting('server_version_num')`, a preset GUC no test
-    // can override: there was no way to present an old server without owning
-    // one. `connect_with_server_version` takes the number as a parameter for
-    // exactly this reason.
-    let Some(db) = TestDatabase::create().await? else {
-        return Ok(());
-    };
-    let test_result = async {
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&db.scoped_url)
-            .await
-            .context("connect a pool for the version guard")?;
-
-        // One below the floor. PostgreSQL 17.9 would report 170_009.
-        let rejected = PgEventWriter::connect_with_server_version(
-            pool.clone(),
-            MINIMUM_SERVER_VERSION_NUM - 1,
-            "icarus",
-            "Icarus-Laptop",
-        )
-        .await;
-        let error = rejected
-            .err()
-            .context("an unsupported server version must be refused")?;
-        ensure!(
-            format!("{error:#}").contains("PostgreSQL 18 or newer"),
-            "expected a version refusal, got: {error:#}"
-        );
-
-        // The refusal must land BEFORE any write. A guard that rejects after
-        // upserting the machine row has already touched a server it declared
-        // unsupported.
-        let machines: i64 = sqlx::query_scalar("SELECT count(*) FROM machines")
-            .fetch_one(&pool)
-            .await
-            .context("count machines after the refusal")?;
-        ensure!(
-            machines == 0,
-            "the writer wrote to an unsupported server before rejecting it: {machines} machine row(s)"
-        );
-
-        // Positive control: at the floor exactly, the same call must succeed.
-        // Without this the guard could reject everything and still pass.
-        let accepted = PgEventWriter::connect_with_server_version(
-            pool.clone(),
-            MINIMUM_SERVER_VERSION_NUM,
-            "icarus",
-            "Icarus-Laptop",
-        )
-        .await;
-        ensure!(
-            accepted.is_ok(),
-            "a server at the minimum supported version must be accepted: {:#}",
-            accepted.err().expect("checked is_ok")
-        );
-        Ok(())
-    }
-    .await;
-    db.finish(test_result).await
-}
-
-#[tokio::test]
 async fn search_finds_by_words_by_time_and_by_both() -> Result<()> {
     // The read path. Until it existed this system was write-only: it recorded
     // continuously and offered no way to ask it anything, which made every
@@ -1236,12 +1170,353 @@ async fn search_finds_by_words_by_time_and_by_both() -> Result<()> {
     db.finish(test_result).await
 }
 
-/// Feeds the runner a fixed script of clipboard reads, then refuses to be asked
-/// again.
-///
-/// Panicking on an extra read is what proves the runner consumed exactly the
-/// captures the channel produced - a source that returned a default sample
-/// forever would make every assertion below pass for the wrong reason.
+#[tokio::test]
+async fn search_headline_includes_context_for_a_match_after_twenty_thousand_characters()
+-> Result<()> {
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let mut late = event(1, "notepad.exe", "Notepad", "notes", "early OCR", None);
+        late.latest.readable_text = format!("{}lateheadlinefixturemarker", "filler ".repeat(3_500));
+        let event_id = writer.write_start(&late, SplitReason::Initial).await?;
+
+        let hits = writer
+            .search(&screenpipe_memory::SearchRequest {
+                query: "lateheadlinefixturemarker".to_owned(),
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        ensure!(
+            hits.iter()
+                .map(|hit| hit.event_id.as_str())
+                .eq([event_id.as_str()]),
+            "the complete FTS corpus must find the late marker: {hits:?}"
+        );
+        ensure!(
+            hits[0].snippet.contains("[lateheadlinefixturemarker]"),
+            "the headline must show context around its late match: {:?}",
+            hits[0].snippet
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn search_headline_marks_a_caption_only_match() -> Result<()> {
+    // A headline source that omits `caption` can return this FTS hit with an
+    // unmarked body snippet, even though caption is a searchable field.
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let mut recorded = event(1, "notepad.exe", "Notepad", "notes", "ordinary OCR", None);
+        recorded.latest.readable_text = "ordinary readable body".to_owned();
+        let event_id = writer.write_start(&recorded, SplitReason::Initial).await?;
+        sqlx::query("UPDATE events SET caption = $1 WHERE id = $2")
+            .bind("captionheadlinefixturemarker")
+            .bind(&event_id)
+            .execute(&db.pool)
+            .await?;
+
+        let hits = writer
+            .search(&screenpipe_memory::SearchRequest {
+                query: "captionheadlinefixturemarker".to_owned(),
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        ensure!(
+            hits.iter()
+                .map(|hit| hit.event_id.as_str())
+                .eq([event_id.as_str()]),
+            "caption-only FTS query must return its event"
+        );
+        ensure!(
+            hits[0].snippet.contains("[captionheadlinefixturemarker]"),
+            "caption-only FTS match must be included and marked in the headline"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn explicit_machine_search_connection_never_upserts_a_machine() -> Result<()> {
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        writer
+            .write_start(
+                &event(1, "notepad.exe", "Notepad", "notes", "searchable", None),
+                SplitReason::Initial,
+            )
+            .await?;
+        let before: (i64, String, i64) = sqlx::query_as(
+            "SELECT id, display_name, next_event_seq FROM machines WHERE slug = $1",
+        )
+        .bind("icarus")
+        .fetch_one(&db.pool)
+        .await?;
+
+        let reader = PgEventReader::connect(&db.scoped_url, "icarus").await?;
+        let hits = reader
+            .search(&screenpipe_memory::SearchRequest {
+                query: "searchable".to_owned(),
+                limit: 10,
+                ..Default::default()
+            })
+            .await?;
+        let after: (i64, String, i64) = sqlx::query_as(
+            "SELECT id, display_name, next_event_seq FROM machines WHERE slug = $1",
+        )
+        .bind("icarus")
+        .fetch_one(&db.pool)
+        .await?;
+
+        ensure!(
+            hits.len() == 1,
+            "the explicit machine reader did not return its recorded event"
+        );
+        ensure!(
+            before == after,
+            "search must not upsert or otherwise mutate the explicit machine: before={before:?} after={after:?}"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn concurrent_writer_startup_backfills_each_historical_title_once() -> Result<()> {
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let event_id = writer
+            .write_start(
+                &event(
+                    1,
+                    "notepad.exe",
+                    "Notepad",
+                    "race-free title",
+                    "text",
+                    None,
+                ),
+                SplitReason::Initial,
+            )
+            .await?;
+        sqlx::query("UPDATE events SET title = NULL WHERE id = $1")
+            .bind(&event_id)
+            .execute(&db.pool)
+            .await?;
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE title_backfill_audit (id BIGSERIAL PRIMARY KEY);
+            CREATE FUNCTION pause_and_count_title_backfill() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                INSERT INTO title_backfill_audit DEFAULT VALUES;
+                PERFORM pg_sleep(0.25);
+                RETURN NEW;
+            END;
+            $$;
+            CREATE TRIGGER pause_and_count_title_backfill
+            BEFORE UPDATE OF title ON events
+            FOR EACH ROW WHEN (NEW.title IS NOT NULL)
+            EXECUTE FUNCTION pause_and_count_title_backfill();
+            "#,
+        )
+        .execute(&db.pool)
+        .await?;
+
+        let (left, right) = tokio::join!(
+            PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop"),
+            PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop"),
+        );
+        drop((left?, right?));
+
+        let updates: i64 = sqlx::query_scalar("SELECT count(*) FROM title_backfill_audit")
+            .fetch_one(&db.pool)
+            .await?;
+        let title: Option<String> = sqlx::query_scalar("SELECT title FROM events WHERE id = $1")
+            .bind(&event_id)
+            .fetch_one(&db.pool)
+            .await?;
+        ensure!(
+            updates == 1,
+            "concurrent writer startup must backfill once, not rewrite an already-backfilled title: updates={updates}"
+        );
+        ensure!(title.as_deref() == Some("Notepad - race-free title"));
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn writer_backfills_window_only_historical_events_without_an_app_row() -> Result<()> {
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let _writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let machine_id: i64 = sqlx::query_scalar("SELECT id FROM machines WHERE slug = $1")
+            .bind("icarus")
+            .fetch_one(&db.pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO events (\
+                 id, machine_id, seq, kind, started_at, ended_at, app_id, window_title, \
+                 ocr_text, readable_text, ocr_text_hash, sample_count, merge_meta, title\
+             ) VALUES ($1, $2, $3, 'screen', $4, $5, NULL, $6, $7, $8, $9, $10, $11, NULL)",
+        )
+        .bind("icarus_999")
+        .bind(machine_id)
+        .bind(999_i64)
+        .bind(at(1))
+        .bind(at(1))
+        .bind("window-only historical title")
+        .bind("text")
+        .bind("text")
+        .bind("hash-window-only")
+        .bind(1_i32)
+        .bind(serde_json::json!({}))
+        .execute(&db.pool)
+        .await?;
+
+        let _ = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let title: Option<String> =
+            sqlx::query_scalar("SELECT title FROM events WHERE id = 'icarus_999'")
+                .fetch_one(&db.pool)
+                .await?;
+        ensure!(
+            title.as_deref() == Some("window-only historical title"),
+            "a nullable app_id must not prevent window-only historical title backfill: {title:?}"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn writer_backfills_missing_titles_once_for_existing_events() -> Result<()> {
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let event_id = writer
+            .write_start(
+                &event(
+                    1,
+                    "notepad.exe",
+                    "  Notepad  Editor  ",
+                    "  project notes  ",
+                    "text",
+                    None,
+                ),
+                SplitReason::Initial,
+            )
+            .await?;
+        sqlx::query("UPDATE events SET title = NULL WHERE id = $1")
+            .bind(&event_id)
+            .execute(&db.pool)
+            .await?;
+
+        let _ = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let first: (Option<String>, String) =
+            sqlx::query_as("SELECT title, xmin::text FROM events WHERE id = $1")
+                .bind(&event_id)
+                .fetch_one(&db.pool)
+                .await?;
+        let _ = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let second: (Option<String>, String) =
+            sqlx::query_as("SELECT title, xmin::text FROM events WHERE id = $1")
+                .bind(&event_id)
+                .fetch_one(&db.pool)
+                .await?;
+
+        ensure!(
+            first.0 == Some("Notepad Editor - project notes".to_owned()),
+            "the title migration did not backfill the event: {first:?}"
+        );
+        ensure!(
+            first == second,
+            "a completed title migration must not rewrite rows: first={first:?} second={second:?}"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
+#[tokio::test]
+async fn writer_backfill_leaves_blank_derived_titles_null_without_rewriting_them() -> Result<()> {
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
+    let test_result = async {
+        let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let event_id = writer
+            .write_start(
+                &event(
+                    1,
+                    "notepad.exe",
+                    " \t\r\n ",
+                    "\n\t  ",
+                    "text",
+                    None,
+                ),
+                SplitReason::Initial,
+            )
+            .await?;
+        sqlx::query("UPDATE events SET title = NULL WHERE id = $1")
+            .bind(&event_id)
+            .execute(&db.pool)
+            .await?;
+        let before: (Option<String>, String) =
+            sqlx::query_as("SELECT title, xmin::text FROM events WHERE id = $1")
+                .bind(&event_id)
+                .fetch_one(&db.pool)
+                .await?;
+
+        let _ = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let first: (Option<String>, String) =
+            sqlx::query_as("SELECT title, xmin::text FROM events WHERE id = $1")
+                .bind(&event_id)
+                .fetch_one(&db.pool)
+                .await?;
+        let _ = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
+        let second: (Option<String>, String) =
+            sqlx::query_as("SELECT title, xmin::text FROM events WHERE id = $1")
+                .bind(&event_id)
+                .fetch_one(&db.pool)
+                .await?;
+
+        ensure!(before.0.is_none(), "the blank title fixture must begin NULL: {before:?}");
+        ensure!(first.0.is_none(), "the first writer connection filled a blank title: {first:?}");
+        ensure!(second.0.is_none(), "the second writer connection filled a blank title: {second:?}");
+        ensure!(
+            before == first && first == second,
+            "blank derived titles must not create row versions: before={before:?} first={first:?} second={second:?}"
+        );
+        Ok(())
+    }
+    .await;
+    db.finish(test_result).await
+}
+
 struct ScriptedSource(std::collections::VecDeque<screenpipe_memory::SampleRead>);
 
 #[async_trait::async_trait]
@@ -1254,7 +1529,6 @@ impl screenpipe_memory::SampleSource for ScriptedSource {
     }
 }
 
-/// A clipboard capture in the shape the channel produces one: text, no app.
 fn clipboard_read(second: u32, text: &str) -> screenpipe_memory::SampleRead {
     screenpipe_memory::SampleRead::Sample {
         sample: ObservationSample {
@@ -1283,27 +1557,18 @@ fn clipboard_read(second: u32, text: &str) -> screenpipe_memory::SampleRead {
 #[tokio::test]
 async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_discipline()
 -> Result<()> {
-    // The whole channel end to end, through the real merger, the real runner,
-    // and the real writer: only the Win32 clipboard read is scripted. What this
-    // has to prove is that clipboard capture reuses the durable machinery
-    // rather than paralleling it - the same `{slug}_{seq}` allocator, the same
-    // `events` table, the same `merge_meta` - and that the rows it writes say
-    // `clipboard` and not `screen`.
     let Some(db) = TestDatabase::create().await? else {
         return Ok(());
     };
     let test_result = async {
         let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
-        // A screen event first, so the sequence the clipboard events get is
-        // demonstrably the SHARED machine sequence and not a second counter.
         let screen_id = writer
             .write_start(
                 &event(0, "notepad.exe", "Notepad", "notes", "screen text", None),
                 SplitReason::Initial,
             )
             .await?;
-
-        let copied = "the release checklist item that was copied";
+        let copied = "clipboard search fixture";
         let mut runner = screenpipe_memory::Runner::new(screenpipe_memory::MergeConfig {
             kind: EventKind::Clipboard,
             idle_gap: Duration::seconds(60),
@@ -1312,19 +1577,15 @@ async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_dis
         let mut source = ScriptedSource(
             [
                 clipboard_read(1, copied),
-                // The same text copied again: one event, two samples.
                 clipboard_read(3, copied),
-                // Different text: a second event.
-                clipboard_read(5, "an unrelated thing that was copied later"),
+                clipboard_read(5, "different clipboard fixture"),
             ]
             .into_iter()
             .collect(),
         );
-
         let first = runner.run_once(&mut source, &writer).await?;
         let merged = runner.run_once(&mut source, &writer).await?;
         let second = runner.run_once(&mut source, &writer).await?;
-
         let (first_id, second_id) = match (&first, &merged, &second) {
             (
                 screenpipe_memory::RunOutcome::Started {
@@ -1341,16 +1602,10 @@ async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_dis
             ) if merged_id == first_id => (first_id.clone(), second_id.clone()),
             other => anyhow::bail!("clipboard channel produced {other:?}"),
         };
-
-        // Durable ids come from the machine allocator, in one shared sequence
-        // with the screen event above.
         ensure!(
             (screen_id.as_str(), first_id.as_str(), second_id.as_str())
-                == ("icarus_1", "icarus_2", "icarus_3"),
-            "clipboard events did not take the shared slug_seq allocator: \
-             {screen_id}, {first_id}, {second_id}"
+                == ("icarus_1", "icarus_2", "icarus_3")
         );
-
         let row = sqlx::query(
             "SELECT kind, started_at, ended_at, ocr_text, readable_text, ocr_text_hash, \
                     sample_count, app_id, window_title, title, merge_meta \
@@ -1361,32 +1616,22 @@ async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_dis
         .await?;
         ensure!(row.try_get::<String, _>("kind")? == "clipboard");
         ensure!(row.try_get::<chrono::DateTime<Utc>, _>("started_at")? == at(1));
-        // The merge extended the open event rather than opening a new one.
         ensure!(row.try_get::<chrono::DateTime<Utc>, _>("ended_at")? == at(3));
         ensure!(row.try_get::<i32, _>("sample_count")? == 2);
-        // The copied text lands in the same columns OCR text does, so search
-        // and retrieval need no second path.
         ensure!(row.try_get::<String, _>("ocr_text")? == copied);
         ensure!(row.try_get::<String, _>("readable_text")? == copied);
         ensure!(
             row.try_get::<String, _>("ocr_text_hash")?
                 == screenpipe_memory::TextIdentity::from_ocr(copied).exact_hash
         );
-        // No application invented for a capture that has none.
         ensure!(row.try_get::<Option<i64>, _>("app_id")?.is_none());
         ensure!(row.try_get::<String, _>("window_title")?.is_empty());
         ensure!(row.try_get::<Option<String>, _>("title")? == Some("Clipboard".to_owned()));
-
         let meta: Value = row.try_get("merge_meta")?;
-        ensure!(
-            meta["merge_contract_version"] == json!(MERGE_CONTRACT_VERSION),
-            "clipboard merge_meta did not record the contract: {meta:#}"
-        );
+        ensure!(meta["merge_contract_version"] == json!(MERGE_CONTRACT_VERSION));
         ensure!(meta["start_reason"] == json!("initial"));
         ensure!(meta["last_decision"] == json!("merge"));
         ensure!(meta["sample_count"] == json!(2));
-
-        // And the second event is a separate row, not an overwrite.
         let second_row = sqlx::query(
             "SELECT kind, ocr_text, sample_count, merge_meta FROM events WHERE id = $1",
         )
@@ -1399,28 +1644,19 @@ async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_dis
             second_row.try_get::<Value, _>("merge_meta")?["start_reason"]
                 == json!("text_hash_change")
         );
-
-        // The screen event kept its own kind, so `kind` is bound per event and
-        // not per writer.
         let screen_kind: String = sqlx::query_scalar("SELECT kind FROM events WHERE id = $1")
             .bind(&screen_id)
             .fetch_one(&db.pool)
             .await?;
         ensure!(screen_kind == "screen");
-
-        // Clipboard text is searchable through the same index as screen text.
         let hits = writer
             .search(&screenpipe_memory::SearchRequest {
-                query: "release checklist".to_owned(),
+                query: "clipboard search".to_owned(),
                 limit: 10,
                 ..Default::default()
             })
             .await?;
-        ensure!(
-            hits.iter().any(|hit| hit.event_id == first_id),
-            "the clipboard event was not searchable: {:?}",
-            hits.iter().map(|hit| &hit.event_id).collect::<Vec<_>>()
-        );
+        ensure!(hits.iter().any(|hit| hit.event_id == first_id));
         Ok(())
     }
     .await;

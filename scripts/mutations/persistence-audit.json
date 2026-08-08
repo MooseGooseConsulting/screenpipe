@@ -11,8 +11,8 @@
   {
     "id": "start-sample-count-hardcoded-to-one",
     "file": "crates/screenpipe-memory/src/postgres.rs",
-    "find": "        .bind(sample_count)\n        .bind(merge_meta)\n        .execute(&mut *transaction)\n        .await\n        .context(\"insert allocated screen event\")?;",
-    "replace": "        .bind(1_i32)\n        .bind(merge_meta)\n        .execute(&mut *transaction)\n        .await\n        .context(\"insert allocated screen event\")?;",
+    "find": "        .bind(sample_count)\n        .bind(merge_meta)\n        .bind(event_title(event))\n        .execute(&mut *transaction)\n        .await\n        .context(\"insert allocated screen event\")?;",
+    "replace": "        .bind(1_i32)\n        .bind(merge_meta)\n        .bind(event_title(event))\n        .execute(&mut *transaction)\n        .await\n        .context(\"insert allocated screen event\")?;",
     "package": "screenpipe-memory",
     "test": "postgres_writer",
     "claim": "a started event persists its own sample_count rather than relying on the column default"
@@ -20,8 +20,8 @@
   {
     "id": "merge-drops-machine-scoping",
     "file": "crates/screenpipe-memory/src/postgres.rs",
-    "find": "WHERE id = $9 AND machine_id = $10",
-    "replace": "WHERE id = $9 AND $10 = $10",
+    "find": "WHERE id = $10 AND machine_id = $11",
+    "replace": "WHERE id = $10 AND $11 = $11",
     "package": "screenpipe-memory",
     "test": "postgres_writer",
     "claim": "a merge can only ever update a row belonging to this writer's own machine"

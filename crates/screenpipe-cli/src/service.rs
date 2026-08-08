@@ -1733,7 +1733,7 @@ $parseErrors = $null
         // half for the same reason.
         let mut scheduler = super::WindowsTaskScheduler;
         let absent_task = "MooseGoose Goal 1 Task That Must Not Exist";
-        let absent_binary = Path::new(r"C:\screenpipe-goal-1-nonexistentin\screenpipe.exe");
+        let absent_binary = Path::new(r"C:\does-not-exist\screenpipe.exe");
 
         let status = scheduler
             .status(absent_task, absent_binary)
