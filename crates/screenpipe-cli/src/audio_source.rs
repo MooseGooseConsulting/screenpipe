@@ -64,6 +64,11 @@ fn capture_error_reason_code(error: &CaptureError) -> &'static str {
     }
 }
 
+fn capture_failure_diagnostic(error: &CaptureError) -> String {
+    let reason = capture_error_reason_code(error);
+    format!("{AUDIO_CAPTURE_FAILURE} reason={reason}")
+}
+
 /// Reported when the capture side is gone for good.
 ///
 /// The one failure this channel cannot back off and retry through: the WASAPI
@@ -370,8 +375,8 @@ fn capture_loop<C: FrameSource>(
         let frame = match capture.next_frame() {
             Ok(frame) => frame,
             Err(error) => {
-                let reason = capture_error_reason_code(&error);
-                println!("{AUDIO_CAPTURE_FAILURE} reason={reason}");
+                let diagnostic = capture_failure_diagnostic(&error);
+                println!("{diagnostic}");
                 // The utterance in flight is worth more than the failure: flush
                 // before reporting, so a stream that dies mid-sentence still
                 // writes the sentence.
@@ -517,7 +522,7 @@ mod tests {
     use super::{
         AUDIO_BACKLOG, AUDIO_CAPTURE_FAILURE, AUDIO_NO_SPEECH, AUDIO_TRANSCRIBE_FAILURE,
         AudioSampleSource, CaptureError, CaptureStopped, FrameSource, TRANSCRIBE_QUEUE,
-        WRITE_QUEUE, capture_error_reason_code, capture_loop, receive_utterance, to_permille,
+        WRITE_QUEUE, capture_failure_diagnostic, capture_loop, receive_utterance, to_permille,
     };
     use chrono::{TimeZone, Utc};
     use screenpipe_audio::{CapturedFrame, Utterance, UtteranceEnd, VadAggressiveness};
@@ -686,23 +691,37 @@ mod tests {
     }
 
     #[test]
-    fn every_capture_error_has_a_stable_private_safe_reason_code() {
+    fn every_capture_error_has_a_fixed_private_safe_diagnostic() {
         let cases = [
-            (CaptureError::NoDevice, "no_device"),
-            (CaptureError::DeviceUnavailable, "device_unavailable"),
-            (CaptureError::FormatUnsupported, "format_unsupported"),
-            (CaptureError::StreamStalled, "stream_stalled"),
-            (CaptureError::StreamDiscontinuity, "stream_discontinuity"),
+            (
+                CaptureError::NoDevice,
+                "event=audio_capture_error category=capture_unavailable reason=no_device",
+            ),
+            (
+                CaptureError::DeviceUnavailable,
+                "event=audio_capture_error category=capture_unavailable reason=device_unavailable",
+            ),
+            (
+                CaptureError::FormatUnsupported,
+                "event=audio_capture_error category=capture_unavailable reason=format_unsupported",
+            ),
+            (
+                CaptureError::StreamStalled,
+                "event=audio_capture_error category=capture_unavailable reason=stream_stalled",
+            ),
+            (
+                CaptureError::StreamDiscontinuity,
+                "event=audio_capture_error category=capture_unavailable reason=stream_discontinuity",
+            ),
         ];
 
         for (error, expected) in cases {
-            let reason = capture_error_reason_code(&error);
-            assert_eq!(reason, expected);
+            let display = error.to_string();
+            let diagnostic = capture_failure_diagnostic(&error);
+            assert_eq!(diagnostic, expected);
             assert!(
-                reason
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
-                "{reason} is not a fixed reason code"
+                !diagnostic.contains(display.as_str()),
+                "the fixed diagnostic contains raw CaptureError Display text"
             );
         }
     }
