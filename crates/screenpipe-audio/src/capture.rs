@@ -11,7 +11,7 @@ use std::fmt;
 use chrono::{DateTime, Duration, Utc};
 use wasapi::{
     AudioCaptureClient, AudioClient, DeviceEnumerator, Direction, Handle, SampleType, StreamMode,
-    WaveFormat, initialize_mta,
+    WasapiError, WaveFormat, initialize_mta,
 };
 
 use crate::Channel;
@@ -49,6 +49,23 @@ const READ_TIMEOUT_MS: u32 = 2_000;
 
 /// Frames of manufactured silence one timed-out wait stands for.
 const TIMEOUT_FRAMES: usize = READ_TIMEOUT_MS as usize / crate::vad::FRAME_MS;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitOutcome {
+    Signaled,
+    TimedOut,
+}
+
+/// Only the library's explicit timeout means ordinary silence. Every other
+/// wait error means the capture boundary itself is unhealthy and must reach
+/// the existing typed restart path.
+fn classify_wait_result(result: Result<(), WasapiError>) -> Result<WaitOutcome, CaptureError> {
+    match result {
+        Ok(()) => Ok(WaitOutcome::Signaled),
+        Err(WasapiError::EventTimeout) => Ok(WaitOutcome::TimedOut),
+        Err(_) => Err(CaptureError::StreamStalled),
+    }
+}
 
 /// Requested engine buffer, in 100 ns units. 100 ms.
 ///
@@ -220,21 +237,24 @@ impl AudioCapture {
     }
 
     fn fill(&mut self) -> Result<(), CaptureError> {
-        if self.event.wait_for_event(READ_TIMEOUT_MS).is_err() {
-            // Silence, not a stall. See READ_TIMEOUT_MS: a loopback stream
-            // signals nothing while nothing is playing, so the frames the
-            // detector needs to keep counting silence - and to close an
-            // utterance that ended when the sound stopped - have to be
-            // manufactured here.
-            //
-            // A whole timeout's worth of them, not one. The detector counts
-            // FRAMES, so handing it a single 20 ms frame per two seconds of
-            // wall clock would stretch the 600 ms hangover into a minute, and
-            // an utterance that ended when the sound stopped would stay open
-            // long after.
-            self.queued
-                .extend(std::iter::repeat_n(0u8, FRAME_BYTES * TIMEOUT_FRAMES));
-            return Ok(());
+        match classify_wait_result(self.event.wait_for_event(READ_TIMEOUT_MS))? {
+            WaitOutcome::TimedOut => {
+                // Silence, not a stall. See READ_TIMEOUT_MS: a loopback stream
+                // signals nothing while nothing is playing, so the frames the
+                // detector needs to keep counting silence - and to close an
+                // utterance that ended when the sound stopped - have to be
+                // manufactured here.
+                //
+                // A whole timeout's worth of them, not one. The detector counts
+                // FRAMES, so handing it a single 20 ms frame per two seconds of
+                // wall clock would stretch the 600 ms hangover into a minute,
+                // and an utterance that ended when the sound stopped would stay
+                // open long after.
+                self.queued
+                    .extend(std::iter::repeat_n(0u8, FRAME_BYTES * TIMEOUT_FRAMES));
+                return Ok(());
+            }
+            WaitOutcome::Signaled => {}
         }
         self.capture
             .read_from_device_to_deque(&mut self.queued)
@@ -259,8 +279,12 @@ fn samples_to_duration(samples: usize) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureError, FRAME_BYTES, SAMPLE_RATE_HZ, samples_to_duration};
+    use super::{
+        CaptureError, FRAME_BYTES, SAMPLE_RATE_HZ, WaitOutcome, classify_wait_result,
+        samples_to_duration,
+    };
     use crate::vad::{FRAME_MS, FRAME_SAMPLES};
+    use wasapi::WasapiError;
 
     #[test]
     fn one_frame_is_two_bytes_per_sample() {
@@ -299,5 +323,18 @@ mod tests {
                 "{message} looks like it quotes a device name"
             );
         }
+    }
+
+    #[test]
+    fn wait_timeout_is_silence_but_other_wait_failure_stalls_capture() {
+        assert_eq!(
+            classify_wait_result(Err(WasapiError::EventTimeout)),
+            Ok(WaitOutcome::TimedOut)
+        );
+        assert_eq!(
+            classify_wait_result(Err(WasapiError::ClientNotInit)),
+            Err(CaptureError::StreamStalled)
+        );
+        assert_eq!(classify_wait_result(Ok(())), Ok(WaitOutcome::Signaled));
     }
 }
