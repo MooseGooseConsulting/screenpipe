@@ -149,6 +149,8 @@
     "find": "             app_title = EXCLUDED.app_title, last_seen_at = EXCLUDED.last_seen_at \\",
     "replace": "             app_title = EXCLUDED.app_title \\",
     "package": "screenpipe-memory",
+    "test": "postgres_writer",
+    "filter": "repeated_app_sightings_preserve_first_seen_and_advance_last_seen",
     "claim": "a repeat app sighting advances apps.last_seen_at"
   },
   {
