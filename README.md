@@ -28,11 +28,29 @@ summarization, embedding, MCP server, or model-based merge decision.
 
 ## Build and offline verification
 
+The audio commands use a one-time online bootstrap for pinned Ninja 1.12.1
+unless that exact binary is already present; verification itself stays local.
+
 ```powershell
 cargo fmt --all -- --check
 cargo test --workspace --exclude screenpipe-audio
 cargo check --workspace --exclude screenpipe-audio
 
+$ninjaVersion = '1.12.1'
+$ninjaRoot = Join-Path $env:LOCALAPPDATA "screen-memory\tools\ninja\$ninjaVersion"
+$ninja = Join-Path $ninjaRoot 'ninja.exe'
+if (-not (Test-Path -LiteralPath $ninja)) {
+    $archive = Join-Path $env:TEMP "ninja-$ninjaVersion-win.zip"
+    $uri = "https://github.com/ninja-build/ninja/releases/download/v$ninjaVersion/ninja-win.zip"
+    Invoke-WebRequest -Uri $uri -OutFile $archive
+    New-Item -ItemType Directory -Path $ninjaRoot -Force | Out-Null
+    Expand-Archive -LiteralPath $archive -DestinationPath $ninjaRoot -Force
+}
+$env:PATH = "$ninjaRoot;$env:PATH"
+$env:CMAKE_GENERATOR = 'Ninja'
+if ((& $ninja --version).Trim() -ne $ninjaVersion) {
+    throw "Ninja $ninjaVersion is required"
+}
 $env:LIBCLANG_PATH = "$env:LOCALAPPDATA\screen-memory\llvm\bin"
 cargo test -p screenpipe-audio
 cargo check -p screenpipe-cli --features audio
@@ -40,9 +58,11 @@ powershell -NoProfile -File .\scripts\verify-pruned.ps1
 ```
 
 Audio is a workspace member but not a default member, so the ordinary build
-stays free of the whisper.cpp toolchain. CI does not omit it: a dedicated
-Windows job installs LLVM/libclang 18.1.8, runs the audio crate tests, and
-checks the CLI with its `audio` feature enabled.
+stays free of the whisper.cpp toolchain. CI is configured not to omit it: a
+dedicated Windows job installs LLVM/libclang 18.1.8 and Ninja 1.12.1, sets
+`CMAKE_GENERATOR=Ninja`, tests the audio crate, and checks the CLI with its
+`audio` feature enabled. Hosted success remains a pull-request check rather
+than a claim made by this document.
 
 The three interactive Windows tests remain ignored by default. They require an
 unlocked desktop with a controlled foreground window and must not be treated as
@@ -125,7 +145,15 @@ same table, under the same `{slug}_{seq}` identifiers, through the same writer.
    install it. It has its own subcommand and its own scheduled task.
 
 ```powershell
-# A build that CAN record audio. Needs CMake and libclang for whisper.cpp.
+# A build that CAN record audio. Uses the pinned Ninja setup above and needs
+# libclang for whisper.cpp.
+$ninjaVersion = '1.12.1'
+$ninjaRoot = Join-Path $env:LOCALAPPDATA "screen-memory\tools\ninja\$ninjaVersion"
+$env:PATH = "$ninjaRoot;$env:PATH"
+$env:CMAKE_GENERATOR = 'Ninja'
+if ((& (Join-Path $ninjaRoot 'ninja.exe') --version).Trim() -ne $ninjaVersion) {
+    throw "Ninja $ninjaVersion is required; run the offline verification setup first"
+}
 $env:LIBCLANG_PATH = "$env:LOCALAPPDATA\screen-memory\llvm\bin"
 cargo build --release -p screenpipe-cli --features audio
 
