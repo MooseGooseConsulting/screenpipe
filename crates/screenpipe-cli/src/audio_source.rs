@@ -79,6 +79,20 @@ enum Observed {
     Gap(CaptureGap),
 }
 
+/// The one operation capture-loop ownership needs from WASAPI.
+///
+/// Keeping this private lets the loop run against a scripted source in tests
+/// without changing the audio crate's public surface or opening hardware.
+trait FrameSource {
+    fn next_frame(&mut self) -> Result<screenpipe_audio::CapturedFrame, CaptureError>;
+}
+
+impl FrameSource for AudioCapture {
+    fn next_frame(&mut self) -> Result<screenpipe_audio::CapturedFrame, CaptureError> {
+        AudioCapture::next_frame(self)
+    }
+}
+
 /// Everything the two worker threads need, resolved before either starts.
 pub(crate) struct AudioConfig {
     pub(crate) channel: Channel,
@@ -258,8 +272,8 @@ struct AudioMetaTemplate {
 }
 
 /// Thread 1: WASAPI to closed utterances. Never blocks on anything downstream.
-fn capture_loop(
-    mut capture: AudioCapture,
+fn capture_loop<C: FrameSource>(
+    mut capture: C,
     aggressiveness: VadAggressiveness,
     utterances: &SyncSender<Utterance>,
     terminal: &UnboundedSyncSender<Utterance>,
@@ -410,11 +424,23 @@ fn to_permille(probability: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIO_BACKLOG, AUDIO_NO_SPEECH, CaptureStopped, TRANSCRIBE_QUEUE, WRITE_QUEUE,
-        preserve_terminal_utterance, receive_utterance, to_permille,
+        AUDIO_BACKLOG, AUDIO_NO_SPEECH, CaptureError, CaptureStopped, FrameSource,
+        TRANSCRIBE_QUEUE, WRITE_QUEUE, capture_loop, receive_utterance, to_permille,
     };
     use chrono::{TimeZone, Utc};
-    use screenpipe_audio::{Utterance, UtteranceEnd};
+    use screenpipe_audio::{CapturedFrame, Utterance, UtteranceEnd, VadAggressiveness};
+
+    struct ScriptedCapture {
+        frames: std::collections::VecDeque<Result<CapturedFrame, CaptureError>>,
+    }
+
+    impl FrameSource for ScriptedCapture {
+        fn next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+            self.frames
+                .pop_front()
+                .expect("the capture loop read beyond the scripted stream")
+        }
+    }
 
     fn synthetic_utterance(second: u32) -> Utterance {
         let started_at = Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, second).unwrap();
@@ -427,20 +453,46 @@ mod tests {
     }
 
     #[test]
-    fn terminal_flush_bypasses_a_full_capture_queue_without_reordering() {
+    fn terminal_capture_flush_bypasses_a_full_queue_without_reordering() {
         let (queued_tx, queued_rx) = std::sync::mpsc::sync_channel(1);
         let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
         let queued = synthetic_utterance(1);
-        let terminal = synthetic_utterance(2);
         queued_tx.send(queued.clone()).unwrap();
 
-        preserve_terminal_utterance(&terminal_tx, terminal.clone());
+        let started_at = Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, 2).unwrap();
+        let frames = (0..3)
+            .map(|index| {
+                Ok(CapturedFrame {
+                    captured_at: started_at + chrono::Duration::milliseconds(index * 20),
+                    samples: vec![i16::MAX; 320],
+                })
+            })
+            .chain(std::iter::once(Err(CaptureError::StreamStalled)))
+            .collect();
+        let capture = ScriptedCapture { frames };
+        let (reports_tx, mut reports_rx) = tokio::sync::mpsc::channel(1);
+
+        capture_loop(
+            capture,
+            VadAggressiveness::Quality,
+            &queued_tx,
+            &terminal_tx,
+            &reports_tx,
+        );
         drop(queued_tx);
         drop(terminal_tx);
 
         assert_eq!(receive_utterance(&queued_rx, &terminal_rx), Some(queued));
-        assert_eq!(receive_utterance(&queued_rx, &terminal_rx), Some(terminal));
+        let terminal = receive_utterance(&queued_rx, &terminal_rx).expect("terminal utterance");
+        assert_eq!(terminal.closed_by, UtteranceEnd::StreamClosed);
+        assert_eq!(terminal.started_at, started_at);
         assert_eq!(receive_utterance(&queued_rx, &terminal_rx), None);
+        assert!(matches!(
+            reports_rx.try_recv(),
+            Ok(super::Observed::Gap(
+                screenpipe_memory::CaptureGap::CaptureUnavailable
+            ))
+        ));
     }
 
     #[test]

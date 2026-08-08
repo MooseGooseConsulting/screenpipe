@@ -221,51 +221,73 @@ impl WhisperEngine {
             .map_err(|_| WhisperError::InferenceFailed)?;
 
         let count = state.full_n_segments();
-        let mut kept: Vec<String> = Vec::new();
-        let mut probabilities: Vec<f32> = Vec::new();
-        let mut dropped = 0usize;
-        for index in 0..count {
-            let Some(segment) = state.get_segment(index) else {
-                continue;
-            };
-            let probability = segment.no_speech_probability();
-            let Ok(text) = segment.to_str_lossy() else {
-                // Non-UTF-8 from the tokenizer. Counted as dropped rather than
-                // guessed at.
-                dropped += 1;
-                continue;
-            };
-            let text = text.trim().to_owned();
-            if text.is_empty() {
-                continue;
-            }
-            if !is_credible_no_speech_probability(probability) {
-                dropped += 1;
-                continue;
-            }
-            kept.push(text);
-            probabilities.push(probability);
-        }
-
         let segments = usize::try_from(count).unwrap_or(0);
-        if kept.is_empty() {
-            return Ok(Transcript::nothing(segments, dropped));
-        }
+        let candidates = (0..count).filter_map(|index| {
+            let segment = state.get_segment(index)?;
+            Some(SegmentCandidate {
+                probability: segment.no_speech_probability(),
+                text: segment
+                    .to_str_lossy()
+                    .map(|text| text.into_owned())
+                    .map_err(|_| ()),
+            })
+        });
+        Ok(transcript_from_segments(segments, candidates))
+    }
+}
 
-        let raw = kept.join("\n");
-        let text = kept
-            .join(" ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let average = probabilities.iter().sum::<f32>() / probabilities.len() as f32;
-        Ok(Transcript {
-            text,
-            raw,
-            avg_no_speech_prob: Some(average),
-            segments,
-            dropped_segments: dropped,
-        })
+struct SegmentCandidate {
+    probability: f32,
+    text: Result<String, ()>,
+}
+
+/// Applies the production no-speech acceptance boundary to Whisper segments.
+///
+/// The engine above supplies native segment data; this private seam lets the
+/// boundary be tested with malformed FFI values without loading a model.
+fn transcript_from_segments(
+    segments: usize,
+    candidates: impl IntoIterator<Item = SegmentCandidate>,
+) -> Transcript {
+    let mut kept: Vec<String> = Vec::new();
+    let mut probabilities: Vec<f32> = Vec::new();
+    let mut dropped = 0usize;
+    for SegmentCandidate { probability, text } in candidates {
+        let Ok(text) = text else {
+            // Non-UTF-8 from the tokenizer. Counted as dropped rather than
+            // guessed at.
+            dropped += 1;
+            continue;
+        };
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            continue;
+        }
+        if !is_credible_no_speech_probability(probability) {
+            dropped += 1;
+            continue;
+        }
+        kept.push(text);
+        probabilities.push(probability);
+    }
+
+    if kept.is_empty() {
+        return Transcript::nothing(segments, dropped);
+    }
+
+    let raw = kept.join("\n");
+    let text = kept
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let average = probabilities.iter().sum::<f32>() / probabilities.len() as f32;
+    Transcript {
+        text,
+        raw,
+        avg_no_speech_prob: Some(average),
+        segments,
+        dropped_segments: dropped,
     }
 }
 
@@ -283,8 +305,8 @@ fn is_credible_no_speech_probability(probability: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_TRANSCRIBABLE_SAMPLES, ModelPath, NO_SPEECH_CEILING, Transcript, WhisperError,
-        is_credible_no_speech_probability,
+        MIN_TRANSCRIBABLE_SAMPLES, ModelPath, SegmentCandidate, Transcript, WhisperError,
+        transcript_from_segments,
     };
     use crate::capture::SAMPLE_RATE_HZ;
 
@@ -325,23 +347,26 @@ mod tests {
     }
 
     #[test]
-    fn invalid_no_speech_probabilities_are_never_credible() {
-        for probability in [
-            f32::NAN,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            -f32::EPSILON,
-            1.0 + f32::EPSILON,
-        ] {
-            assert!(!is_credible_no_speech_probability(probability));
-        }
+    fn invalid_no_speech_probability_is_dropped_at_segment_acceptance() {
+        let transcript = transcript_from_segments(
+            2,
+            [
+                SegmentCandidate {
+                    probability: f32::NAN,
+                    text: Ok("discarded".to_owned()),
+                },
+                SegmentCandidate {
+                    probability: 0.2,
+                    text: Ok("kept".to_owned()),
+                },
+            ],
+        );
 
-        assert!(is_credible_no_speech_probability(0.0));
-        assert!(is_credible_no_speech_probability(NO_SPEECH_CEILING));
-        assert!(!is_credible_no_speech_probability(
-            NO_SPEECH_CEILING + f32::EPSILON
-        ));
-        assert!(!is_credible_no_speech_probability(1.0));
+        assert_eq!(transcript.text, "kept");
+        assert_eq!(transcript.raw, "kept");
+        assert_eq!(transcript.avg_no_speech_prob, Some(0.2));
+        assert_eq!(transcript.segments, 2);
+        assert_eq!(transcript.dropped_segments, 1);
     }
 
     #[test]
