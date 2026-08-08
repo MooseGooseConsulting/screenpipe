@@ -1,0 +1,14 @@
+error[E0382]: use of moved value: `original`
+ --> tests/ui/clipboard_watcher_not_copy.rs:6:30
+  |
+4 |     let original = ClipboardWatcher::new();
+  |         -------- move occurs because `original` has type `ClipboardWatcher`, which does not implement the `Copy` trait
+5 |     let moved = original;
+  |                 -------- value moved here
+6 |     let _reused_after_move = original;
+  |                              ^^^^^^^^ value used here after move
+  |
+help: consider cloning the value if the performance cost is acceptable
+  |
+5 |     let moved = original.clone();
+  |                         ++++++++

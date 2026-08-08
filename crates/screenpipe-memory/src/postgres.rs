@@ -735,11 +735,14 @@ impl PgEventWriter {
                     e.merge_meta ->> 'browser_url', \
                     CASE WHEN $4 THEN \
                         ts_headline('english', \
-                                    coalesce(nullif(e.readable_text, ''), e.ocr_text), \
+                                    CASE WHEN strpos(lower(text_source.value), lower($1)) > 0 THEN \
+                                        substring(text_source.value FROM greatest(1, strpos(lower(text_source.value), lower($1)) - 512) FOR 2048) \
+                                    ELSE text_source.value END, \
                                     plainto_tsquery('english', $1), \
                                     'StartSel=[, StopSel=], MaxFragments=2, FragmentDelimiter= ... , MaxWords=18, MinWords=6') \
-                    ELSE left(coalesce(nullif(e.readable_text, ''), e.ocr_text), 160) END \
+                    ELSE left(text_source.value, 160) END \
              FROM events e \
+             CROSS JOIN LATERAL (SELECT coalesce(nullif(e.readable_text, ''), e.ocr_text) AS value) text_source \
              LEFT JOIN apps a ON a.id = e.app_id \
              WHERE e.machine_id = $2 \
                AND (NOT $4 OR e.search_tsv @@ plainto_tsquery('english', $1)) \

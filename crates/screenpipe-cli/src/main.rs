@@ -215,7 +215,7 @@ async fn run_search(
         if request.query.trim().is_empty() {
             println!("nothing recorded in that window");
         } else {
-            println!("no matches for {:?}", request.query);
+            println!("no matches for {:?}", terminal_safe_text(&request.query));
         }
         return Ok(());
     }
@@ -227,6 +227,7 @@ async fn run_search(
             .as_deref()
             .or(hit.app_title.as_deref())
             .unwrap_or("(untitled)");
+        let label = terminal_safe_text(label);
         println!(
             "{}  {}  ({} samples, {} min)",
             hit.started_at
@@ -237,17 +238,32 @@ async fn run_search(
             minutes.max(0)
         );
         if let Some(url) = hit.browser_url.as_deref() {
-            println!("    {url}");
+            println!("    {}", terminal_safe_text(url));
         }
-        let snippet = hit.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+        let snippet = terminal_safe_text(&hit.snippet)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         if !snippet.is_empty() {
             println!("    {snippet}");
         }
-        println!("    {}", hit.event_id);
+        println!("    {}", terminal_safe_text(hit.event_id.as_str()));
         println!();
     }
     println!("{} match(es)", hits.len());
     Ok(())
+}
+
+/// Remove control characters before rendering database or CLI content locally.
+///
+/// Search results are intentionally displayed to the local operator, but a
+/// captured title, URL, or snippet must not be able to inject terminal escape
+/// sequences, cursor movement, or additional output lines.
+fn terminal_safe_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect()
 }
 
 fn required_database_url(value: Option<OsString>) -> Result<String> {
@@ -1229,6 +1245,13 @@ mod tests {
                 "{value} returned the wrong error: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn search_terminal_output_removes_c0_c1_and_escape_controls() {
+        let raw = "visible\u{0000}\u{001b}[31m\u{007f}\u{009b}tail";
+
+        assert_eq!(super::terminal_safe_text(raw), "visible[31mtail");
     }
 
     #[test]

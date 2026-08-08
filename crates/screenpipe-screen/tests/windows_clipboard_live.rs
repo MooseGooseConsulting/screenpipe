@@ -191,6 +191,23 @@ fn set_format(format: u32, bytes: &[u8]) {
     }
 }
 
+fn set_unterminated_unicode_text(bytes: usize) {
+    assert_eq!(
+        bytes % size_of::<u16>(),
+        0,
+        "Unicode text must use whole units"
+    );
+    unsafe {
+        let global: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, bytes).expect("GlobalAlloc");
+        let pointer = GlobalLock(global);
+        assert!(!pointer.is_null(), "GlobalLock");
+        std::slice::from_raw_parts_mut(pointer as *mut u16, bytes / size_of::<u16>())
+            .fill(b'x' as u16);
+        let _ = GlobalUnlock(global);
+        SetClipboardData(CF_UNICODETEXT, HANDLE(global.0)).expect("SetClipboardData");
+    }
+}
+
 fn text_bytes(text: &str) -> Vec<u8> {
     text.encode_utf16()
         .chain(std::iter::once(0))
@@ -360,6 +377,40 @@ fn the_exclusion_formats_stop_a_capture_before_the_text_is_read() {
     assert_eq!(settled(&mut watcher), ClipboardRead::NoText);
 
     // Give the operator their clipboard back.
+    match operators_text {
+        Some(text) if !text.is_empty() => write_clipboard(&owner, &text, &[]),
+        _ => {
+            let _clipboard = Clipboard::open(owner.0);
+            unsafe { EmptyClipboard() }.expect("EmptyClipboard");
+        }
+    }
+}
+
+#[test]
+fn an_advertised_clipboard_allocation_above_sixteen_mib_is_refused() {
+    let _serialized = CLIPBOARD.lock().unwrap_or_else(|error| error.into_inner());
+    let owner = OwnerWindow::create();
+    if !clipboard_is_accessible(
+        &owner,
+        "an_advertised_clipboard_allocation_above_sixteen_mib_is_refused",
+    ) {
+        return;
+    }
+    let operators_text = current_text(&owner);
+    let mut watcher = ClipboardWatcher::new();
+    write_clipboard(&owner, "SCREENPIPE CLIPBOARD FIXTURE BASELINE", &[]);
+    assert_eq!(settled(&mut watcher), ClipboardRead::Unchanged);
+
+    {
+        let _clipboard = Clipboard::open(owner.0);
+        unsafe { EmptyClipboard() }.expect("EmptyClipboard");
+        set_unterminated_unicode_text(16 * 1024 * 1024 + size_of::<u16>());
+    }
+    assert!(
+        matches!(settled(&mut watcher), ClipboardRead::NoText),
+        "a clipboard allocation above the capture limit must be refused"
+    );
+
     match operators_text {
         Some(text) if !text.is_empty() => write_clipboard(&owner, &text, &[]),
         _ => {

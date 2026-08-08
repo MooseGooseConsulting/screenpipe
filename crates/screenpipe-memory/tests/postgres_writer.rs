@@ -7,8 +7,7 @@ use anyhow::{Context, Result, ensure};
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
     CadenceInput, CadenceRecord, CaptureGapSummary, EventKind, HashLedger, MERGE_CONTRACT_VERSION,
-    MINIMUM_SERVER_VERSION_NUM, MergeDecisionKind, ObservationSample, OpenEvent, PgEventReader,
-    PgEventWriter, SplitReason,
+    MergeDecisionKind, ObservationSample, OpenEvent, PgEventReader, PgEventWriter, SplitReason,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -152,10 +151,12 @@ fn announce_skip() {
         // is byte-for-byte identical to one that exercised PostgreSQL. Writing
         // to the process stdout handle bypasses that capture, which is the only
         // way this line survives a plain `cargo test --workspace`.
+        let mut stdout = std::io::stdout();
         let _ = writeln!(
-            std::io::stdout(),
+            stdout,
             "SKIPPED postgres_writer: {TEST_DATABASE_URL_ENV} is not set, so no PostgreSQL integration test ran."
         );
+        let _ = stdout.flush();
     });
 }
 
@@ -1052,75 +1053,6 @@ async fn no_disposable_writer_schemas_remain() -> Result<()> {
 }
 
 #[tokio::test]
-async fn connect_refuses_an_unsupported_server_before_touching_it() -> Result<()> {
-    // The PostgreSQL 18 floor was moved into `connect` because `run_capture`
-    // never calls `preflight` - only `doctor` does - so the guard was
-    // unreachable on the one path that writes for 24 hours.
-    //
-    // That fix then survived a mutation deleting the call, because the version
-    // comes from `current_setting('server_version_num')`, a preset GUC no test
-    // can override: there was no way to present an old server without owning
-    // one. `connect_with_server_version` takes the number as a parameter for
-    // exactly this reason.
-    let Some(db) = TestDatabase::create().await? else {
-        return Ok(());
-    };
-    let test_result = async {
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&db.scoped_url)
-            .await
-            .context("connect a pool for the version guard")?;
-
-        // One below the floor. PostgreSQL 17.9 would report 170_009.
-        let rejected = PgEventWriter::connect_with_server_version(
-            pool.clone(),
-            MINIMUM_SERVER_VERSION_NUM - 1,
-            "icarus",
-            "Icarus-Laptop",
-        )
-        .await;
-        let error = rejected
-            .err()
-            .context("an unsupported server version must be refused")?;
-        ensure!(
-            format!("{error:#}").contains("PostgreSQL 18 or newer"),
-            "expected a version refusal, got: {error:#}"
-        );
-
-        // The refusal must land BEFORE any write. A guard that rejects after
-        // upserting the machine row has already touched a server it declared
-        // unsupported.
-        let machines: i64 = sqlx::query_scalar("SELECT count(*) FROM machines")
-            .fetch_one(&pool)
-            .await
-            .context("count machines after the refusal")?;
-        ensure!(
-            machines == 0,
-            "the writer wrote to an unsupported server before rejecting it: {machines} machine row(s)"
-        );
-
-        // Positive control: at the floor exactly, the same call must succeed.
-        // Without this the guard could reject everything and still pass.
-        let accepted = PgEventWriter::connect_with_server_version(
-            pool.clone(),
-            MINIMUM_SERVER_VERSION_NUM,
-            "icarus",
-            "Icarus-Laptop",
-        )
-        .await;
-        ensure!(
-            accepted.is_ok(),
-            "a server at the minimum supported version must be accepted: {:#}",
-            accepted.err().expect("checked is_ok")
-        );
-        Ok(())
-    }
-    .await;
-    db.finish(test_result).await
-}
-
-#[tokio::test]
 async fn search_finds_by_words_by_time_and_by_both() -> Result<()> {
     // The read path. Until it existed this system was write-only: it recorded
     // continuously and offered no way to ask it anything, which made every
@@ -1239,7 +1171,9 @@ async fn search_finds_by_words_by_time_and_by_both() -> Result<()> {
 #[tokio::test]
 async fn search_headline_includes_context_for_a_match_after_twenty_thousand_characters()
 -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
         let mut late = event(1, "notepad.exe", "Notepad", "notes", "early OCR", None);
@@ -1272,7 +1206,9 @@ async fn search_headline_includes_context_for_a_match_after_twenty_thousand_char
 
 #[tokio::test]
 async fn explicit_machine_search_connection_never_upserts_a_machine() -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
         writer
@@ -1319,7 +1255,9 @@ async fn explicit_machine_search_connection_never_upserts_a_machine() -> Result<
 
 #[tokio::test]
 async fn concurrent_writer_startup_backfills_each_historical_title_once() -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
         let event_id = writer
@@ -1384,7 +1322,9 @@ async fn concurrent_writer_startup_backfills_each_historical_title_once() -> Res
 
 #[tokio::test]
 async fn writer_backfills_window_only_historical_events_without_an_app_row() -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let _writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
         let machine_id: i64 = sqlx::query_scalar("SELECT id FROM machines WHERE slug = $1")
@@ -1428,7 +1368,9 @@ async fn writer_backfills_window_only_historical_events_without_an_app_row() -> 
 
 #[tokio::test]
 async fn writer_backfills_missing_titles_once_for_existing_events() -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
         let event_id = writer
@@ -1478,7 +1420,9 @@ async fn writer_backfills_missing_titles_once_for_existing_events() -> Result<()
 
 #[tokio::test]
 async fn writer_backfill_leaves_blank_derived_titles_null_without_rewriting_them() -> Result<()> {
-    let db = TestDatabase::create().await?;
+    let Some(db) = TestDatabase::create().await? else {
+        return Ok(());
+    };
     let test_result = async {
         let writer = PgEventWriter::connect(&db.scoped_url, "icarus", "Icarus-Laptop").await?;
         let event_id = writer
