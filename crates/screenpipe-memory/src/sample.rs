@@ -11,31 +11,62 @@ pub struct ObservationSample {
     pub ocr_text: String,
     pub readable_text: String,
     pub browser_url: Option<String>,
-    /// When the observation STOPPED, if it occupied a span rather than an
-    /// instant. `None` means it was an instant and `captured_at` is both ends.
-    ///
-    /// Screen and clipboard samples are instants: a frame is read at a moment,
-    /// a copy happens at a moment. An utterance is not - it runs for seconds,
-    /// and the merger has to know that. Its idle-gap test measures
-    /// `next.captured_at - open.ended_at`, so without this the "silence"
-    /// between two utterances would include the length of the first one: a
-    /// 30-second utterance followed by 35 seconds of quiet would read as a
-    /// 65-second gap and split at a 60-second threshold that 35 seconds of
-    /// silence never crossed.
-    ///
-    /// It also makes the durable window true. With it, `ended_at - started_at`
-    /// is how long the speech actually ran.
-    pub observed_until: Option<DateTime<Utc>>,
-    /// Set only by the audio channel. `None` on every screen and clipboard
-    /// sample, and the writer emits nothing for it then.
-    pub audio: Option<AudioMeta>,
 }
 
-impl ObservationSample {
-    /// The instant this observation stopped: its own end if it had one, and
-    /// otherwise the instant it was captured.
+/// Additive context for channels whose observation is more than an instant.
+///
+/// [`ObservationSample`] keeps its original public field shape so downstream
+/// struct literals remain source-compatible. New channels carry span and
+/// source facts beside that stable sample through this envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservationEnvelope {
+    sample: ObservationSample,
+    observed_until: DateTime<Utc>,
+    audio: Option<AudioMeta>,
+}
+
+impl ObservationEnvelope {
+    pub fn instant(sample: ObservationSample) -> Self {
+        let observed_until = sample.captured_at;
+        Self {
+            sample,
+            observed_until,
+            audio: None,
+        }
+    }
+
+    pub fn spanning(
+        sample: ObservationSample,
+        observed_until: DateTime<Utc>,
+        audio: AudioMeta,
+    ) -> Self {
+        Self {
+            sample,
+            observed_until,
+            audio: Some(audio),
+        }
+    }
+
+    pub fn sample(&self) -> &ObservationSample {
+        &self.sample
+    }
+
+    pub fn into_sample(self) -> ObservationSample {
+        self.sample
+    }
+
     pub fn observed_until(&self) -> DateTime<Utc> {
-        self.observed_until.unwrap_or(self.captured_at)
+        self.observed_until
+    }
+
+    pub fn audio(&self) -> Option<&AudioMeta> {
+        self.audio.as_ref()
+    }
+}
+
+impl From<ObservationSample> for ObservationEnvelope {
+    fn from(sample: ObservationSample) -> Self {
+        Self::instant(sample)
     }
 }
 
@@ -89,10 +120,6 @@ impl fmt::Debug for ObservationSample {
                 "browser_url",
                 &self.browser_url.as_ref().map(|_| "<redacted>"),
             )
-            // Not redacted: every field of it is a code or a model name, none
-            // of which is content. Redacting it would hide the one thing worth
-            // seeing in a debug line about an audio sample.
-            .field("audio", &self.audio)
             .finish()
     }
 }

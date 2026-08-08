@@ -1192,8 +1192,6 @@ mod tests {
                         ocr_text: "an unchanged idle window".to_owned(),
                         readable_text: "an unchanged idle window".to_owned(),
                         browser_url: None,
-                        observed_until: None,
-                        audio: None,
                     },
                     cadence: idle_cadence,
                 })
@@ -1272,8 +1270,6 @@ mod tests {
                 ocr_text: "an observation worth not losing".to_owned(),
                 readable_text: "an observation worth not losing".to_owned(),
                 browser_url: None,
-                observed_until: None,
-                audio: None,
             },
             cadence: CadenceRecord::from_input(CadenceInput {
                 input_idle: Duration::zero(),
@@ -1413,8 +1409,6 @@ mod tests {
                 ocr_text: "runner wiring sample".to_owned(),
                 readable_text: "runner wiring sample".to_owned(),
                 browser_url: None,
-                observed_until: None,
-                audio: None,
             },
             cadence,
         }));

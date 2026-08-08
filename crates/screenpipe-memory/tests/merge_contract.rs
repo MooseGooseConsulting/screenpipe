@@ -1,7 +1,8 @@
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
-    CadenceInput, CadenceRecord, CaptureGap, CaptureGapSummary, EventKind, MergeConfig,
-    MergeDecision, MergeDecisionKind, Merger, ObservationSample, SplitReason, TextIdentity,
+    CadenceInput, CadenceRecord, CaptureGap, CaptureGapSummary, EnvelopeMergeDecision,
+    EventEnvelope, EventKind, MergeConfig, MergeDecision, MergeDecisionKind, Merger,
+    ObservationEnvelope, ObservationSample, SplitReason, TextIdentity,
 };
 
 trait TestIngest {
@@ -47,8 +48,6 @@ fn sample(second: i64, app_key: &str, window_title: &str, ocr_text: &str) -> Obs
         ocr_text: ocr_text.to_owned(),
         readable_text: ocr_text.to_owned(),
         browser_url: None,
-        observed_until: None,
-        audio: None,
     }
 }
 
@@ -720,8 +719,6 @@ fn clipboard_sample(second: i64, text: &str) -> ObservationSample {
         ocr_text: text.to_owned(),
         readable_text: text.to_owned(),
         browser_url: None,
-        observed_until: None,
-        audio: None,
     }
 }
 
@@ -885,22 +882,25 @@ fn a_clipboard_event_is_closed_by_the_shared_idle_gap() {
 /// The app key is NOT empty here, unlike the clipboard's. An audio event has a
 /// real source worth naming - which of the two channels heard it - and naming
 /// it is what gives the event a title a person can recognise.
-fn audio_sample(second: i64, transcript: &str) -> ObservationSample {
+fn audio_sample(second: i64, transcript: &str) -> ObservationEnvelope {
     audio_sample_lasting(second, 0, transcript)
 }
 
 /// An utterance that ran for `seconds` after it started.
-fn audio_sample_lasting(second: i64, seconds: i64, transcript: &str) -> ObservationSample {
-    ObservationSample {
+fn audio_sample_lasting(second: i64, seconds: i64, transcript: &str) -> ObservationEnvelope {
+    let sample = ObservationSample {
         captured_at: at(second),
-        observed_until: Some(at(second + seconds)),
         app_key: "audio:loopback".to_owned(),
         app_title: "System Audio".to_owned(),
         window_title: String::new(),
         ocr_text: transcript.to_owned(),
         readable_text: transcript.to_owned(),
         browser_url: None,
-        audio: Some(screenpipe_memory::AudioMeta {
+    };
+    ObservationEnvelope::spanning(
+        sample,
+        at(second + seconds),
+        screenpipe_memory::AudioMeta {
             channel: "system_audio",
             device_category: "communications",
             engine: "whisper-rs",
@@ -910,7 +910,49 @@ fn audio_sample_lasting(second: i64, seconds: i64, transcript: &str) -> Observat
             language: Some("en".to_owned()),
             avg_no_speech_permille: Some(30),
             closed_by: "silence",
-        }),
+        },
+    )
+}
+
+trait TestIngestEnvelope {
+    fn ingest_envelope(&mut self, observation: ObservationEnvelope) -> EnvelopeMergeDecision;
+}
+
+impl TestIngestEnvelope for Merger {
+    fn ingest_envelope(&mut self, observation: ObservationEnvelope) -> EnvelopeMergeDecision {
+        self.ingest_envelope_with_metadata(
+            observation,
+            idle_cadence(),
+            CaptureGapSummary::default(),
+        )
+    }
+}
+
+fn started_envelope(
+    decision: EnvelopeMergeDecision,
+    expected_reason: SplitReason,
+) -> EventEnvelope {
+    match decision {
+        EnvelopeMergeDecision::Start { reason, event } => {
+            assert_eq!(reason, expected_reason);
+            assert_eq!(event.event().start_reason, expected_reason);
+            event
+        }
+        EnvelopeMergeDecision::Merge { .. } => panic!("expected a start decision"),
+    }
+}
+
+fn started_audio(
+    decision: EnvelopeMergeDecision,
+    expected_reason: SplitReason,
+) -> screenpipe_memory::OpenEvent {
+    started_envelope(decision, expected_reason).event().clone()
+}
+
+fn merged_audio(decision: EnvelopeMergeDecision) -> screenpipe_memory::OpenEvent {
+    match decision {
+        EnvelopeMergeDecision::Merge { event } => event.event().clone(),
+        EnvelopeMergeDecision::Start { .. } => panic!("expected a merge decision"),
     }
 }
 
@@ -926,8 +968,8 @@ fn audio_merger() -> Merger {
 fn an_audio_event_records_its_kind_so_the_writer_cannot_mislabel_it() {
     let mut merger = audio_merger();
 
-    let event = started(
-        merger.ingest(audio_sample(0, "the deploy finished about ten minutes ago")),
+    let event = started_audio(
+        merger.ingest_envelope(audio_sample(0, "the deploy finished about ten minutes ago")),
         SplitReason::Initial,
     );
 
@@ -942,13 +984,13 @@ fn every_distinct_utterance_becomes_its_own_event() {
     // transcripts would keep the second and silently lose the first. Splitting
     // is what makes every utterance durable and searchable.
     let mut merger = audio_merger();
-    started(
-        merger.ingest(audio_sample(0, "did you see the review comments")),
+    started_audio(
+        merger.ingest_envelope(audio_sample(0, "did you see the review comments")),
         SplitReason::Initial,
     );
 
-    let second = started(
-        merger.ingest(audio_sample(3, "yes, two of them were real")),
+    let second = started_audio(
+        merger.ingest_envelope(audio_sample(3, "yes, two of them were real")),
         SplitReason::TextHashChange,
     );
 
@@ -963,13 +1005,13 @@ fn identical_transcripts_in_distinct_utterance_windows_start_distinct_events() {
     // content-only identity would merge them and erase the first occurrence as
     // a separately searchable event.
     let mut merger = audio_merger();
-    let first = started(
-        merger.ingest(audio_sample_lasting(0, 1, "Thank you.")),
+    let first = started_audio(
+        merger.ingest_envelope(audio_sample_lasting(0, 1, "Thank you.")),
         SplitReason::Initial,
     );
 
-    let second = started(
-        merger.ingest(audio_sample_lasting(2, 1, "Thank you.")),
+    let second = started_audio(
+        merger.ingest_envelope(audio_sample_lasting(2, 1, "Thank you.")),
         SplitReason::TextHashChange,
     );
 
@@ -988,9 +1030,9 @@ fn identical_chunks_from_one_utterance_window_are_deduplicated() {
     // is its identity, so this is one durable occurrence with two samples.
     let mut merger = audio_merger();
     let chunk = audio_sample_lasting(0, 1, "Thank you.");
-    let first = started(merger.ingest(chunk.clone()), SplitReason::Initial);
+    let first = started_audio(merger.ingest_envelope(chunk.clone()), SplitReason::Initial);
 
-    let duplicate = merged(merger.ingest(chunk));
+    let duplicate = merged_audio(merger.ingest_envelope(chunk));
 
     assert_eq!(duplicate.started_at, at(0));
     assert_eq!(duplicate.ended_at, at(1));
@@ -1006,16 +1048,19 @@ fn a_silence_longer_than_the_idle_gap_starts_a_new_audio_event() {
     // long period with no speech.
     let mut merger = audio_merger();
     let line = "same thing said twice, an hour apart";
-    started(merger.ingest(audio_sample(0, line)), SplitReason::Initial);
+    started_audio(
+        merger.ingest_envelope(audio_sample(0, line)),
+        SplitReason::Initial,
+    );
 
-    let at_threshold = started(
-        merger.ingest(audio_sample(TEST_IDLE_GAP_SECONDS, line)),
+    let at_threshold = started_audio(
+        merger.ingest_envelope(audio_sample(TEST_IDLE_GAP_SECONDS, line)),
         SplitReason::TextHashChange,
     );
     assert_eq!(at_threshold.sample_count, 1);
 
-    let event = started(
-        merger.ingest(audio_sample(TEST_IDLE_GAP_SECONDS * 2 + 1, line)),
+    let event = started_audio(
+        merger.ingest_envelope(audio_sample(TEST_IDLE_GAP_SECONDS * 2 + 1, line)),
         SplitReason::IdleGap,
     );
 
@@ -1029,12 +1074,12 @@ fn the_audio_metadata_rides_on_the_event_for_the_writer_to_persist() {
     // between a row worth reading and one invented over room tone.
     let mut merger = audio_merger();
 
-    let event = started(
-        merger.ingest(audio_sample(0, "an utterance with metadata")),
+    let event = started_envelope(
+        merger.ingest_envelope(audio_sample(0, "an utterance with metadata")),
         SplitReason::Initial,
     );
 
-    let meta = event.latest.audio.as_ref().expect("audio metadata");
+    let meta = event.audio().expect("audio metadata");
     assert_eq!(meta.channel, "system_audio");
     assert_eq!(meta.device_category, "communications");
     assert_eq!(meta.model, "ggml-base.en");
@@ -1048,12 +1093,12 @@ fn a_screen_sample_carries_no_audio_metadata_at_all() {
     // channel would have to be ignored by every reader of merge_meta.
     let mut merger = merger();
 
-    let event = started(
-        merger.ingest(sample(0, "notepad.exe", "notes", "ordinary screen text")),
+    let event = started_envelope(
+        merger.ingest_envelope(sample(0, "notepad.exe", "notes", "ordinary screen text").into()),
         SplitReason::Initial,
     );
 
-    assert!(event.latest.audio.is_none());
+    assert!(event.audio().is_none());
 }
 
 #[test]
@@ -1065,8 +1110,8 @@ fn the_silence_is_measured_from_the_end_of_the_previous_utterance() {
     // silence after it - and splits at a threshold the silence never crossed.
     let mut merger = audio_merger();
     let long_utterance = TEST_IDLE_GAP_SECONDS - 5;
-    started(
-        merger.ingest(audio_sample_lasting(0, long_utterance, "a long sentence")),
+    started_audio(
+        merger.ingest_envelope(audio_sample_lasting(0, long_utterance, "a long sentence")),
         SplitReason::Initial,
     );
 
@@ -1078,8 +1123,8 @@ fn the_silence_is_measured_from_the_end_of_the_previous_utterance() {
         next_start > TEST_IDLE_GAP_SECONDS,
         "the fixture must be one the old arithmetic would have split"
     );
-    let event = started(
-        merger.ingest(audio_sample_lasting(next_start, 2, "a different sentence")),
+    let event = started_audio(
+        merger.ingest_envelope(audio_sample_lasting(next_start, 2, "a different sentence")),
         SplitReason::TextHashChange,
     );
 
@@ -1097,8 +1142,8 @@ fn an_audio_events_window_covers_the_speech_it_holds() {
     // instant.
     let mut merger = audio_merger();
 
-    let event = started(
-        merger.ingest(audio_sample_lasting(0, 7, "seven seconds of speech")),
+    let event = started_audio(
+        merger.ingest_envelope(audio_sample_lasting(0, 7, "seven seconds of speech")),
         SplitReason::Initial,
     );
 

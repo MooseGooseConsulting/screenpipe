@@ -9,7 +9,8 @@ use screenpipe_audio::{
     VadSegmenter, WhisperEngine,
 };
 use screenpipe_memory::{
-    AudioMeta, CadenceInput, CadenceRecord, CaptureGap, ObservationSample, SampleRead, SampleSource,
+    AudioMeta, CadenceInput, CadenceRecord, CaptureGap, ObservationEnvelope, ObservationRead,
+    ObservationSample, SampleRead, SampleSource,
 };
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 
@@ -52,7 +53,7 @@ pub(crate) const CAPTURE_STOPPED: &str = "the audio capture threads stopped";
 
 /// The message the capture side sends the async run loop.
 enum Observed {
-    Sample(Box<ObservationSample>),
+    Sample(Box<ObservationEnvelope>),
     /// Capture itself failed. The run loop counts these toward its gap ceiling,
     /// so a dead endpoint stops the channel rather than spinning on it.
     Gap(CaptureGap),
@@ -174,7 +175,7 @@ impl SampleSource for AudioSampleSource {
     async fn next_sample(&mut self) -> Result<SampleRead> {
         match self.incoming.recv().await {
             Some(Observed::Sample(sample)) => Ok(SampleRead::Sample {
-                sample: *sample,
+                sample: sample.into_sample(),
                 // Reported, not computed, exactly as the clipboard channel does
                 // it. `CadencePolicy` answers a question about screen frames
                 // and input idleness; neither describes an utterance. What is
@@ -195,6 +196,25 @@ impl SampleSource for AudioSampleSource {
             // Both workers are gone. Returning an error rather than parking
             // forever is what lets the run loop exit and the service wrapper
             // restart the process from a clean state.
+            None => Err(anyhow::anyhow!(CAPTURE_STOPPED)),
+        }
+    }
+
+    async fn next_observation(&mut self) -> Result<ObservationRead> {
+        match self.incoming.recv().await {
+            Some(Observed::Sample(observation)) => Ok(ObservationRead::Sample {
+                observation: *observation,
+                cadence: CadenceRecord {
+                    input: CadenceInput {
+                        input_idle: Duration::zero(),
+                        frame_stable_for: Duration::zero(),
+                        foreground_changed: false,
+                        frame_changed: false,
+                    },
+                    next_interval: Duration::zero(),
+                },
+            }),
+            Some(Observed::Gap(gap)) => Ok(ObservationRead::Gap(gap)),
             None => Err(anyhow::anyhow!(CAPTURE_STOPPED)),
         }
     }
@@ -299,13 +319,14 @@ fn transcribe_loop(
             ocr_text: transcript.raw,
             readable_text: transcript.text,
             browser_url: None,
-            // An utterance occupies a span, and this is the only channel
-            // where that is true. Without it the merger measures the silence
-            // between two turns from the START of the first one, so a long
-            // sentence followed by a short pause reads as a long gap and
-            // splits.
-            observed_until: Some(utterance.ended_at),
-            audio: Some(AudioMeta {
+        };
+        // An utterance occupies a span, and this is the only channel where
+        // that is true. The envelope preserves the stable public sample shape
+        // while carrying the end and audio source facts through the runner.
+        let observation = ObservationEnvelope::spanning(
+            sample,
+            utterance.ended_at,
+            AudioMeta {
                 channel: meta.channel,
                 device_category: meta.device_category,
                 engine: "whisper-rs",
@@ -315,11 +336,11 @@ fn transcribe_loop(
                 language: meta.language.clone(),
                 avg_no_speech_permille: transcript.avg_no_speech_prob.map(to_permille),
                 closed_by: utterance.closed_by.as_code(),
-            }),
-        };
+            },
+        );
 
         if observed
-            .blocking_send(Observed::Sample(Box::new(sample)))
+            .blocking_send(Observed::Sample(Box::new(observation)))
             .is_err()
         {
             return;

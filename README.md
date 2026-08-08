@@ -222,11 +222,12 @@ carry no `audio` key at all.
 An audio event's window is real: `ended_at - started_at` is how long the speech
 ran. That takes a deliberate mechanism, because every other observation in this
 system happens at an instant - a frame is read at a moment, a copy happens at a
-moment - and an utterance runs for seconds. `ObservationSample.observed_until`
-carries that end, and the merger measures the idle gap from it. Without it the
-"silence" between two turns would include the length of the first one, and a
-30-second sentence followed by a 35-second pause would split at a 60-second
-threshold that 35 seconds of silence never crossed.
+moment - and an utterance runs for seconds. `ObservationEnvelope` carries that
+end beside the source-compatible `ObservationSample`, and the merger measures
+the idle gap from it. Without it the "silence" between two turns would include
+the length of the first one, and a 30-second sentence followed by a 35-second
+pause would split at a 60-second threshold that 35 seconds of silence never
+crossed.
 
 ### Three threads, and why
 

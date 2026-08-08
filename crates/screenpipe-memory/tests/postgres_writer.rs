@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, ensure};
 use chrono::{Duration, TimeZone, Utc};
 use screenpipe_memory::{
-    CadenceInput, CadenceRecord, CaptureGapSummary, EventKind, HashLedger, MERGE_CONTRACT_VERSION,
-    MergeDecisionKind, ObservationSample, OpenEvent, PgEventReader, PgEventWriter, SplitReason,
+    CadenceInput, CadenceRecord, CaptureGapSummary, EventEnvelope, EventKind, HashLedger,
+    MERGE_CONTRACT_VERSION, MergeDecisionKind, ObservationSample, OpenEvent, PgEventReader,
+    PgEventWriter, SplitReason,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -356,8 +357,6 @@ fn event(
             ocr_text: text.to_owned(),
             readable_text: format!("readable {text}"),
             browser_url: browser_url.map(str::to_owned),
-            observed_until: None,
-            audio: None,
         },
         merge_hash: "stable-merge-hash".to_owned(),
         latest_exact_ocr_hash: hash.clone(),
@@ -1539,8 +1538,6 @@ fn clipboard_read(second: u32, text: &str) -> screenpipe_memory::SampleRead {
             ocr_text: text.to_owned(),
             readable_text: text.to_owned(),
             browser_url: None,
-            observed_until: None,
-            audio: None,
         },
         cadence: CadenceRecord {
             input: CadenceInput {
@@ -1684,19 +1681,24 @@ async fn an_audio_event_persists_its_kind_its_title_and_its_audio_metadata() -> 
         );
         utterance.kind = EventKind::Audio;
         utterance.latest.readable_text = "cleaned transcript".to_owned();
-        utterance.latest.audio = Some(screenpipe_memory::AudioMeta {
-            channel: "system_audio",
-            device_category: "communications",
-            engine: "whisper-rs",
-            model: "ggml-base.en".to_owned(),
-            vad_engine: "webrtc-vad",
-            vad_aggressiveness: "quality",
-            language: Some("en".to_owned()),
-            avg_no_speech_permille: Some(30),
-            closed_by: "silence",
-        });
+        let utterance = EventEnvelope::with_audio(
+            utterance,
+            screenpipe_memory::AudioMeta {
+                channel: "system_audio",
+                device_category: "communications",
+                engine: "whisper-rs",
+                model: "ggml-base.en".to_owned(),
+                vad_engine: "webrtc-vad",
+                vad_aggressiveness: "quality",
+                language: Some("en".to_owned()),
+                avg_no_speech_permille: Some(30),
+                closed_by: "silence",
+            },
+        );
 
-        let id = writer.write_start(&utterance, SplitReason::Initial).await?;
+        let id = writer
+            .write_start_envelope(&utterance, SplitReason::Initial)
+            .await?;
         let row = sqlx::query(
             "SELECT kind, title, ocr_text, readable_text, merge_meta FROM events WHERE id = $1",
         )

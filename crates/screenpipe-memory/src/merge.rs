@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, Utc};
 use sha2::{Digest, Sha256};
 
 use crate::cadence::CadenceRecord;
-use crate::sample::ObservationSample;
+use crate::sample::{AudioMeta, ObservationEnvelope, ObservationSample};
 use crate::text_hash::{TextIdentity, jaccard_overlap, normalize_text};
 
 /// Bumped to 2 when the per-event hash ledger became bounded. Version 1 events
@@ -347,7 +347,7 @@ pub struct OpenEvent {
 #[derive(Clone, Debug)]
 pub struct Merger {
     config: MergeConfig,
-    open: Option<OpenEvent>,
+    open: Option<EventEnvelope>,
 }
 
 impl Merger {
@@ -361,14 +361,25 @@ impl Merger {
         cadence: CadenceRecord,
         capture_gaps: CaptureGapSummary,
     ) -> MergeDecision {
+        self.ingest_envelope_with_metadata(sample.into(), cadence, capture_gaps)
+            .into_legacy()
+    }
+
+    pub fn ingest_envelope_with_metadata(
+        &mut self,
+        observation: ObservationEnvelope,
+        cadence: CadenceRecord,
+        capture_gaps: CaptureGapSummary,
+    ) -> EnvelopeMergeDecision {
+        let sample = observation.sample();
         let identity = TextIdentity::from_ocr(&sample.ocr_text);
         let merge_hash = match self.config.kind {
-            EventKind::Audio => audio_merge_hash(&sample, &identity.exact_hash),
+            EventKind::Audio => audio_merge_hash(&observation, &identity.exact_hash),
             EventKind::Screen | EventKind::Clipboard => identity.exact_hash.clone(),
         };
         let Some(open) = self.open.as_ref() else {
             return self.start(
-                sample,
+                observation,
                 merge_hash,
                 identity.exact_hash,
                 cadence,
@@ -378,9 +389,9 @@ impl Merger {
         };
 
         let reason = match self.config.kind {
-            EventKind::Screen => self.screen_split_reason(open, &sample, &identity),
-            EventKind::Clipboard => self.clipboard_split_reason(open, &sample, &identity),
-            EventKind::Audio => self.audio_split_reason(open, &sample, &merge_hash),
+            EventKind::Screen => self.screen_split_reason(open.event(), sample, &identity),
+            EventKind::Clipboard => self.clipboard_split_reason(open.event(), sample, &identity),
+            EventKind::Audio => self.audio_split_reason(open.event(), sample, &merge_hash),
         };
 
         // The ceilings are consulted last, so an observed reason always wins
@@ -389,9 +400,11 @@ impl Merger {
         // that never changes matches none of them and would otherwise merge for
         // the length of the run.
         let reason = reason.or_else(|| {
-            if (sample.captured_at - open.started_at).num_seconds() >= MAX_EVENT_DURATION_SECONDS {
+            if (sample.captured_at - open.event().started_at).num_seconds()
+                >= MAX_EVENT_DURATION_SECONDS
+            {
                 Some(SplitReason::MaxDuration)
-            } else if open.sample_count >= MAX_EVENT_SAMPLES {
+            } else if open.event().sample_count >= MAX_EVENT_SAMPLES {
                 Some(SplitReason::MaxSamples)
             } else {
                 None
@@ -400,7 +413,7 @@ impl Merger {
 
         if let Some(reason) = reason {
             return self.start(
-                sample,
+                observation,
                 merge_hash,
                 identity.exact_hash,
                 cadence,
@@ -410,15 +423,16 @@ impl Merger {
         }
 
         let open = self.open.as_mut().expect("open event checked above");
-        open.ended_at = sample.observed_until();
-        open.latest = sample;
-        open.latest_exact_ocr_hash = identity.exact_hash.clone();
-        open.last_decision = MergeDecisionKind::Merge;
-        open.latest_cadence = cadence;
-        open.capture_gaps = open.capture_gaps.add(capture_gaps);
-        open.sample_count = open.sample_count.saturating_add(1);
-        open.hash_counts.record(identity.exact_hash);
-        MergeDecision::Merge {
+        open.event.ended_at = observation.observed_until();
+        open.event.latest = observation.sample().clone();
+        open.audio = observation.audio().cloned();
+        open.event.latest_exact_ocr_hash = identity.exact_hash.clone();
+        open.event.last_decision = MergeDecisionKind::Merge;
+        open.event.latest_cadence = cadence;
+        open.event.capture_gaps = open.event.capture_gaps.add(capture_gaps);
+        open.event.sample_count = open.event.sample_count.saturating_add(1);
+        open.event.hash_counts.record(identity.exact_hash);
+        EnvelopeMergeDecision::Merge {
             event: open.clone(),
         }
     }
@@ -531,24 +545,28 @@ impl Merger {
 
     fn start(
         &mut self,
-        sample: ObservationSample,
+        observation: ObservationEnvelope,
         merge_hash: String,
         latest_exact_ocr_hash: String,
         cadence: CadenceRecord,
         capture_gaps: CaptureGapSummary,
         reason: SplitReason,
-    ) -> MergeDecision {
+    ) -> EnvelopeMergeDecision {
+        let started_at = observation.sample().captured_at;
+        let ended_at = observation.observed_until();
+        let audio = observation.audio().cloned();
+        let sample = observation.into_sample();
         let hash_counts = HashLedger::with_first(latest_exact_ocr_hash.clone());
         let event = OpenEvent {
             kind: self.config.kind,
             merge_contract_version: MERGE_CONTRACT_VERSION,
-            started_at: sample.captured_at,
+            started_at,
             // The observation's END, which is its start for everything that
             // happens at an instant and genuinely later for an utterance. This
             // is what the idle-gap test above measures FROM, so getting it
             // wrong would fold the length of one utterance into the silence
             // after it.
-            ended_at: sample.observed_until(),
+            ended_at,
             latest: sample,
             latest_exact_ocr_hash,
             merge_hash,
@@ -559,8 +577,68 @@ impl Merger {
             sample_count: 1,
             hash_counts,
         };
+        let event = match audio {
+            Some(audio) => EventEnvelope::with_audio(event, audio),
+            None => EventEnvelope::without_audio(event),
+        };
         self.open = Some(event.clone());
-        MergeDecision::Start { reason, event }
+        EnvelopeMergeDecision::Start { reason, event }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventEnvelope {
+    event: OpenEvent,
+    audio: Option<AudioMeta>,
+}
+
+impl EventEnvelope {
+    pub fn without_audio(event: OpenEvent) -> Self {
+        Self { event, audio: None }
+    }
+
+    pub fn with_audio(event: OpenEvent, audio: AudioMeta) -> Self {
+        Self {
+            event,
+            audio: Some(audio),
+        }
+    }
+
+    pub fn event(&self) -> &OpenEvent {
+        &self.event
+    }
+
+    pub fn audio(&self) -> Option<&AudioMeta> {
+        self.audio.as_ref()
+    }
+
+    fn into_event(self) -> OpenEvent {
+        self.event
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnvelopeMergeDecision {
+    Start {
+        reason: SplitReason,
+        event: EventEnvelope,
+    },
+    Merge {
+        event: EventEnvelope,
+    },
+}
+
+impl EnvelopeMergeDecision {
+    fn into_legacy(self) -> MergeDecision {
+        match self {
+            Self::Start { reason, event } => MergeDecision::Start {
+                reason,
+                event: event.into_event(),
+            },
+            Self::Merge { event } => MergeDecision::Merge {
+                event: event.into_event(),
+            },
+        }
     }
 }
 
@@ -570,11 +648,14 @@ impl Merger {
 /// locale or formatter can alter the durable hash. Including the transcript
 /// hash keeps different chunks in one window distinct; including both ends of
 /// the VAD window keeps identical words in separate utterances distinct.
-fn audio_merge_hash(sample: &ObservationSample, transcript_hash: &str) -> String {
+fn audio_merge_hash(observation: &ObservationEnvelope, transcript_hash: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"screenpipe-audio-utterance-v1\0");
     hasher.update(transcript_hash.as_bytes());
-    for instant in [sample.captured_at, sample.observed_until()] {
+    for instant in [
+        observation.sample().captured_at,
+        observation.observed_until(),
+    ] {
         hasher.update(instant.timestamp().to_be_bytes());
         hasher.update(instant.timestamp_subsec_nanos().to_be_bytes());
     }
