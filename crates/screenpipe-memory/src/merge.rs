@@ -27,7 +27,11 @@ use crate::text_hash::{TextIdentity, jaccard_overlap, normalize_text};
 /// their merge identity. From 6 on, an audio identity also includes the VAD
 /// utterance window, so repeating the same words in a later utterance remains
 /// a separately durable event.
-pub const MERGE_CONTRACT_VERSION: u32 = 6;
+///
+/// Bumped to 7 when an observation window end that regresses behind the open
+/// event's observed end becomes a durable boundary. Earlier versions could
+/// merge it and produce an invalid event window with `ended_at < started_at`.
+pub const MERGE_CONTRACT_VERSION: u32 = 7;
 
 /// What a durable event is a record of.
 ///
@@ -195,6 +199,8 @@ pub enum SplitReason {
     AppChange,
     WindowTitleChange,
     IdleGap,
+    /// The observation window end moved behind the open event's observed end.
+    TimestampRegression,
     TextHashChange,
     /// The open event reached `MAX_EVENT_DURATION_SECONDS`.
     ///
@@ -213,6 +219,7 @@ impl SplitReason {
             Self::AppChange => "app_change",
             Self::WindowTitleChange => "window_title_change",
             Self::IdleGap => "idle_gap",
+            Self::TimestampRegression => "timestamp_regression",
             Self::TextHashChange => "text_hash_change",
             Self::MaxDuration => "max_duration",
             Self::MaxSamples => "max_samples",
@@ -388,10 +395,16 @@ impl Merger {
             );
         };
 
-        let reason = match self.config.kind {
-            EventKind::Screen => self.screen_split_reason(open.event(), sample, &identity),
-            EventKind::Clipboard => self.clipboard_split_reason(open.event(), sample, &identity),
-            EventKind::Audio => self.audio_split_reason(open.event(), sample, &merge_hash),
+        let reason = if observation.observed_until() < open.event().ended_at {
+            Some(SplitReason::TimestampRegression)
+        } else {
+            match self.config.kind {
+                EventKind::Screen => self.screen_split_reason(open.event(), sample, &identity),
+                EventKind::Clipboard => {
+                    self.clipboard_split_reason(open.event(), sample, &identity)
+                }
+                EventKind::Audio => self.audio_split_reason(open.event(), sample, &merge_hash),
+            }
         };
 
         // The ceilings are consulted last, so an observed reason always wins

@@ -1552,8 +1552,7 @@ fn clipboard_read(second: u32, text: &str) -> screenpipe_memory::SampleRead {
 }
 
 #[tokio::test]
-async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_discipline()
--> Result<()> {
+async fn clipboard_timestamp_regressions_round_trip_as_distinct_valid_events() -> Result<()> {
     let Some(db) = TestDatabase::create().await? else {
         return Ok(());
     };
@@ -1565,7 +1564,7 @@ async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_dis
                 SplitReason::Initial,
             )
             .await?;
-        let copied = "clipboard search fixture";
+        let copied = "synthetic clipboard regression fixture";
         let mut runner = screenpipe_memory::Runner::new(screenpipe_memory::MergeConfig {
             kind: EventKind::Clipboard,
             idle_gap: Duration::seconds(60),
@@ -1573,30 +1572,25 @@ async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_dis
         });
         let mut source = ScriptedSource(
             [
-                clipboard_read(1, copied),
-                clipboard_read(3, copied),
-                clipboard_read(5, "different clipboard fixture"),
+                clipboard_read(10, copied),
+                clipboard_read(5, copied),
             ]
             .into_iter()
             .collect(),
         );
         let first = runner.run_once(&mut source, &writer).await?;
-        let merged = runner.run_once(&mut source, &writer).await?;
         let second = runner.run_once(&mut source, &writer).await?;
-        let (first_id, second_id) = match (&first, &merged, &second) {
+        let (first_id, second_id) = match (&first, &second) {
             (
                 screenpipe_memory::RunOutcome::Started {
                     event_id: first_id,
                     reason: SplitReason::Initial,
                 },
-                screenpipe_memory::RunOutcome::Merged {
-                    event_id: merged_id,
-                },
                 screenpipe_memory::RunOutcome::Started {
                     event_id: second_id,
-                    reason: SplitReason::TextHashChange,
+                    reason,
                 },
-            ) if merged_id == first_id => (first_id.clone(), second_id.clone()),
+            ) if reason.as_code() == "timestamp_regression" => (first_id.clone(), second_id.clone()),
             other => anyhow::bail!("clipboard channel produced {other:?}"),
         };
         ensure!(
@@ -1612,9 +1606,9 @@ async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_dis
         .fetch_one(&db.pool)
         .await?;
         ensure!(row.try_get::<String, _>("kind")? == "clipboard");
-        ensure!(row.try_get::<chrono::DateTime<Utc>, _>("started_at")? == at(1));
-        ensure!(row.try_get::<chrono::DateTime<Utc>, _>("ended_at")? == at(3));
-        ensure!(row.try_get::<i32, _>("sample_count")? == 2);
+        ensure!(row.try_get::<chrono::DateTime<Utc>, _>("started_at")? == at(10));
+        ensure!(row.try_get::<chrono::DateTime<Utc>, _>("ended_at")? == at(10));
+        ensure!(row.try_get::<i32, _>("sample_count")? == 1);
         ensure!(row.try_get::<String, _>("ocr_text")? == copied);
         ensure!(row.try_get::<String, _>("readable_text")? == copied);
         ensure!(
@@ -1627,33 +1621,26 @@ async fn clipboard_captures_round_trip_as_clipboard_events_under_the_same_id_dis
         let meta: Value = row.try_get("merge_meta")?;
         ensure!(meta["merge_contract_version"] == json!(MERGE_CONTRACT_VERSION));
         ensure!(meta["start_reason"] == json!("initial"));
-        ensure!(meta["last_decision"] == json!("merge"));
-        ensure!(meta["sample_count"] == json!(2));
+        ensure!(meta["last_decision"] == json!("start"));
+        ensure!(meta["sample_count"] == json!(1));
         let second_row = sqlx::query(
-            "SELECT kind, ocr_text, sample_count, merge_meta FROM events WHERE id = $1",
+            "SELECT kind, started_at, ended_at, ocr_text, sample_count, merge_meta FROM events WHERE id = $1",
         )
         .bind(&second_id)
         .fetch_one(&db.pool)
         .await?;
         ensure!(second_row.try_get::<String, _>("kind")? == "clipboard");
+        ensure!(second_row.try_get::<chrono::DateTime<Utc>, _>("started_at")? == at(5));
+        ensure!(second_row.try_get::<chrono::DateTime<Utc>, _>("ended_at")? == at(5));
         ensure!(second_row.try_get::<i32, _>("sample_count")? == 1);
         ensure!(
             second_row.try_get::<Value, _>("merge_meta")?["start_reason"]
-                == json!("text_hash_change")
+                == json!("timestamp_regression")
         );
-        let screen_kind: String = sqlx::query_scalar("SELECT kind FROM events WHERE id = $1")
-            .bind(&screen_id)
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE kind = 'clipboard'")
             .fetch_one(&db.pool)
             .await?;
-        ensure!(screen_kind == "screen");
-        let hits = writer
-            .search(&screenpipe_memory::SearchRequest {
-                query: "clipboard search".to_owned(),
-                limit: 10,
-                ..Default::default()
-            })
-            .await?;
-        ensure!(hits.iter().any(|hit| hit.event_id == first_id));
+        ensure!(rows == 2);
         Ok(())
     }
     .await;

@@ -408,6 +408,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clipboard_timestamp_regression_starts_a_new_event_and_clears_pending_state() {
+        let copied = "synthetic clipboard regression fixture";
+        let mut source = MemorySource::new([
+            Ok(sample_read(10, "", "", copied)),
+            Ok(sample_read(5, "", "", copied)),
+        ]);
+        let sink = RecordingSink::new(
+            [Ok("event-older".to_owned()), Ok("event-newer".to_owned())],
+            [Ok(())],
+        );
+        let mut runner = Runner::new(MergeConfig {
+            kind: EventKind::Clipboard,
+            idle_gap: Duration::seconds(30),
+            scroll_overlap: 0.35,
+        });
+
+        assert!(matches!(
+            runner.run_once(&mut source, &sink).await.unwrap(),
+            RunOutcome::Started { .. }
+        ));
+        let outcome = runner.run_once(&mut source, &sink).await.unwrap();
+
+        let RunOutcome::Started { event_id, reason } = outcome else {
+            panic!("timestamp regression must start a new event");
+        };
+        assert_eq!(event_id, "event-newer");
+        assert_eq!(reason.as_code(), "timestamp_regression");
+        assert_eq!(runner.current_event_id(), Some("event-newer"));
+        assert_eq!(runner.pending_gaps(), CaptureGapSummary::default());
+        assert!(!runner.has_pending_observation());
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(calls[0], SinkCall::Start { .. }));
+        assert!(matches!(calls[1], SinkCall::Start { .. }));
+        assert!(started_event(&calls[0]).ended_at >= started_event(&calls[0]).started_at);
+        assert!(started_event(&calls[1]).ended_at >= started_event(&calls[1]).started_at);
+    }
+
+    #[tokio::test]
     async fn split_replaces_the_durable_id_for_later_merges() {
         let mut source = MemorySource::new([
             Ok(sample_read(0, "notepad.exe", "notes", "same text")),
