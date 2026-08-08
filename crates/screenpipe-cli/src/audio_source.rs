@@ -256,6 +256,12 @@ impl AudioSampleSource {
         self.shutdown.store(true, Ordering::Release);
     }
 
+    /// Rejects new worker output while preserving the observations already
+    /// buffered for the foreground drain.
+    pub(crate) fn stop_accepting_observations(&mut self) {
+        self.incoming.close();
+    }
+
     /// Joins workers only after their observed channel has closed, so joining
     /// cannot wait on a writer that the foreground drain has not processed.
     pub(crate) fn join_workers(&mut self) -> Result<()> {

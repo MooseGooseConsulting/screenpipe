@@ -862,7 +862,9 @@ mod audio {
     use screenpipe_audio::{
         AudioCapture, CaptureError, Channel, DeviceCategory, ModelPath, VadAggressiveness,
     };
-    use screenpipe_memory::{EventKind, MergeConfig, PgEventWriter, Runner, SampleSource};
+    use screenpipe_memory::{
+        EventKind, MergeConfig, ObservationRead, PgEventWriter, Runner, SampleRead, SampleSource,
+    };
 
     use crate::audio_source::{AudioConfig, AudioSampleSource, CaptureStopped};
     use crate::{
@@ -946,19 +948,20 @@ mod audio {
     }
 
     #[derive(Debug)]
-    struct AudioShutdownTimedOut;
+    struct AudioShutdownWaitTimedOut;
 
-    impl std::fmt::Display for AudioShutdownTimedOut {
+    impl std::fmt::Display for AudioShutdownWaitTimedOut {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("audio shutdown did not complete before its bounded deadline")
+            formatter.write_str("audio shutdown stopped waiting for new observations")
         }
     }
 
-    impl std::error::Error for AudioShutdownTimedOut {}
+    impl std::error::Error for AudioShutdownWaitTimedOut {}
 
     /// The shutdown operations the foreground run path needs from its source.
     trait AudioShutdownSource: SampleSource {
         fn request_shutdown(&mut self);
+        fn stop_accepting_observations(&mut self);
         fn join_workers(&mut self) -> Result<()>;
     }
 
@@ -967,15 +970,40 @@ mod audio {
             AudioSampleSource::request_shutdown(self);
         }
 
+        fn stop_accepting_observations(&mut self) {
+            AudioSampleSource::stop_accepting_observations(self);
+        }
+
         fn join_workers(&mut self) -> Result<()> {
             AudioSampleSource::join_workers(self)
         }
     }
 
-    /// Signals capture, persists every observation already completed by the
-    /// workers, then joins after the observed channel closes. The deadline is
-    /// deliberately around the whole drain so Ctrl-C cannot hang forever on a
-    /// broken native worker.
+    /// Signals capture, then gives workers a bounded window to produce more
+    /// observations. Once an observation reaches the runner, persistence is
+    /// never cancelled; after the window, the receiver closes to new output
+    /// and drains its buffered observations before workers are joined.
+    struct ShutdownDrainSource<'a, S> {
+        source: &'a mut S,
+        wait_deadline: Option<tokio::time::Instant>,
+    }
+
+    #[async_trait::async_trait]
+    impl<S: AudioShutdownSource> SampleSource for ShutdownDrainSource<'_, S> {
+        async fn next_sample(&mut self) -> Result<SampleRead> {
+            self.source.next_sample().await
+        }
+
+        async fn next_observation(&mut self) -> Result<ObservationRead> {
+            match self.wait_deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, self.source.next_observation())
+                    .await
+                    .map_err(|_| anyhow::Error::new(AudioShutdownWaitTimedOut))?,
+                None => self.source.next_observation().await,
+            }
+        }
+    }
+
     async fn drain_audio_shutdown(
         runner: &mut Runner,
         source: &mut impl AudioShutdownSource,
@@ -983,25 +1011,33 @@ mod audio {
         deadline: std::time::Duration,
     ) -> Result<()> {
         source.request_shutdown();
-        tokio::time::timeout(deadline, async {
-            loop {
-                match run_iteration(runner, source, sink).await {
-                    Ok(outcome) => print_run_outcome("audio", &outcome),
-                    Err(error) if is_capture_stopped(&error) => {
-                        source.join_workers()?;
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        return Err(anyhow::anyhow!(
-                            "audio shutdown drain failed (category={})",
-                            failure_category(&error)
-                        ));
-                    }
+        let mut wait_deadline = Some(tokio::time::Instant::now() + deadline);
+        loop {
+            let result = {
+                let mut drain_source = ShutdownDrainSource {
+                    source,
+                    wait_deadline,
+                };
+                run_iteration(runner, &mut drain_source, sink).await
+            };
+            match result {
+                Ok(outcome) => print_run_outcome("audio", &outcome),
+                Err(error) if error.downcast_ref::<AudioShutdownWaitTimedOut>().is_some() => {
+                    source.stop_accepting_observations();
+                    wait_deadline = None;
+                }
+                Err(error) if is_capture_stopped(&error) => {
+                    source.join_workers()?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "audio shutdown drain failed (category={})",
+                        failure_category(&error)
+                    ));
                 }
             }
-        })
-        .await
-        .map_err(|_| anyhow::Error::new(AudioShutdownTimedOut))?
+        }
     }
 
     trait AudioCaptureProbe {
@@ -1207,12 +1243,12 @@ mod audio {
     mod tests {
         use std::cell::Cell;
         use std::collections::VecDeque;
-        use std::sync::Mutex;
+        use std::sync::{Arc, Mutex};
 
         use super::{
-            AudioCaptureProbe, AudioShutdownSource, AudioShutdownTimedOut, MAX_TRANSCRIBE_THREADS,
-            audio_next_step, audio_runner, channel_of, drain_audio_shutdown, is_capture_stopped,
-            probe_audio_stream, resolve_threads,
+            AudioCaptureProbe, AudioShutdownSource, MAX_TRANSCRIBE_THREADS, audio_next_step,
+            audio_runner, channel_of, drain_audio_shutdown, is_capture_stopped, probe_audio_stream,
+            resolve_threads,
         };
         use crate::audio_source::CaptureStopped;
         use crate::{LoopStep, MAX_CONSECUTIVE_FAILURES};
@@ -1380,6 +1416,8 @@ mod audio {
                 self.shutdown_requested = true;
             }
 
+            fn stop_accepting_observations(&mut self) {}
+
             fn join_workers(&mut self) -> anyhow::Result<()> {
                 self.joined = true;
                 Ok(())
@@ -1399,6 +1437,65 @@ mod audio {
                 _reason: SplitReason,
             ) -> anyhow::Result<EventId> {
                 *self.starts.lock().unwrap() += 1;
+                EventId::try_from("icarus_1".to_owned())
+            }
+
+            async fn merge(&self, _event_id: &str, _event: &OpenEvent) -> anyhow::Result<()> {
+                unreachable!("one completed observation starts exactly one event")
+            }
+        }
+
+        struct SlowDrainSource {
+            reads: VecDeque<anyhow::Result<ObservationRead>>,
+            shutdown_requested: bool,
+            events: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        #[async_trait]
+        impl SampleSource for SlowDrainSource {
+            async fn next_sample(&mut self) -> anyhow::Result<SampleRead> {
+                unreachable!("the drain path reads envelopes")
+            }
+
+            async fn next_observation(&mut self) -> anyhow::Result<ObservationRead> {
+                assert!(
+                    self.shutdown_requested,
+                    "Ctrl-C must signal workers before draining"
+                );
+                self.reads.pop_front().expect("a queued drain result")
+            }
+        }
+
+        impl AudioShutdownSource for SlowDrainSource {
+            fn request_shutdown(&mut self) {
+                self.shutdown_requested = true;
+            }
+
+            fn stop_accepting_observations(&mut self) {}
+
+            fn join_workers(&mut self) -> anyhow::Result<()> {
+                self.events.lock().unwrap().push("joined");
+                Ok(())
+            }
+        }
+
+        struct SlowDrainSink {
+            events: Arc<Mutex<Vec<&'static str>>>,
+            started: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl EventSink for SlowDrainSink {
+            async fn start(
+                &self,
+                _event: &OpenEvent,
+                _reason: SplitReason,
+            ) -> anyhow::Result<EventId> {
+                self.events.lock().unwrap().push("persistence_started");
+                self.started.notify_one();
+                self.release.notified().await;
+                self.events.lock().unwrap().push("persistence_completed");
                 EventId::try_from("icarus_1".to_owned())
             }
 
@@ -1469,8 +1566,89 @@ mod audio {
             );
         }
 
+        #[tokio::test]
+        async fn ctrl_c_completes_slow_persistence_before_joining_workers() {
+            let started_at = chrono::Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, 0).unwrap();
+            let observation = ObservationEnvelope::spanning(
+                ObservationSample {
+                    captured_at: started_at,
+                    app_key: "audio:loopback".to_owned(),
+                    app_title: "System Audio".to_owned(),
+                    window_title: String::new(),
+                    ocr_text: "fixed transcript".to_owned(),
+                    readable_text: "fixed transcript".to_owned(),
+                    browser_url: None,
+                },
+                started_at + chrono::Duration::seconds(1),
+                AudioMeta {
+                    channel: "system_audio",
+                    device_category: "communications",
+                    engine: "whisper-rs",
+                    model: "ggml-base.en".to_owned(),
+                    vad_engine: "webrtc-vad",
+                    vad_aggressiveness: "quality",
+                    language: None,
+                    avg_no_speech_permille: Some(0),
+                    closed_by: "stream_closed",
+                },
+            );
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let mut source = SlowDrainSource {
+                reads: VecDeque::from([
+                    Ok(ObservationRead::Sample {
+                        observation,
+                        cadence: CadenceRecord::from_input(CadenceInput {
+                            input_idle: chrono::Duration::zero(),
+                            frame_stable_for: chrono::Duration::zero(),
+                            foreground_changed: false,
+                            frame_changed: false,
+                        }),
+                    }),
+                    Err(anyhow::Error::new(CaptureStopped)),
+                ]),
+                shutdown_requested: false,
+                events: Arc::clone(&events),
+            };
+            let sink = SlowDrainSink {
+                events: Arc::clone(&events),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            };
+            let mut runner = audio_runner();
+
+            let mut drain = Box::pin(tokio::spawn(async move {
+                drain_audio_shutdown(
+                    &mut runner,
+                    &mut source,
+                    &sink,
+                    std::time::Duration::from_millis(1),
+                )
+                .await
+            }));
+            started.notified().await;
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), drain.as_mut())
+                    .await
+                    .is_err(),
+                "the deadline only bounds waiting for work, not accepted persistence"
+            );
+            assert_eq!(*events.lock().unwrap(), ["persistence_started"]);
+
+            release.notify_one();
+            drain.await.unwrap().unwrap();
+            assert_eq!(
+                *events.lock().unwrap(),
+                ["persistence_started", "persistence_completed", "joined"]
+            );
+        }
+
         struct StalledDrainSource {
             shutdown_requested: bool,
+            stopped_accepting: bool,
+            joined: bool,
         }
 
         #[async_trait]
@@ -1480,6 +1658,9 @@ mod audio {
             }
 
             async fn next_observation(&mut self) -> anyhow::Result<ObservationRead> {
+                if self.stopped_accepting {
+                    return Err(anyhow::Error::new(CaptureStopped));
+                }
                 std::future::pending().await
             }
         }
@@ -1489,20 +1670,27 @@ mod audio {
                 self.shutdown_requested = true;
             }
 
+            fn stop_accepting_observations(&mut self) {
+                self.stopped_accepting = true;
+            }
+
             fn join_workers(&mut self) -> anyhow::Result<()> {
-                unreachable!("a stalled worker cannot be joined")
+                self.joined = true;
+                Ok(())
             }
         }
 
         #[tokio::test]
-        async fn ctrl_c_shutdown_uses_its_bounded_drain_deadline() {
+        async fn ctrl_c_shutdown_stops_waiting_before_joining_workers() {
             let mut source = StalledDrainSource {
                 shutdown_requested: false,
+                stopped_accepting: false,
+                joined: false,
             };
             let sink = DrainSink::default();
             let mut runner = audio_runner();
 
-            let result = tokio::time::timeout(
+            tokio::time::timeout(
                 std::time::Duration::from_millis(50),
                 drain_audio_shutdown(
                     &mut runner,
@@ -1513,10 +1701,11 @@ mod audio {
             )
             .await
             .expect("the shutdown helper must honor its own deadline")
-            .unwrap_err();
+            .unwrap();
 
-            assert!(result.downcast_ref::<AudioShutdownTimedOut>().is_some());
             assert!(source.shutdown_requested);
+            assert!(source.stopped_accepting);
+            assert!(source.joined);
         }
     }
 }
