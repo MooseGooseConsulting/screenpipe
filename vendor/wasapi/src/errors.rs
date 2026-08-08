@@ -22,8 +22,6 @@ pub enum WasapiError {
     DataLengthMismatch { received: usize, expected: usize },
     #[error("Wrong length of data, got {received}, expected at least {expected}")]
     DataLengthTooShort { received: usize, expected: usize },
-    #[error("Capture client returned a null buffer for non-silent frames")]
-    NullCaptureBuffer,
     #[error("Handle wait timed out")]
     EventTimeout,
     #[error("Handle wait returned an unexpected result: {0}")]
