@@ -1774,11 +1774,14 @@ impl AudioCaptureClient {
             });
         }
         let len_in_bytes = nbr_frames_returned as usize * self.bytes_per_frame;
-        let bufferslice = unsafe { slice::from_raw_parts(buffer_ptr, len_in_bytes) };
-        data[..len_in_bytes].copy_from_slice(bufferslice);
-        if nbr_frames_returned > 0 {
-            unsafe { self.client.ReleaseBuffer(nbr_frames_returned)? };
-        }
+        let copy_result = copy_capture_packet(
+            &mut data[..len_in_bytes],
+            buffer_ptr,
+            &buffer_info,
+        );
+        let release_result = unsafe { self.client.ReleaseBuffer(nbr_frames_returned) };
+        copy_result?;
+        release_result?;
         trace!("read {nbr_frames_returned} frames");
         Ok((nbr_frames_returned, buffer_info))
     }
@@ -1802,17 +1805,19 @@ impl AudioCaptureClient {
         };
         let buffer_info = BufferInfo::new(flags, index, timestamp);
         if nbr_frames_returned == 0 {
-            // There is no need to release a buffer of 0 bytes
+            complete_capture_packet(
+                nbr_frames_returned,
+                || Ok(()),
+                |frames| unsafe { Ok(self.client.ReleaseBuffer(frames)?) },
+            )?;
             return Ok(buffer_info);
         }
         let len_in_bytes = nbr_frames_returned as usize * self.bytes_per_frame;
-        let bufferslice = unsafe { slice::from_raw_parts(buffer_ptr, len_in_bytes) };
-        for element in bufferslice.iter() {
-            data.push_back(*element);
-        }
-        if nbr_frames_returned > 0 {
-            unsafe { self.client.ReleaseBuffer(nbr_frames_returned).unwrap() };
-        }
+        complete_capture_packet(
+            nbr_frames_returned,
+            || append_capture_packet(data, buffer_ptr, len_in_bytes, &buffer_info),
+            |frames| unsafe { Ok(self.client.ReleaseBuffer(frames)?) },
+        )?;
         trace!("read {nbr_frames_returned} frames");
         Ok(buffer_info)
     }
@@ -1822,6 +1827,67 @@ impl AudioCaptureClient {
     pub fn get_sharemode(&self) -> Option<ShareMode> {
         self.sharemode
     }
+}
+
+/// Copies one capture packet while honoring WASAPI's silent-buffer contract.
+///
+/// A silent packet is defined by its flag, not by the pointer. WASAPI may use
+/// a null buffer for it, so no nonempty slice may be formed before the flag is
+/// inspected.
+fn copy_capture_packet(
+    destination: &mut [u8],
+    buffer_ptr: *const u8,
+    buffer_info: &BufferInfo,
+) -> WasapiRes<()> {
+    if buffer_info.flags.silent {
+        destination.fill(0);
+        return Ok(());
+    }
+    if buffer_ptr.is_null() {
+        return Err(WasapiError::DataLengthTooShort {
+            received: 0,
+            expected: destination.len(),
+        });
+    }
+    let source = unsafe { slice::from_raw_parts(buffer_ptr, destination.len()) };
+    destination.copy_from_slice(source);
+    Ok(())
+}
+
+/// Appends one capture packet while honoring WASAPI's silent-buffer contract.
+fn append_capture_packet(
+    destination: &mut VecDeque<u8>,
+    buffer_ptr: *const u8,
+    len_in_bytes: usize,
+    buffer_info: &BufferInfo,
+) -> WasapiRes<()> {
+    if buffer_info.flags.silent {
+        destination.extend(std::iter::repeat_n(0, len_in_bytes));
+        return Ok(());
+    }
+    if buffer_ptr.is_null() {
+        return Err(WasapiError::DataLengthTooShort {
+            received: 0,
+            expected: len_in_bytes,
+        });
+    }
+    let source = unsafe { slice::from_raw_parts(buffer_ptr, len_in_bytes) };
+    destination.extend(source.iter().copied());
+    Ok(())
+}
+
+/// Runs the packet operation and releases every successfully acquired packet
+/// exactly once, including a valid zero-frame packet.
+fn complete_capture_packet<T>(
+    nbr_frames: u32,
+    process: impl FnOnce() -> WasapiRes<T>,
+    release: impl FnOnce(u32) -> WasapiRes<()>,
+) -> WasapiRes<T> {
+    let process_result = process();
+    let release_result = release(nbr_frames);
+    let result = process_result?;
+    release_result?;
+    Ok(result)
 }
 
 /// Struct wrapping a [HANDLE] to an [Event Object](https://docs.microsoft.com/en-us/windows/win32/sync/event-objects).
@@ -1853,7 +1919,12 @@ impl Handle {
 
 #[cfg(test)]
 mod wait_tests {
-    use super::{Handle, HANDLE};
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+
+    use super::{
+        BufferInfo, Handle, append_capture_packet, complete_capture_packet, ptr, HANDLE,
+    };
     use crate::WasapiError;
 
     #[test]
@@ -1872,6 +1943,51 @@ mod wait_tests {
             matches!(error, WasapiError::Windows(_)),
             "WAIT_FAILED must preserve its Windows error, got {error:?}"
         );
+    }
+
+    #[test]
+    fn silent_packet_with_a_null_buffer_enqueues_zeroes() {
+        let mut packet = BufferInfo::none();
+        packet.flags.silent = true;
+        let mut queued = VecDeque::new();
+
+        append_capture_packet(&mut queued, ptr::null(), 6, &packet).unwrap();
+
+        assert_eq!(queued, VecDeque::from([0u8; 6]));
+    }
+
+    #[test]
+    fn non_silent_packet_with_a_null_buffer_is_rejected_without_a_slice() {
+        let packet = BufferInfo::none();
+        let mut queued = VecDeque::new();
+
+        assert!(matches!(
+            append_capture_packet(&mut queued, ptr::null(), 6, &packet),
+            Err(crate::WasapiError::DataLengthTooShort {
+                received: 0,
+                expected: 6
+            })
+        ));
+    }
+
+    #[test]
+    fn zero_frame_capture_packet_is_released_exactly_once() {
+        let releases = Cell::new(0);
+        let released_frames = Cell::new(None);
+
+        complete_capture_packet(
+            0,
+            || Ok(()),
+            |frames| {
+                releases.set(releases.get() + 1);
+                released_frames.set(Some(frames));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(releases.get(), 1);
+        assert_eq!(released_frames.get(), Some(0));
     }
 }
 

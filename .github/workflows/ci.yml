@@ -181,5 +181,8 @@ jobs:
       - name: Test the audio crate
         run: cargo test -p screenpipe-audio
 
+      - name: Test the CLI audio feature
+        run: cargo test -p screenpipe-cli --features audio
+
       - name: Check the CLI audio feature
         run: cargo check -p screenpipe-cli --features audio

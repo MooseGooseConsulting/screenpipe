@@ -96,7 +96,8 @@ fn audio_help_says_the_channel_is_off_and_what_turning_it_on_means() {
         .assert()
         .success()
         .stdout(predicate::str::contains("OFF"))
-        .stdout(predicate::str::contains("audio-channel.md"));
+        .stdout(predicate::str::contains("README Audio channel section"))
+        .stdout(predicate::str::contains("audio-channel.md").not());
 }
 
 #[test]

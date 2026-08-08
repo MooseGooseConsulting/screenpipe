@@ -10,8 +10,8 @@ use std::fmt;
 
 use chrono::{DateTime, Duration, Utc};
 use wasapi::{
-    AudioCaptureClient, AudioClient, DeviceEnumerator, Direction, Handle, SampleType, StreamMode,
-    WasapiError, WaveFormat, initialize_mta,
+    AudioCaptureClient, AudioClient, BufferInfo, DeviceEnumerator, Direction, Handle, SampleType,
+    StreamMode, WasapiError, WaveFormat, initialize_mta,
 };
 
 use crate::Channel;
@@ -91,6 +91,8 @@ pub enum CaptureError {
     FormatUnsupported,
     /// The stream stopped delivering audio.
     StreamStalled,
+    /// WASAPI reported frames were lost before this packet.
+    StreamDiscontinuity,
 }
 
 impl fmt::Display for CaptureError {
@@ -104,12 +106,54 @@ impl fmt::Display for CaptureError {
                 "the audio engine would not provide mono 16 kHz 16-bit capture"
             }
             Self::StreamStalled => "the audio stream stopped delivering frames",
+            Self::StreamDiscontinuity => "the audio stream reported a capture discontinuity",
         };
         formatter.write_str(text)
     }
 }
 
 impl std::error::Error for CaptureError {}
+
+enum CaptureFill<'a> {
+    TimeoutSilence,
+    Packet {
+        packet: &'a BufferInfo,
+        nonempty: bool,
+    },
+}
+
+/// WASAPI commonly marks the first real packet after starting a stream as a
+/// discontinuity even though no established stream history exists to lose.
+/// Only that first nonempty engine packet gets the exemption; every later
+/// discontinuity remains a typed restart boundary before audio reaches VAD.
+struct PacketClassifier {
+    awaiting_first_nonempty_packet: bool,
+}
+
+impl PacketClassifier {
+    fn new() -> Self {
+        Self {
+            awaiting_first_nonempty_packet: true,
+        }
+    }
+
+    fn classify(&mut self, fill: CaptureFill<'_>) -> Result<(), CaptureError> {
+        let CaptureFill::Packet { packet, nonempty } = fill else {
+            return Ok(());
+        };
+        if !nonempty {
+            return Ok(());
+        }
+
+        let is_startup_packet = self.awaiting_first_nonempty_packet;
+        self.awaiting_first_nonempty_packet = false;
+        if packet.flags.data_discontinuity && !is_startup_packet {
+            Err(CaptureError::StreamDiscontinuity)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// One frame of audio, with the time it was captured.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +172,7 @@ pub struct AudioCapture {
     event: Handle,
     /// Raw bytes read from the engine, not yet cut into frames.
     queued: VecDeque<u8>,
+    packet_classifier: PacketClassifier,
     category: DeviceCategory,
     channel: Channel,
 }
@@ -193,6 +238,7 @@ impl AudioCapture {
             capture,
             event,
             queued: VecDeque::with_capacity(FRAME_BYTES * 64),
+            packet_classifier: PacketClassifier::new(),
             category,
             channel,
         })
@@ -252,14 +298,22 @@ impl AudioCapture {
                 // open long after.
                 self.queued
                     .extend(std::iter::repeat_n(0u8, FRAME_BYTES * TIMEOUT_FRAMES));
+                self.packet_classifier
+                    .classify(CaptureFill::TimeoutSilence)?;
                 return Ok(());
             }
             WaitOutcome::Signaled => {}
         }
-        self.capture
+        let queued_before = self.queued.len();
+        let packet = self
+            .capture
             .read_from_device_to_deque(&mut self.queued)
             .map_err(|_| CaptureError::StreamStalled)?;
-        Ok(())
+        let nonempty = self.queued.len() > queued_before;
+        self.packet_classifier.classify(CaptureFill::Packet {
+            packet: &packet,
+            nonempty,
+        })
     }
 }
 
@@ -280,8 +334,8 @@ fn samples_to_duration(samples: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureError, FRAME_BYTES, SAMPLE_RATE_HZ, WaitOutcome, classify_wait_result,
-        samples_to_duration,
+        CaptureError, CaptureFill, FRAME_BYTES, PacketClassifier, SAMPLE_RATE_HZ, WaitOutcome,
+        classify_wait_result, samples_to_duration,
     };
     use crate::vad::{FRAME_MS, FRAME_SAMPLES};
     use wasapi::WasapiError;
@@ -315,6 +369,7 @@ mod tests {
             CaptureError::DeviceUnavailable,
             CaptureError::FormatUnsupported,
             CaptureError::StreamStalled,
+            CaptureError::StreamDiscontinuity,
         ] {
             let message = error.to_string();
             assert!(!message.is_empty());
@@ -336,5 +391,105 @@ mod tests {
             Err(CaptureError::StreamStalled)
         );
         assert_eq!(classify_wait_result(Ok(())), Ok(WaitOutcome::Signaled));
+    }
+
+    fn packet(discontinuous: bool) -> wasapi::BufferInfo {
+        let mut packet = wasapi::BufferInfo::none();
+        packet.flags.data_discontinuity = discontinuous;
+        packet
+    }
+
+    #[test]
+    fn first_nonempty_discontinuous_packet_is_an_accepted_startup_boundary() {
+        let packet = packet(true);
+        let mut classifier = PacketClassifier::new();
+
+        assert_eq!(
+            classifier.classify(CaptureFill::Packet {
+                packet: &packet,
+                nonempty: true,
+            }),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn discontinuity_after_the_flagged_startup_packet_restarts_capture() {
+        let packet = packet(true);
+        let mut classifier = PacketClassifier::new();
+
+        assert_eq!(
+            classifier.classify(CaptureFill::Packet {
+                packet: &packet,
+                nonempty: true,
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            classifier.classify(CaptureFill::Packet {
+                packet: &packet,
+                nonempty: true,
+            }),
+            Err(CaptureError::StreamDiscontinuity)
+        );
+    }
+
+    #[test]
+    fn zero_frame_packet_does_not_consume_the_startup_exemption() {
+        let zero_frame = packet(false);
+        let first_nonempty = packet(true);
+        let mut classifier = PacketClassifier::new();
+
+        assert_eq!(
+            classifier.classify(CaptureFill::Packet {
+                packet: &zero_frame,
+                nonempty: false,
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            classifier.classify(CaptureFill::Packet {
+                packet: &first_nonempty,
+                nonempty: true,
+            }),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn timeout_silence_does_not_consume_the_startup_exemption() {
+        let first_nonempty = packet(true);
+        let mut classifier = PacketClassifier::new();
+
+        assert_eq!(classifier.classify(CaptureFill::TimeoutSilence), Ok(()));
+        assert_eq!(
+            classifier.classify(CaptureFill::Packet {
+                packet: &first_nonempty,
+                nonempty: true,
+            }),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn discontinuity_after_an_ordinary_startup_packet_restarts_capture() {
+        let ordinary = packet(false);
+        let discontinuous = packet(true);
+        let mut classifier = PacketClassifier::new();
+
+        assert_eq!(
+            classifier.classify(CaptureFill::Packet {
+                packet: &ordinary,
+                nonempty: true,
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            classifier.classify(CaptureFill::Packet {
+                packet: &discontinuous,
+                nonempty: true,
+            }),
+            Err(CaptureError::StreamDiscontinuity)
+        );
     }
 }

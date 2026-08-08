@@ -1,9 +1,11 @@
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{
     Receiver as SyncReceiver, Sender as UnboundedSyncSender, SyncSender, TrySendError,
     channel as sync_unbounded_channel, sync_channel,
 };
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -45,6 +47,27 @@ const AUDIO_BACKLOG: &str = "event=audio_dropped reason=transcriber_backlog";
 /// spun up. Counted, so a channel that is producing nothing but these is
 /// visible, but it writes no row.
 const AUDIO_NO_SPEECH: &str = "event=audio_discarded reason=no_speech";
+
+/// Fixed diagnostics for worker failures. The worker threads can hold raw
+/// audio, model paths, and OS error details, none of which belong in logs.
+const AUDIO_CAPTURE_FAILURE: &str = "event=audio_capture_error category=capture_unavailable";
+const AUDIO_TRANSCRIBE_FAILURE: &str = "event=audio_transcribe_error category=transcription";
+const AUDIO_WORKER_SHUTDOWN_FAILURE: &str = "one or more audio workers panicked during shutdown";
+
+fn capture_error_reason_code(error: &CaptureError) -> &'static str {
+    match error {
+        CaptureError::NoDevice => "no_device",
+        CaptureError::DeviceUnavailable => "device_unavailable",
+        CaptureError::FormatUnsupported => "format_unsupported",
+        CaptureError::StreamStalled => "stream_stalled",
+        CaptureError::StreamDiscontinuity => "stream_discontinuity",
+    }
+}
+
+fn capture_failure_diagnostic(error: &CaptureError) -> String {
+    let reason = capture_error_reason_code(error);
+    format!("{AUDIO_CAPTURE_FAILURE} reason={reason}")
+}
 
 /// Reported when the capture side is gone for good.
 ///
@@ -120,6 +143,9 @@ pub(crate) struct AudioConfig {
 /// real OS thread and not a `spawn_blocking` task that the runtime may move.
 pub(crate) struct AudioSampleSource {
     incoming: Receiver<Observed>,
+    shutdown: Arc<AtomicBool>,
+    capture_worker: Option<JoinHandle<()>>,
+    transcribe_worker: Option<JoinHandle<()>>,
 }
 
 impl AudioSampleSource {
@@ -139,11 +165,13 @@ impl AudioSampleSource {
         let (terminal_tx, terminal_rx) = sync_unbounded_channel::<Utterance>();
         let (observed_tx, observed_rx) = channel::<Observed>(WRITE_QUEUE);
         let (ready_tx, ready_rx) = sync_channel::<Result<DeviceCategory, CaptureError>>(1);
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let capture_reports = observed_tx.clone();
+        let capture_shutdown = Arc::clone(&shutdown);
         let aggressiveness = config.aggressiveness;
         let audio_channel = config.channel;
-        thread::Builder::new()
+        let capture_worker = thread::Builder::new()
             .name("screenpipe-audio-capture".to_owned())
             .spawn(move || {
                 let capture = match AudioCapture::open(audio_channel) {
@@ -162,18 +190,36 @@ impl AudioSampleSource {
                     &utterances_tx,
                     &terminal_tx,
                     &capture_reports,
+                    capture_shutdown.as_ref(),
                 );
             })?;
 
-        let device_category = ready_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("the audio capture thread stopped before it opened"))??;
+        let device_category = match ready_rx.recv() {
+            Ok(Ok(category)) => category,
+            Ok(Err(error)) => {
+                let _ = capture_worker.join();
+                return Err(error.into());
+            }
+            Err(_) => {
+                let _ = capture_worker.join();
+                return Err(anyhow::anyhow!(
+                    "the audio capture thread stopped before it opened"
+                ));
+            }
+        };
 
-        let engine = WhisperEngine::load(
+        let engine = match WhisperEngine::load(
             config.model.clone(),
             config.threads,
             config.language.clone(),
-        )?;
+        ) {
+            Ok(engine) => engine,
+            Err(error) => {
+                shutdown.store(true, Ordering::Release);
+                let _ = capture_worker.join();
+                return Err(error.into());
+            }
+        };
 
         println!(
             "event=audio_channel state=on channel={} device_category={} model={} vad={}",
@@ -192,7 +238,7 @@ impl AudioSampleSource {
         };
         let app_key = config.channel.app_key();
         let app_title = config.channel.app_title();
-        thread::Builder::new()
+        let transcribe_worker = match thread::Builder::new()
             .name("screenpipe-audio-transcribe".to_owned())
             .spawn(move || {
                 transcribe_loop(
@@ -204,11 +250,49 @@ impl AudioSampleSource {
                     &terminal_rx,
                     &observed_tx,
                 )
-            })?;
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                shutdown.store(true, Ordering::Release);
+                let _ = capture_worker.join();
+                return Err(error.into());
+            }
+        };
 
         Ok(Self {
             incoming: observed_rx,
+            shutdown,
+            capture_worker: Some(capture_worker),
+            transcribe_worker: Some(transcribe_worker),
         })
+    }
+
+    /// Signals capture to flush its open utterance and close the worker inputs.
+    pub(crate) fn request_shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Rejects new worker output while preserving the observations already
+    /// buffered for the foreground drain.
+    pub(crate) fn stop_accepting_observations(&mut self) {
+        self.incoming.close();
+    }
+
+    /// Joins every worker after its observed channel has closed, so joining
+    /// cannot wait on a writer that the foreground drain has not processed.
+    pub(crate) fn join_workers(&mut self) -> Result<()> {
+        let mut worker_panicked = false;
+        for worker in [&mut self.capture_worker, &mut self.transcribe_worker] {
+            if let Some(worker) = worker.take() {
+                let join_failed = worker.join().is_err();
+                worker_panicked |= join_failed;
+            }
+        }
+        if worker_panicked {
+            Err(anyhow::anyhow!(AUDIO_WORKER_SHUTDOWN_FAILURE))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -278,13 +362,21 @@ fn capture_loop<C: FrameSource>(
     utterances: &SyncSender<Utterance>,
     terminal: &UnboundedSyncSender<Utterance>,
     reports: &Sender<Observed>,
+    shutdown: &AtomicBool,
 ) {
     let mut segmenter = VadSegmenter::new(aggressiveness);
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            if let Some(utterance) = segmenter.flush() {
+                preserve_terminal_utterance(terminal, utterance);
+            }
+            return;
+        }
         let frame = match capture.next_frame() {
             Ok(frame) => frame,
             Err(error) => {
-                println!("event=audio_capture_error reason={error}");
+                let diagnostic = capture_failure_diagnostic(&error);
+                println!("{diagnostic}");
                 // The utterance in flight is worth more than the failure: flush
                 // before reporting, so a stream that dies mid-sentence still
                 // writes the sentence.
@@ -346,7 +438,8 @@ fn transcribe_loop(
         let transcript = match engine.transcribe(&utterance.samples) {
             Ok(transcript) => transcript,
             Err(error) => {
-                println!("event=audio_transcribe_error reason={error}");
+                let _ = error;
+                println!("{AUDIO_TRANSCRIBE_FAILURE}");
                 // The audio existed and could not be read - the same shape of
                 // failure as an OCR pass that would not run, and counted the
                 // same way so the run loop's ceiling still means something.
@@ -423,9 +516,13 @@ fn to_permille(probability: f32) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
     use super::{
-        AUDIO_BACKLOG, AUDIO_NO_SPEECH, CaptureError, CaptureStopped, FrameSource,
-        TRANSCRIBE_QUEUE, WRITE_QUEUE, capture_loop, receive_utterance, to_permille,
+        AUDIO_BACKLOG, AUDIO_CAPTURE_FAILURE, AUDIO_NO_SPEECH, AUDIO_TRANSCRIBE_FAILURE,
+        AudioSampleSource, CaptureError, CaptureStopped, FrameSource, TRANSCRIBE_QUEUE,
+        WRITE_QUEUE, capture_failure_diagnostic, capture_loop, receive_utterance, to_permille,
     };
     use chrono::{TimeZone, Utc};
     use screenpipe_audio::{CapturedFrame, Utterance, UtteranceEnd, VadAggressiveness};
@@ -478,6 +575,7 @@ mod tests {
             &queued_tx,
             &terminal_tx,
             &reports_tx,
+            &AtomicBool::new(false),
         );
         drop(queued_tx);
         drop(terminal_tx);
@@ -495,11 +593,137 @@ mod tests {
         ));
     }
 
+    struct ShutdownAfterFrames {
+        frames: std::collections::VecDeque<CapturedFrame>,
+        shutdown: Arc<AtomicBool>,
+    }
+
+    impl FrameSource for ShutdownAfterFrames {
+        fn next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+            let frame = self.frames.pop_front().expect("a scripted frame");
+            if self.frames.is_empty() {
+                self.shutdown
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            Ok(frame)
+        }
+    }
+
+    #[test]
+    fn capture_shutdown_flushes_the_open_utterance_without_a_capture_gap() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let started_at = Utc.with_ymd_and_hms(2026, 8, 8, 0, 0, 2).unwrap();
+        let capture = ShutdownAfterFrames {
+            frames: (0..3)
+                .map(|index| CapturedFrame {
+                    captured_at: started_at + chrono::Duration::milliseconds(index * 20),
+                    samples: vec![i16::MAX; 320],
+                })
+                .collect(),
+            shutdown: Arc::clone(&shutdown),
+        };
+        let (queued_tx, _queued_rx) = std::sync::mpsc::sync_channel(1);
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
+        let (reports_tx, mut reports_rx) = tokio::sync::mpsc::channel(1);
+
+        capture_loop(
+            capture,
+            VadAggressiveness::Quality,
+            &queued_tx,
+            &terminal_tx,
+            &reports_tx,
+            shutdown.as_ref(),
+        );
+
+        let flushed = terminal_rx
+            .recv()
+            .expect("the in-flight utterance is flushed");
+        assert_eq!(flushed.closed_by, UtteranceEnd::StreamClosed);
+        assert!(
+            reports_rx.try_recv().is_err(),
+            "shutdown is not a capture gap"
+        );
+    }
+
     #[test]
     fn capture_shutdown_remains_typed_through_anyhow_context() {
         let error = anyhow::Error::new(CaptureStopped).context("audio source read failed");
 
         assert!(error.downcast_ref::<CaptureStopped>().is_some());
+    }
+
+    #[test]
+    fn joining_workers_attempts_both_and_redacts_any_panic() {
+        for (capture_panics, transcriber_panics) in [(true, false), (false, true), (true, true)] {
+            let (observed_tx, incoming) = tokio::sync::mpsc::channel(1);
+            drop(observed_tx);
+            let capture_worker = std::thread::spawn(move || {
+                assert!(!capture_panics, "private capture panic value");
+            });
+            let transcribe_worker = std::thread::spawn(move || {
+                assert!(!transcriber_panics, "private transcriber panic value");
+            });
+            let mut source = AudioSampleSource {
+                incoming,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                capture_worker: Some(capture_worker),
+                transcribe_worker: Some(transcribe_worker),
+            };
+
+            let error = source.join_workers().unwrap_err();
+
+            assert!(
+                source.capture_worker.is_none(),
+                "capture join was not attempted"
+            );
+            assert!(
+                source.transcribe_worker.is_none(),
+                "transcriber join was not attempted after capture failed"
+            );
+            assert_eq!(
+                error.to_string(),
+                "one or more audio workers panicked during shutdown"
+            );
+            let rendered = format!("{error:?}");
+            assert!(!rendered.contains("private capture"));
+            assert!(!rendered.contains("private transcriber"));
+        }
+    }
+
+    #[test]
+    fn every_capture_error_has_a_fixed_private_safe_diagnostic() {
+        let cases = [
+            (
+                CaptureError::NoDevice,
+                "event=audio_capture_error category=capture_unavailable reason=no_device",
+            ),
+            (
+                CaptureError::DeviceUnavailable,
+                "event=audio_capture_error category=capture_unavailable reason=device_unavailable",
+            ),
+            (
+                CaptureError::FormatUnsupported,
+                "event=audio_capture_error category=capture_unavailable reason=format_unsupported",
+            ),
+            (
+                CaptureError::StreamStalled,
+                "event=audio_capture_error category=capture_unavailable reason=stream_stalled",
+            ),
+            (
+                CaptureError::StreamDiscontinuity,
+                "event=audio_capture_error category=capture_unavailable reason=stream_discontinuity",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let display = error.to_string();
+            let diagnostic = capture_failure_diagnostic(&error);
+            assert_eq!(diagnostic, expected);
+            assert!(
+                !diagnostic.contains(display.as_str()),
+                "the fixed diagnostic contains raw CaptureError Display text"
+            );
+        }
     }
 
     #[test]
@@ -538,7 +762,20 @@ mod tests {
             "event=audio_dropped reason=transcriber_backlog"
         );
         assert_eq!(AUDIO_NO_SPEECH, "event=audio_discarded reason=no_speech");
-        for line in [AUDIO_BACKLOG, AUDIO_NO_SPEECH] {
+        assert_eq!(
+            AUDIO_CAPTURE_FAILURE,
+            "event=audio_capture_error category=capture_unavailable"
+        );
+        assert_eq!(
+            AUDIO_TRANSCRIBE_FAILURE,
+            "event=audio_transcribe_error category=transcription"
+        );
+        for line in [
+            AUDIO_BACKLOG,
+            AUDIO_NO_SPEECH,
+            AUDIO_CAPTURE_FAILURE,
+            AUDIO_TRANSCRIBE_FAILURE,
+        ] {
             assert!(!line.contains('{'), "{line} carries a format placeholder");
         }
     }

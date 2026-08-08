@@ -77,6 +77,18 @@ if ($failures.Count -eq 0) {
     }
 }
 
+$workflowPath = Join-Path $root '.github/workflows/ci.yml'
+$workflow = Get-Content -LiteralPath $workflowPath -Raw
+if ($workflow -notmatch '(?m)^\s*- name: Test the CLI audio feature[ \t]*\r?$') {
+    $failures.Add('audio CI does not name its feature-gated CLI test step')
+}
+if ($workflow -notmatch '(?m)^\s*run:\s*cargo test -p screenpipe-cli --features audio\s*$') {
+    $failures.Add('audio CI does not run cargo test -p screenpipe-cli --features audio')
+}
+if ($workflow -notmatch 'LLVM_SHA256:\s+[A-F0-9]{64}' -or $workflow -notmatch 'NINJA_SHA256:\s+[A-F0-9]{64}') {
+    $failures.Add('audio CI checksum pins are missing or malformed')
+}
+
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) {
         Write-Error $failure -ErrorAction Continue

@@ -12,7 +12,7 @@
 //! That is a deliberate posture and not an accident of wiring: a microphone
 //! that records the room is a materially different thing from a recorder that
 //! reads the screen its owner is already looking at, and it can capture people
-//! who never agreed to be captured. See `docs/build/tracks/audio-channel.md` §6.
+//! who never agreed to be captured. See the README Audio channel section.
 
 mod capture;
 mod device;
