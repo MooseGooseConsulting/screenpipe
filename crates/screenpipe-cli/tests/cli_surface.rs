@@ -90,6 +90,9 @@ fn service_status_reads_the_native_task_and_process_state() {
         .args(["service", "status"])
         .assert()
         .success()
+        .stdout(predicate::str::contains(
+            "task_name=MooseGoose Screen Memory",
+        ))
         .stdout(predicate::str::contains("task="))
         .stdout(predicate::str::contains("process="));
 }

@@ -861,6 +861,7 @@ fn run_screen_service_action(action: ScreenServiceAction) -> anyhow::Result<()> 
         ScreenServiceAction::Uninstall => manager.uninstall(&service_root, ServiceKind::Screen)?,
         ScreenServiceAction::Status => manager.status(&service_root, ServiceKind::Screen)?,
     };
+    println!("task_name={}", ServiceKind::Screen.task_name());
     print_service_status(&status);
     Ok(())
 }
