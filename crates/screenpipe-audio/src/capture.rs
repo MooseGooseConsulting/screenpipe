@@ -334,7 +334,7 @@ fn samples_to_duration(samples: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureError, FRAME_BYTES, SAMPLE_RATE_HZ, WaitOutcome, classify_packet,
+        CaptureError, CaptureFill, FRAME_BYTES, PacketClassifier, SAMPLE_RATE_HZ, WaitOutcome,
         classify_wait_result, samples_to_duration,
     };
     use crate::vad::{FRAME_MS, FRAME_SAMPLES};
