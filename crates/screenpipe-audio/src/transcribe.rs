@@ -320,7 +320,13 @@ mod tests {
     fn the_model_label_is_the_stem_and_never_the_path() {
         // The path can contain a Windows user name and this string is written
         // into a durable row.
-        let file = std::env::temp_dir().join("ggml-base.en.bin");
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let file = fixture_dir.path().join("ggml-base.en.bin");
+        let canonical_temp_model = std::env::temp_dir().join("ggml-base.en.bin");
+        assert_ne!(
+            file, canonical_temp_model,
+            "the fixture must not reuse the canonical temp model path"
+        );
         std::fs::write(&file, b"not a real model").unwrap();
         let model = ModelPath::new(&file).unwrap();
 
@@ -328,7 +334,8 @@ mod tests {
 
         assert_eq!(label, "ggml-base.en");
         assert!(!label.contains(std::path::MAIN_SEPARATOR));
-        std::fs::remove_file(&file).ok();
+        assert!(file.exists());
+        assert!(!canonical_temp_model.starts_with(fixture_dir.path()));
     }
 
     #[test]

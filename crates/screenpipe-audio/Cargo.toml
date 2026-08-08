@@ -29,3 +29,4 @@ whisper-rs = { version = "0.16", default-features = false }
 
 [dev-dependencies]
 hound = "3.5"
+tempfile = "3.23"

@@ -10,8 +10,8 @@ use std::fmt;
 
 use chrono::{DateTime, Duration, Utc};
 use wasapi::{
-    AudioCaptureClient, AudioClient, DeviceEnumerator, Direction, Handle, SampleType, StreamMode,
-    WasapiError, WaveFormat, initialize_mta,
+    AudioCaptureClient, AudioClient, BufferInfo, DeviceEnumerator, Direction, Handle, SampleType,
+    StreamMode, WasapiError, WaveFormat, initialize_mta,
 };
 
 use crate::Channel;
@@ -91,6 +91,8 @@ pub enum CaptureError {
     FormatUnsupported,
     /// The stream stopped delivering audio.
     StreamStalled,
+    /// WASAPI reported frames were lost before this packet.
+    StreamDiscontinuity,
 }
 
 impl fmt::Display for CaptureError {
@@ -104,12 +106,24 @@ impl fmt::Display for CaptureError {
                 "the audio engine would not provide mono 16 kHz 16-bit capture"
             }
             Self::StreamStalled => "the audio stream stopped delivering frames",
+            Self::StreamDiscontinuity => "the audio stream reported a capture discontinuity",
         };
         formatter.write_str(text)
     }
 }
 
 impl std::error::Error for CaptureError {}
+
+/// A discontinuity is not a packet that can continue the current utterance.
+/// The caller turns this typed boundary into the existing capture-gap/restart
+/// path before any post-gap audio reaches VAD.
+fn classify_packet(packet: &BufferInfo) -> Result<(), CaptureError> {
+    if packet.flags.data_discontinuity {
+        Err(CaptureError::StreamDiscontinuity)
+    } else {
+        Ok(())
+    }
+}
 
 /// One frame of audio, with the time it was captured.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,10 +270,11 @@ impl AudioCapture {
             }
             WaitOutcome::Signaled => {}
         }
-        self.capture
+        let packet = self
+            .capture
             .read_from_device_to_deque(&mut self.queued)
             .map_err(|_| CaptureError::StreamStalled)?;
-        Ok(())
+        classify_packet(&packet)
     }
 }
 
@@ -280,8 +295,8 @@ fn samples_to_duration(samples: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureError, FRAME_BYTES, SAMPLE_RATE_HZ, WaitOutcome, classify_wait_result,
-        samples_to_duration,
+        CaptureError, FRAME_BYTES, SAMPLE_RATE_HZ, WaitOutcome, classify_packet,
+        classify_wait_result, samples_to_duration,
     };
     use crate::vad::{FRAME_MS, FRAME_SAMPLES};
     use wasapi::WasapiError;
@@ -315,6 +330,7 @@ mod tests {
             CaptureError::DeviceUnavailable,
             CaptureError::FormatUnsupported,
             CaptureError::StreamStalled,
+            CaptureError::StreamDiscontinuity,
         ] {
             let message = error.to_string();
             assert!(!message.is_empty());
@@ -336,5 +352,16 @@ mod tests {
             Err(CaptureError::StreamStalled)
         );
         assert_eq!(classify_wait_result(Ok(())), Ok(WaitOutcome::Signaled));
+    }
+
+    #[test]
+    fn discontinuous_packets_restart_capture_before_their_audio_is_segmented() {
+        let mut packet = wasapi::BufferInfo::none();
+        packet.flags.data_discontinuity = true;
+
+        assert_eq!(
+            classify_packet(&packet),
+            Err(CaptureError::StreamDiscontinuity)
+        );
     }
 }
