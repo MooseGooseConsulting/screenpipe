@@ -2,6 +2,7 @@
 
 mod cadence;
 mod merge;
+pub mod policy;
 mod postgres;
 mod runner;
 mod sample;
@@ -13,9 +14,14 @@ pub use merge::{
     MAX_EVENT_DURATION_SECONDS, MAX_EVENT_SAMPLES, MAX_TRACKED_HASHES, MERGE_CONTRACT_VERSION,
     MergeConfig, MergeDecision, MergeDecisionKind, Merger, OpenEvent, SplitReason,
 };
+pub use policy::{
+    MemoryPolicyRepository, PgPolicyRepository, PolicyMutationRequest, PolicyRepository,
+    PolicySnapshot,
+};
 pub use postgres::{PgEventReader, PgEventWriter, PgPreflight, SearchHit, SearchRequest};
 pub use runner::{
     EventId, EventSink, ObservationRead, RunOutcome, Runner, SampleRead, SampleSource,
 };
 pub use sample::{AudioMeta, ObservationEnvelope, ObservationSample};
 pub use text_hash::{TextIdentity, jaccard_overlap};
+

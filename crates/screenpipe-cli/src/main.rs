@@ -489,6 +489,7 @@ async fn run_capture(
     if !clipboard {
         println!("event=clipboard_channel state=off");
     }
+    println!("event=policy_authority state=active source={machine_slug}");
     println!("event=runtime_ready machine_slug={machine_slug}");
 
     loop {
