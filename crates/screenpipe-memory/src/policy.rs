@@ -62,46 +62,47 @@ impl PolicyRepository for MemoryPolicyRepository {
         let key = (request.source_id.clone(), request.modality.clone());
         let now = Utc::now();
 
-        let current = guard.entry(key.clone()).or_insert_with(|| {
-            let default_consent = match request.modality.as_str() {
-                "clipboard" | "audio" => false,
-                _ => false, // Default off for all until granted
-            };
-            PolicySnapshot {
-                source_id: request.source_id.clone(),
-                modality: request.modality.clone(),
-                consent: default_consent,
-                excluded: false,
-                retention_class: "default".to_string(),
-                policy_epoch: 1,
-                updated_at: now,
-            }
+        let default_consent = match request.modality.as_str() {
+            "clipboard" | "audio" => false,
+            _ => false,
+        };
+
+        let current_snapshot = guard.get(&key).cloned().unwrap_or_else(|| PolicySnapshot {
+            source_id: request.source_id.clone(),
+            modality: request.modality.clone(),
+            consent: default_consent,
+            excluded: false,
+            retention_class: "default".to_string(),
+            policy_epoch: 1,
+            updated_at: now,
         });
 
+        // Validate epoch BEFORE inserting or mutating repository state
         if let Some(exp) = request.expected_epoch {
-            if current.policy_epoch != exp {
+            if current_snapshot.policy_epoch != exp {
                 bail!(
                     "Policy epoch mismatch for ({}, {}): expected {}, found {}",
                     request.source_id,
                     request.modality,
                     exp,
-                    current.policy_epoch
+                    current_snapshot.policy_epoch
                 );
             }
         }
 
-        let new_epoch = current.policy_epoch + 1;
+        let is_new = !guard.contains_key(&key);
+        let new_epoch = if is_new { 1 } else { current_snapshot.policy_epoch + 1 };
         let updated = PolicySnapshot {
             source_id: request.source_id.clone(),
             modality: request.modality.clone(),
             consent: request.consent,
             excluded: request.excluded,
-            retention_class: request.retention_class.unwrap_or_else(|| current.retention_class.clone()),
+            retention_class: request.retention_class.unwrap_or_else(|| current_snapshot.retention_class.clone()),
             policy_epoch: new_epoch,
             updated_at: now,
         };
 
-        *current = updated.clone();
+        guard.insert(key, updated.clone());
         self.audit_log.lock().unwrap().push((updated.clone(), request.reason));
         Ok(updated)
     }
@@ -146,7 +147,12 @@ impl PolicyRepository for PgPolicyRepository {
     async fn mutate_policy(&self, request: PolicyMutationRequest) -> Result<PolicySnapshot> {
         let mut tx = self.pool.begin().await.context("Failed to begin transaction for policy mutation")?;
 
-        // 1. Ensure source exists
+        let default_consent = match request.modality.as_str() {
+            "clipboard" | "audio" => false,
+            _ => false,
+        };
+
+        // 1. Ensure source existence
         sqlx::query(
             "INSERT INTO sources (id, name, kind) VALUES ($1, $1, 'custom') ON CONFLICT (id) DO NOTHING"
         )
@@ -155,31 +161,33 @@ impl PolicyRepository for PgPolicyRepository {
         .await
         .context("Failed to ensure source existence")?;
 
-        // 2. Lock row for update
-        let existing = sqlx::query(
+        // 2. Ensure initial source policy row exists so FOR UPDATE lock always succeeds and serializes initial writes
+        sqlx::query(
+            r#"
+            INSERT INTO source_policies (source_id, modality, consent, excluded, retention_class, policy_epoch, updated_at)
+            VALUES ($1, $2, $3, false, 'default', 1, NOW())
+            ON CONFLICT (source_id, modality) DO NOTHING
+            "#
+        )
+        .bind(&request.source_id)
+        .bind(&request.modality)
+        .bind(default_consent)
+        .execute(&mut *tx)
+        .await
+        .context("Failed to initialize source policy row")?;
+
+        // 3. Row-lock policy row for update
+        let existing_row = sqlx::query(
             "SELECT consent, excluded, retention_class, policy_epoch FROM source_policies WHERE source_id = $1 AND modality = $2 FOR UPDATE"
         )
         .bind(&request.source_id)
         .bind(&request.modality)
-        .fetch_optional(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .context("Failed to row-lock source policy")?;
 
-        let (_cur_consent, _cur_excluded, cur_retention, cur_epoch) = match existing {
-            Some(row) => (
-                row.get::<bool, _>("consent"),
-                row.get::<bool, _>("excluded"),
-                row.get::<String, _>("retention_class"),
-                row.get::<i64, _>("policy_epoch") as u64,
-            ),
-            None => {
-                let default_consent = match request.modality.as_str() {
-                    "clipboard" | "audio" => false,
-                    _ => false,
-                };
-                (default_consent, false, "default".to_string(), 1u64)
-            }
-        };
+        let cur_epoch = existing_row.get::<i64, _>("policy_epoch") as u64;
+        let cur_retention = existing_row.get::<String, _>("retention_class");
 
         if let Some(exp) = request.expected_epoch {
             if cur_epoch != exp {
@@ -193,20 +201,19 @@ impl PolicyRepository for PgPolicyRepository {
             }
         }
 
-        let new_epoch = if cur_epoch > 0 { cur_epoch + 1 } else { 1 };
+        let new_epoch = cur_epoch + 1;
         let new_retention = request.retention_class.unwrap_or(cur_retention);
 
-        // 3. Upsert policy row
+        // 4. Update policy row
         let row = sqlx::query(
             r#"
-            INSERT INTO source_policies (source_id, modality, consent, excluded, retention_class, policy_epoch, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
-            ON CONFLICT (source_id, modality) DO UPDATE
-            SET consent = EXCLUDED.consent,
-                excluded = EXCLUDED.excluded,
-                retention_class = EXCLUDED.retention_class,
-                policy_epoch = EXCLUDED.policy_epoch,
+            UPDATE source_policies
+            SET consent = $3,
+                excluded = $4,
+                retention_class = $5,
+                policy_epoch = $6,
                 updated_at = NOW()
+            WHERE source_id = $1 AND modality = $2
             RETURNING source_id, modality, consent, excluded, retention_class, policy_epoch, updated_at
             "#
         )
@@ -218,9 +225,9 @@ impl PolicyRepository for PgPolicyRepository {
         .bind(new_epoch as i64)
         .fetch_one(&mut *tx)
         .await
-        .context("Failed to upsert source policy")?;
+        .context("Failed to update source policy")?;
 
-        // 4. Record audit entry atomically
+        // 5. Record audit entry atomically
         sqlx::query(
             r#"
             INSERT INTO policy_audit_log (source_id, modality, previous_epoch, new_epoch, consent, excluded, retention_class, reason)

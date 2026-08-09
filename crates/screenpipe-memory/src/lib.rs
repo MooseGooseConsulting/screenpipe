@@ -18,7 +18,9 @@ pub use policy::{
     MemoryPolicyRepository, PgPolicyRepository, PolicyMutationRequest, PolicyRepository,
     PolicySnapshot,
 };
-pub use postgres::{PgEventReader, PgEventWriter, PgPreflight, SearchHit, SearchRequest};
+pub use postgres::{
+    PgEventReader, PgEventWriter, PgPreflight, SearchHit, SearchRequest, ensure_v3_schema,
+};
 pub use runner::{
     EventId, EventSink, ObservationRead, RunOutcome, Runner, SampleRead, SampleSource,
 };

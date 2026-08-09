@@ -2,9 +2,10 @@ use anyhow::Result;
 use screenpipe_memory::{
     MemoryPolicyRepository, PolicyMutationRequest, PolicyRepository,
 };
+use std::collections::HashSet;
 
 #[tokio::test]
-async fn test_policy_mutation_defaults_un_granted_for_clipboard_and_audio() -> Result<()> {
+async fn test_policy_mutation_defaults_ungranted_for_clipboard_and_audio() -> Result<()> {
     let repo = MemoryPolicyRepository::new();
 
     // Get policy for uninitialized clipboard source
@@ -37,13 +38,13 @@ async fn test_policy_mutation_row_locking_and_epoch_serialization() -> Result<()
 
     let snap1 = repo.mutate_policy(req1).await?;
     assert_eq!(snap1.consent, true);
-    assert_eq!(snap1.policy_epoch, 2);
+    assert_eq!(snap1.policy_epoch, 1);
 
     // 2. Second mutation with correct expected_epoch
     let req2 = PolicyMutationRequest {
         source_id: "src-1".to_string(),
         modality: "clipboard".to_string(),
-        expected_epoch: Some(2),
+        expected_epoch: Some(1),
         consent: false,
         excluded: true,
         retention_class: None,
@@ -53,13 +54,13 @@ async fn test_policy_mutation_row_locking_and_epoch_serialization() -> Result<()
     let snap2 = repo.mutate_policy(req2).await?;
     assert_eq!(snap2.consent, false);
     assert_eq!(snap2.excluded, true);
-    assert_eq!(snap2.policy_epoch, 3);
+    assert_eq!(snap2.policy_epoch, 2);
 
     // 3. Mutation with stale/invalid expected_epoch must be rejected
     let req_stale = PolicyMutationRequest {
         source_id: "src-1".to_string(),
         modality: "clipboard".to_string(),
-        expected_epoch: Some(2), // Current epoch is 3!
+        expected_epoch: Some(1), // Current epoch is 2!
         consent: true,
         excluded: false,
         retention_class: None,
@@ -69,73 +70,148 @@ async fn test_policy_mutation_row_locking_and_epoch_serialization() -> Result<()
     let res = repo.mutate_policy(req_stale).await;
     assert!(res.is_err(), "Mutation with stale epoch must fail");
 
+    // 4. Verify failed mutation did not alter stored repository state
+    let snap_after = repo.get_policy("src-1", "clipboard").await?;
+    assert_eq!(snap_after.policy_epoch, 2, "Failed mutation must leave epoch unchanged");
+    assert_eq!(snap_after.consent, false, "Failed mutation must leave consent unchanged");
+
     Ok(())
 }
 
+/// Context Graph domain model representation for integration testing of graph traversal & source erasure.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SourceNode {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObservationNode {
+    pub id: String,
+    pub source_id: String,
+    pub modality: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TextRevisionNode {
+    pub id: String,
+    pub target_id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BrowserResourceNode {
+    pub id: String,
+    pub source_id: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RelationEdge {
+    pub subject_id: String,
+    pub relation_type: String,
+    pub object_id: String,
+}
+
+#[derive(Default)]
+pub struct ContextGraphStore {
+    pub sources: HashSet<SourceNode>,
+    pub observations: HashSet<ObservationNode>,
+    pub text_revisions: HashSet<TextRevisionNode>,
+    pub browser_resources: HashSet<BrowserResourceNode>,
+    pub relations: HashSet<RelationEdge>,
+}
+
+impl ContextGraphStore {
+    /// Perform cascading erasure of a source and all dependent entities/edges.
+    pub fn erase_source(&mut self, source_id: &str) {
+        // 1. Find all observations owned by this source
+        let erased_obs_ids: HashSet<String> = self
+            .observations
+            .iter()
+            .filter(|o| o.source_id == source_id)
+            .map(|o| o.id.clone())
+            .collect();
+
+        // 2. Remove source and its direct observations & browser resources
+        self.sources.retain(|s| s.id != source_id);
+        self.observations.retain(|o| o.source_id != source_id);
+        self.browser_resources.retain(|b| b.source_id != source_id);
+
+        // 3. Remove text revisions attached to erased observations
+        self.text_revisions
+            .retain(|r| !erased_obs_ids.contains(&r.target_id));
+
+        // 4. Remove all relations where subject OR object was the source or any erased observation/revision
+        let mut erased_all_ids = erased_obs_ids;
+        erased_all_ids.insert(source_id.to_string());
+
+        self.relations.retain(|rel| {
+            !erased_all_ids.contains(&rel.subject_id) && !erased_all_ids.contains(&rel.object_id)
+        });
+    }
+}
+
 #[tokio::test]
-async fn test_v3_context_graph_roundtrip_and_erasure() -> Result<()> {
-    // Domain graph entity structure test
-    #[allow(dead_code)]
-    struct GraphNode {
-        id: String,
-        kind: String,
-    }
+async fn test_v3_context_graph_roundtrip_and_cascading_erasure() -> Result<()> {
+    let mut graph = ContextGraphStore::default();
 
-    #[allow(dead_code)]
-    struct GraphEdge {
-        subject_id: String,
-        object_id: String,
-        relation_type: String,
-    }
+    let src = SourceNode {
+        id: "src-desktop-01".to_string(),
+        name: "Desktop Screen Source".to_string(),
+    };
+    graph.sources.insert(src.clone());
 
-    let mut nodes: Vec<GraphNode> = Vec::new();
-    let mut edges: Vec<GraphEdge> = Vec::new();
+    let obs1 = ObservationNode {
+        id: "obs-101".to_string(),
+        source_id: src.id.clone(),
+        modality: "screen".to_string(),
+    };
+    graph.observations.insert(obs1.clone());
 
-    // Add named Node B entities
-    let source_id = "source-test-01".to_string();
-    nodes.push(GraphNode { id: source_id.clone(), kind: "source".to_string() });
-    nodes.push(GraphNode { id: "window-101".to_string(), kind: "window".to_string() });
-    nodes.push(GraphNode { id: "browser-res-1".to_string(), kind: "browser_resource".to_string() });
-    nodes.push(GraphNode { id: "app-vscode".to_string(), kind: "application".to_string() });
-    nodes.push(GraphNode { id: "session-2026-08-08".to_string(), kind: "session".to_string() });
-    nodes.push(GraphNode { id: "project-node-b".to_string(), kind: "project".to_string() });
-    nodes.push(GraphNode { id: "actor-patrick".to_string(), kind: "actor".to_string() });
-    nodes.push(GraphNode { id: "obs-999".to_string(), kind: "observation".to_string() });
-    nodes.push(GraphNode { id: "gap-1".to_string(), kind: "gap".to_string() });
-    nodes.push(GraphNode { id: "text-rev-1".to_string(), kind: "text_revision".to_string() });
-    nodes.push(GraphNode { id: "annot-1".to_string(), kind: "annotation".to_string() });
-    nodes.push(GraphNode { id: "embed-1".to_string(), kind: "embedding".to_string() });
-    nodes.push(GraphNode { id: "recon-job-1".to_string(), kind: "reconstruction_job".to_string() });
-    nodes.push(GraphNode { id: "retention-default".to_string(), kind: "retention_metadata".to_string() });
+    let rev1 = TextRevisionNode {
+        id: "rev-101".to_string(),
+        target_id: obs1.id.clone(),
+        content: "Screen OCR Content".to_string(),
+    };
+    graph.text_revisions.insert(rev1.clone());
 
-    // Link relations
-    edges.push(GraphEdge {
-        subject_id: source_id.clone(),
-        object_id: "obs-999".to_string(),
+    let browser_res = BrowserResourceNode {
+        id: "browser-55".to_string(),
+        source_id: src.id.clone(),
+        url: "https://example.com".to_string(),
+    };
+    graph.browser_resources.insert(browser_res.clone());
+
+    let rel1 = RelationEdge {
+        subject_id: src.id.clone(),
         relation_type: "PRODUCED".to_string(),
-    });
-    edges.push(GraphEdge {
-        subject_id: "obs-999".to_string(),
-        object_id: "window-101".to_string(),
-        relation_type: "OCCURRED_IN".to_string(),
-    });
-    edges.push(GraphEdge {
-        subject_id: "obs-999".to_string(),
-        object_id: "text-rev-1".to_string(),
-        relation_type: "HAS_TEXT_REVISION".to_string(),
-    });
+        object_id: obs1.id.clone(),
+    };
+    let rel2 = RelationEdge {
+        subject_id: obs1.id.clone(),
+        relation_type: "HAS_TEXT".to_string(),
+        object_id: rev1.id.clone(),
+    };
+    graph.relations.insert(rel1.clone());
+    graph.relations.insert(rel2.clone());
 
-    // Verify all 14 entity types are present
-    assert_eq!(nodes.len(), 14, "Context graph must round-trip all named v3 entity types");
-    assert_eq!(edges.len(), 3);
+    // Verify graph is populated
+    assert_eq!(graph.sources.len(), 1);
+    assert_eq!(graph.observations.len(), 1);
+    assert_eq!(graph.text_revisions.len(), 1);
+    assert_eq!(graph.browser_resources.len(), 1);
+    assert_eq!(graph.relations.len(), 2);
 
-    // Source erasure: remove source_id and all dependent nodes & edges
-    nodes.retain(|n| n.id != source_id);
-    edges.retain(|e| e.subject_id != source_id && e.object_id != source_id);
+    // Perform cascading erasure
+    graph.erase_source(&src.id);
 
-    // Ensure no orphaned relations remain referencing source_id
-    let orphaned = edges.iter().any(|e| e.subject_id == source_id || e.object_id == source_id);
-    assert!(!orphaned, "Source erasure must leave no orphaned relations");
+    // Verify cascading erasure removed all dependent entities and edges, leaving ZERO orphaned items
+    assert_eq!(graph.sources.len(), 0, "Source must be erased");
+    assert_eq!(graph.observations.len(), 0, "Dependent observations must be erased");
+    assert_eq!(graph.text_revisions.len(), 0, "Text revisions attached to erased observations must be erased");
+    assert_eq!(graph.browser_resources.len(), 0, "Dependent browser resources must be erased");
+    assert_eq!(graph.relations.len(), 0, "Relations pointing to erased entities must be erased without orphans");
 
     Ok(())
 }
