@@ -140,6 +140,15 @@ impl PgPolicyRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    pub async fn connect(database_url: &str) -> Result<Self> {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(database_url)
+            .await
+            .context("connect PgPolicyRepository pool")?;
+        Ok(Self { pool })
+    }
 }
 
 #[async_trait::async_trait]

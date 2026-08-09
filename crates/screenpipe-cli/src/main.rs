@@ -5,7 +5,7 @@ use chrono::Duration;
 use clap::{Parser, Subcommand};
 use screenpipe_memory::{
     EventKind, EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventReader, PgEventWriter,
-    RunOutcome, Runner, SampleSource,
+    PgPolicyRepository, PolicyRepository, RunOutcome, Runner, SampleSource,
 };
 use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
@@ -480,12 +480,7 @@ async fn run_capture(
     // losing branches are dropped, so a clipboard arm would cancel a capture
     // that was mid-flight - throwing away the frame, the OCR pass, and the
     // observation - every time a copy happened to land first.
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(database_url)
-        .await
-        .context("connect policy repository")?;
-    let policy_repo = screenpipe_memory::PgPolicyRepository::new(pool);
+    let policy_repo = PgPolicyRepository::connect(database_url).await?;
     let screen_policy = policy_repo.get_policy(machine_slug, "screen").await?;
     let clipboard_policy = policy_repo.get_policy(machine_slug, "clipboard").await?;
 
