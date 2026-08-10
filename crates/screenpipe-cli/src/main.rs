@@ -4,8 +4,9 @@ use anyhow::{Context, Result, ensure};
 use chrono::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 use screenpipe_memory::{
-    EventKind, EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventReader, PgEventWriter,
-    PolicyMutationRequest, PolicyRepository, RunOutcome, Runner, SampleSource,
+    EventKind, EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, ObservationOutcome,
+    PgEventReader, PgEventWriter, PolicyMutationRequest, PolicyRepository, RunOutcome, Runner,
+    SampleSource,
 };
 use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
@@ -726,13 +727,7 @@ async fn record_one_observation(
     match run_iteration(runner, source, sink).await {
         Ok(outcome) => {
             print_run_outcome("screen", &outcome);
-            let kind = match &outcome {
-                RunOutcome::GapRecorded {
-                    gap: screenpipe_memory::CaptureGap::DesktopLocked,
-                } => IterationKind::DesktopLocked,
-                RunOutcome::GapRecorded { .. } => IterationKind::Gap,
-                _ => IterationKind::Persisted,
-            };
+            let kind = iteration_kind_for_run_outcome(&outcome);
             next_step(kind, consecutive_failures, consecutive_gaps)
         }
         Err(error) => {
@@ -769,6 +764,28 @@ enum IterationKind {
     /// category. The category travels with the kind so the abort message can
     /// name it without the error text ever reaching a log line.
     Failure(&'static str),
+}
+
+fn iteration_kind_for_run_outcome(outcome: &RunOutcome) -> IterationKind {
+    match outcome {
+        RunOutcome::GapRecorded {
+            gap: screenpipe_memory::CaptureGap::DesktopLocked,
+        } => IterationKind::DesktopLocked,
+        RunOutcome::GapRecorded { .. } => IterationKind::Gap,
+        RunOutcome::Started { .. } | RunOutcome::Merged { .. } => IterationKind::Persisted,
+        RunOutcome::Outcome { outcome } => match outcome {
+            ObservationOutcome::Failed(_) => IterationKind::Failure("source_failed"),
+            ObservationOutcome::TimedOut(_) => IterationKind::Failure("source_timed_out"),
+            ObservationOutcome::Denied(_) => IterationKind::DesktopLocked,
+            ObservationOutcome::Absent(_)
+            | ObservationOutcome::Cancelled(_)
+            | ObservationOutcome::Stale(_) => IterationKind::Gap,
+            // The runner rejects content-free Available outcomes. Keeping the
+            // fallback a failure preserves safe behavior if that invariant is
+            // ever accidentally bypassed.
+            ObservationOutcome::Available(_) => IterationKind::Failure("source_available"),
+        },
+    }
 }
 
 /// What the run loop should do next.
@@ -907,6 +924,18 @@ fn failure_category(error: &anyhow::Error) -> &'static str {
 /// exactly what it meant - the service wrapper's log and the seam runbook both
 /// read that line - and clipboard events are distinguishable from it at a
 /// glance rather than by inspecting the id.
+fn content_free_outcome_status(outcome: &screenpipe_memory::ObservationOutcome) -> &'static str {
+    match outcome {
+        screenpipe_memory::ObservationOutcome::Available(_) => "available",
+        screenpipe_memory::ObservationOutcome::Absent(_) => "absent",
+        screenpipe_memory::ObservationOutcome::Denied(_) => "denied",
+        screenpipe_memory::ObservationOutcome::Failed(_) => "failed",
+        screenpipe_memory::ObservationOutcome::TimedOut(_) => "timed_out",
+        screenpipe_memory::ObservationOutcome::Cancelled(_) => "cancelled",
+        screenpipe_memory::ObservationOutcome::Stale(_) => "stale",
+    }
+}
+
 fn print_run_outcome(channel: &str, outcome: &RunOutcome) {
     match outcome {
         RunOutcome::GapRecorded { gap } => {
@@ -920,6 +949,12 @@ fn print_run_outcome(channel: &str, outcome: &RunOutcome) {
         }
         RunOutcome::Merged { event_id } => {
             println!("event={channel}_merged event_id={event_id}");
+        }
+        RunOutcome::Outcome { outcome } => {
+            println!(
+                "event={channel}_outcome status={}",
+                content_free_outcome_status(outcome)
+            );
         }
     }
 }
@@ -1274,12 +1309,7 @@ mod audio {
             screenpipe_memory::RunOutcome::GapRecorded {
                 gap: screenpipe_memory::CaptureGap::OcrUnavailable,
             } => IterationKind::Failure("transcription"),
-            screenpipe_memory::RunOutcome::GapRecorded {
-                gap: screenpipe_memory::CaptureGap::DesktopLocked,
-            } => IterationKind::DesktopLocked,
-            screenpipe_memory::RunOutcome::GapRecorded { .. } => IterationKind::Gap,
-            screenpipe_memory::RunOutcome::Started { .. }
-            | screenpipe_memory::RunOutcome::Merged { .. } => IterationKind::Persisted,
+            _ => super::iteration_kind_for_run_outcome(outcome),
         };
         next_step(kind, consecutive_failures, consecutive_gaps)
     }
@@ -2619,11 +2649,16 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use clap::Parser;
     use screenpipe_memory::{
-        CadenceInput, CadenceRecord, EventId, EventKind, EventSink, MergeConfig, ObservationSample,
-        OpenEvent, RunOutcome, Runner, SampleRead, SampleSource, SplitReason,
+        CadenceInput, CadenceRecord, EventId, EventKind, EventSink, MergeConfig,
+        ObservationIdentity, ObservationOutcome, ObservationOutcomeDetails, ObservationReason,
+        ObservationSample, ObservationTiming, OpenEvent, RunOutcome, Runner, SampleRead,
+        SampleSource, SplitReason, WindowKey,
     };
 
-    use super::{Cli, Command, IDLE_GAP_SECONDS, PolicyAction, PolicyModality, run_iteration};
+    use super::{
+        Cli, Command, IDLE_GAP_SECONDS, PolicyAction, PolicyModality, content_free_outcome_status,
+        run_iteration,
+    };
 
     #[test]
     fn idle_gap_keeps_a_full_cadence_of_margin_above_the_slowest_cadence() {
@@ -2676,6 +2711,93 @@ mod tests {
         assert!(consent);
         assert!(!excluded);
         assert_eq!(reason, "initial grant");
+    }
+
+    #[test]
+    fn content_free_outcome_status_omits_identity_and_timing_values() {
+        let at = Utc.with_ymd_and_hms(2026, 8, 9, 12, 0, 0).unwrap();
+        let outcome = ObservationOutcome::Denied(ObservationOutcomeDetails {
+            identity: ObservationIdentity {
+                source_id: "screen:primary".to_owned(),
+                modality: "screen".to_owned(),
+                machine_id: "icarus".to_owned(),
+                observed_at: at,
+                producer: "screenpipe-cli".to_owned(),
+                version: "0.2.0".to_owned(),
+                policy_epoch: Some(7),
+                window_key: WindowKey::None,
+            },
+            reason: ObservationReason::Denied,
+            timing: ObservationTiming {
+                started_at: at - Duration::seconds(1),
+                finished_at: at,
+            },
+        });
+
+        assert_eq!(content_free_outcome_status(&outcome), "denied");
+    }
+
+    fn typed_outcome(reason: ObservationReason) -> ObservationOutcome {
+        let at = Utc.with_ymd_and_hms(2026, 8, 9, 12, 0, 0).unwrap();
+        let details = ObservationOutcomeDetails {
+            identity: ObservationIdentity {
+                source_id: "screen:primary".to_owned(),
+                modality: "screen".to_owned(),
+                machine_id: "icarus".to_owned(),
+                observed_at: at,
+                producer: "screenpipe-cli".to_owned(),
+                version: "0.2.0".to_owned(),
+                policy_epoch: Some(7),
+                window_key: WindowKey::None,
+            },
+            reason: reason.clone(),
+            timing: ObservationTiming {
+                started_at: at - Duration::seconds(1),
+                finished_at: at,
+            },
+        };
+        match reason {
+            ObservationReason::Available => ObservationOutcome::Available(details),
+            ObservationReason::Absent => ObservationOutcome::Absent(details),
+            ObservationReason::Denied => ObservationOutcome::Denied(details),
+            ObservationReason::Failed => ObservationOutcome::Failed(details),
+            ObservationReason::TimedOut => ObservationOutcome::TimedOut(details),
+            ObservationReason::Cancelled => ObservationOutcome::Cancelled(details),
+            ObservationReason::Stale => ObservationOutcome::Stale(details),
+        }
+    }
+
+    #[test]
+    fn failed_and_timed_out_outcomes_enter_failure_backoff() {
+        assert_eq!(
+            super::iteration_kind_for_run_outcome(&RunOutcome::Outcome {
+                outcome: typed_outcome(ObservationReason::Failed),
+            }),
+            super::IterationKind::Failure("source_failed")
+        );
+        assert_eq!(
+            super::iteration_kind_for_run_outcome(&RunOutcome::Outcome {
+                outcome: typed_outcome(ObservationReason::TimedOut),
+            }),
+            super::IterationKind::Failure("source_timed_out")
+        );
+    }
+
+    #[test]
+    fn non_failure_content_free_outcomes_do_not_claim_persistence() {
+        for reason in [
+            ObservationReason::Absent,
+            ObservationReason::Denied,
+            ObservationReason::Cancelled,
+            ObservationReason::Stale,
+        ] {
+            assert_ne!(
+                super::iteration_kind_for_run_outcome(&RunOutcome::Outcome {
+                    outcome: typed_outcome(reason),
+                }),
+                super::IterationKind::Persisted
+            );
+        }
     }
 
     struct QueuedSamples(std::collections::VecDeque<SampleRead>);

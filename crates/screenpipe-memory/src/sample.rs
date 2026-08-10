@@ -1,6 +1,9 @@
 use std::fmt;
 
+use anyhow::{Result, bail, ensure};
 use chrono::{DateTime, Utc};
+
+use crate::{ObservationIdentity, ObservationOutcome};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ObservationSample {
@@ -23,6 +26,7 @@ pub struct ObservationEnvelope {
     sample: ObservationSample,
     observed_until: DateTime<Utc>,
     audio: Option<AudioMeta>,
+    outcome: Option<ObservationOutcome>,
 }
 
 impl ObservationEnvelope {
@@ -32,7 +36,32 @@ impl ObservationEnvelope {
             sample,
             observed_until,
             audio: None,
+            outcome: None,
         }
+    }
+
+    /// Creates an available instant observation after validating its complete,
+    /// content-free outcome contract. The source timestamp and capture
+    /// timestamp must name the same observation.
+    pub fn available_instant(
+        sample: ObservationSample,
+        outcome: ObservationOutcome,
+    ) -> Result<Self> {
+        outcome.validate()?;
+        if !matches!(&outcome, ObservationOutcome::Available(_)) {
+            bail!("content observations require an available outcome");
+        }
+        ensure!(
+            outcome.identity().observed_at == sample.captured_at,
+            "observation identity timestamp must match the sample capture timestamp"
+        );
+        let observed_until = sample.captured_at;
+        Ok(Self {
+            sample,
+            observed_until,
+            audio: None,
+            outcome: Some(outcome),
+        })
     }
 
     pub fn spanning(
@@ -44,6 +73,7 @@ impl ObservationEnvelope {
             sample,
             observed_until,
             audio: Some(audio),
+            outcome: None,
         }
     }
 
@@ -61,6 +91,35 @@ impl ObservationEnvelope {
 
     pub fn audio(&self) -> Option<&AudioMeta> {
         self.audio.as_ref()
+    }
+
+    pub fn identity(&self) -> Option<&ObservationIdentity> {
+        self.outcome.as_ref().map(ObservationOutcome::identity)
+    }
+
+    pub fn outcome(&self) -> Option<&ObservationOutcome> {
+        self.outcome.as_ref()
+    }
+
+    /// Validates a typed outcome when a migrated source attaches one.
+    ///
+    /// `None` is intentionally accepted during the adapter migration: the
+    /// production screen, clipboard, and audio sources predate typed outcomes.
+    /// Their policy-before-access boundary remains in the channel startup
+    /// code, and rejecting their envelopes here would disable persistence.
+    pub(crate) fn validate_available_if_present(&self) -> Result<()> {
+        let Some(outcome) = self.outcome.as_ref() else {
+            return Ok(());
+        };
+        outcome.validate()?;
+        if !matches!(outcome, ObservationOutcome::Available(_)) {
+            bail!("content observation has a non-available outcome");
+        }
+        ensure!(
+            outcome.identity().observed_at == self.sample.captured_at,
+            "observation identity timestamp must match the sample capture timestamp"
+        );
+        Ok(())
     }
 }
 
