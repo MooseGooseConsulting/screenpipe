@@ -1,9 +1,17 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use crate::ContextModality;
+
+fn default_consent(modality: &str) -> Result<bool> {
+    ContextModality::parse(modality)
+        .map(ContextModality::default_consent)
+        .ok_or_else(|| anyhow::anyhow!("unsupported policy modality: {modality}"))
+}
 
 /// Represents a committed snapshot of a modality-qualified policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,6 +23,13 @@ pub struct PolicySnapshot {
     pub retention_class: String,
     pub policy_epoch: u64,
     pub updated_at: DateTime<Utc>,
+}
+
+impl PolicySnapshot {
+    /// The only capture gate: exclusion always wins over consent.
+    pub fn permits_capture(&self) -> bool {
+        self.consent && !self.excluded
+    }
 }
 
 /// Request to mutate a policy snapshot.
@@ -62,10 +77,7 @@ impl PolicyRepository for MemoryPolicyRepository {
         let key = (request.source_id.clone(), request.modality.clone());
         let now = Utc::now();
 
-        let default_consent = match request.modality.as_str() {
-            "clipboard" | "audio" => false,
-            _ => false,
-        };
+        let default_consent = default_consent(&request.modality)?;
 
         let current_snapshot = guard.get(&key).cloned().unwrap_or_else(|| PolicySnapshot {
             source_id: request.source_id.clone(),
@@ -78,32 +90,38 @@ impl PolicyRepository for MemoryPolicyRepository {
         });
 
         // Validate epoch BEFORE inserting or mutating repository state
-        if let Some(exp) = request.expected_epoch {
-            if current_snapshot.policy_epoch != exp {
-                bail!(
-                    "Policy epoch mismatch for ({}, {}): expected {}, found {}",
-                    request.source_id,
-                    request.modality,
-                    exp,
-                    current_snapshot.policy_epoch
-                );
-            }
+        if let Some(exp) = request.expected_epoch
+            && current_snapshot.policy_epoch != exp
+        {
+            bail!(
+                "Policy epoch mismatch for ({}, {}): expected {}, found {}",
+                request.source_id,
+                request.modality,
+                exp,
+                current_snapshot.policy_epoch
+            );
         }
 
-        let is_new = !guard.contains_key(&key);
-        let new_epoch = if is_new { 1 } else { current_snapshot.policy_epoch + 1 };
+        // A missing policy still has the durable epoch-one default. Every
+        // successful mutation is an audited transition away from that state.
+        let new_epoch = current_snapshot.policy_epoch + 1;
         let updated = PolicySnapshot {
             source_id: request.source_id.clone(),
             modality: request.modality.clone(),
             consent: request.consent,
             excluded: request.excluded,
-            retention_class: request.retention_class.unwrap_or_else(|| current_snapshot.retention_class.clone()),
+            retention_class: request
+                .retention_class
+                .unwrap_or_else(|| current_snapshot.retention_class.clone()),
             policy_epoch: new_epoch,
             updated_at: now,
         };
 
         guard.insert(key, updated.clone());
-        self.audit_log.lock().unwrap().push((updated.clone(), request.reason));
+        self.audit_log
+            .lock()
+            .unwrap()
+            .push((updated.clone(), request.reason));
         Ok(updated)
     }
 
@@ -113,10 +131,7 @@ impl PolicyRepository for MemoryPolicyRepository {
         if let Some(snapshot) = guard.get(&key) {
             Ok(snapshot.clone())
         } else {
-            let default_consent = match modality {
-                "clipboard" | "audio" => false,
-                _ => false,
-            };
+            let default_consent = default_consent(modality)?;
             Ok(PolicySnapshot {
                 source_id: source_id.to_string(),
                 modality: modality.to_string(),
@@ -134,41 +149,67 @@ impl PolicyRepository for MemoryPolicyRepository {
 #[derive(Debug, Clone)]
 pub struct PgPolicyRepository {
     pool: PgPool,
+    machine_id: Option<i64>,
 }
 
 impl PgPolicyRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            machine_id: None,
+        }
     }
 
-    pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect(database_url)
-            .await
-            .context("connect PgPolicyRepository pool")?;
-        Ok(Self { pool })
+    /// Creates the policy authority for one writer-owned machine.
+    ///
+    /// The event writer establishes the machine before a policy mutation can
+    /// create the source row, preserving the `sources.machine_id` foreign-key
+    /// invariant from the v3 schema.
+    pub fn for_machine(pool: PgPool, machine_id: i64) -> Self {
+        Self {
+            pool,
+            machine_id: Some(machine_id),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl PolicyRepository for PgPolicyRepository {
     async fn mutate_policy(&self, request: PolicyMutationRequest) -> Result<PolicySnapshot> {
-        let mut tx = self.pool.begin().await.context("Failed to begin transaction for policy mutation")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("Failed to begin transaction for policy mutation")?;
 
-        let default_consent = match request.modality.as_str() {
-            "clipboard" | "audio" => false,
-            _ => false,
-        };
+        let default_consent = default_consent(&request.modality)?;
 
-        // 1. Ensure source existence
-        sqlx::query(
-            "INSERT INTO sources (id, name, kind) VALUES ($1, $1, 'custom') ON CONFLICT (id) DO NOTHING"
-        )
-        .bind(&request.source_id)
-        .execute(&mut *tx)
-        .await
-        .context("Failed to ensure source existence")?;
+        // 1. Ensure source existence. A generic repository may read an
+        // existing source, but only a writer-bound authority can create one:
+        // source identity is machine-scoped in the authoritative schema.
+        if let Some(machine_id) = self.machine_id {
+            sqlx::query(
+                "INSERT INTO sources (id, machine_id, name, kind) VALUES ($1, $2, $1, 'custom') ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(&request.source_id)
+            .bind(machine_id)
+            .execute(&mut *tx)
+            .await
+            .context("ensure policy source")?;
+        } else {
+            let source_exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM sources WHERE id = $1)",
+            )
+            .bind(&request.source_id)
+            .fetch_one(&mut *tx)
+            .await
+            .context("check policy source")?;
+            anyhow::ensure!(
+                source_exists,
+                "policy source {} is not registered; create a writer-bound policy repository",
+                request.source_id
+            );
+        }
 
         // 2. Ensure initial source policy row exists so FOR UPDATE lock always succeeds and serializes initial writes
         sqlx::query(
@@ -198,16 +239,16 @@ impl PolicyRepository for PgPolicyRepository {
         let cur_epoch = existing_row.get::<i64, _>("policy_epoch") as u64;
         let cur_retention = existing_row.get::<String, _>("retention_class");
 
-        if let Some(exp) = request.expected_epoch {
-            if cur_epoch != exp {
-                bail!(
-                    "Policy epoch mismatch for ({}, {}): expected {}, found {}",
-                    request.source_id,
-                    request.modality,
-                    exp,
-                    cur_epoch
-                );
-            }
+        if let Some(exp) = request.expected_epoch
+            && cur_epoch != exp
+        {
+            bail!(
+                "Policy epoch mismatch for ({}, {}): expected {}, found {}",
+                request.source_id,
+                request.modality,
+                exp,
+                cur_epoch
+            );
         }
 
         let new_epoch = cur_epoch + 1;
@@ -255,7 +296,9 @@ impl PolicyRepository for PgPolicyRepository {
         .await
         .context("Failed to write policy audit log")?;
 
-        tx.commit().await.context("Failed to commit policy transaction")?;
+        tx.commit()
+            .await
+            .context("Failed to commit policy transaction")?;
 
         Ok(PolicySnapshot {
             source_id: row.get::<String, _>("source_id"),
@@ -289,10 +332,7 @@ impl PolicyRepository for PgPolicyRepository {
                 updated_at: r.get::<DateTime<Utc>, _>("updated_at"),
             })
         } else {
-            let default_consent = match modality {
-                "clipboard" | "audio" => false,
-                _ => false,
-            };
+            let default_consent = default_consent(modality)?;
             Ok(PolicySnapshot {
                 source_id: source_id.to_string(),
                 modality: modality.to_string(),

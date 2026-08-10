@@ -111,6 +111,7 @@ jobs:
           --test text_hash
           --test debug_redaction
           --test browser_url
+          --test context_graph
           --test cli_surface
 
       - name: Verify the workspace stayed pruned

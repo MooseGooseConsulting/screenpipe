@@ -1,6 +1,7 @@
 //! Deterministic screen-memory domain and PostgreSQL writer.
 
 mod cadence;
+mod context;
 mod merge;
 pub mod policy;
 mod postgres;
@@ -9,6 +10,7 @@ mod sample;
 mod text_hash;
 
 pub use cadence::{CadenceInput, CadencePolicy, CadenceRecord, MAX_CADENCE_INTERVAL_SECONDS};
+pub use context::ContextModality;
 pub use merge::{
     CaptureGap, CaptureGapSummary, EnvelopeMergeDecision, EventEnvelope, EventKind, HashLedger,
     MAX_EVENT_DURATION_SECONDS, MAX_EVENT_SAMPLES, MAX_TRACKED_HASHES, MERGE_CONTRACT_VERSION,
@@ -26,4 +28,3 @@ pub use runner::{
 };
 pub use sample::{AudioMeta, ObservationEnvelope, ObservationSample};
 pub use text_hash::{TextIdentity, jaccard_overlap};
-
