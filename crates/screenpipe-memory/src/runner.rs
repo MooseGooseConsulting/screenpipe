@@ -163,13 +163,16 @@ impl Runner {
                 ObservationRead::Gap(gap) => return Ok(self.record_gap(gap)),
                 ObservationRead::Outcome(outcome) => {
                     outcome.validate()?;
+                    if matches!(&outcome, ObservationOutcome::Available(_)) {
+                        bail!("available outcome requires content");
+                    }
                     return Ok(RunOutcome::Outcome { outcome });
                 }
                 ObservationRead::Sample {
                     observation,
                     cadence,
                 } => {
-                    observation.validate_available()?;
+                    observation.validate_available_if_present()?;
                     (observation, cadence)
                 }
             };

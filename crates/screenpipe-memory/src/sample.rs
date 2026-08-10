@@ -1,6 +1,6 @@
 use std::fmt;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use chrono::{DateTime, Utc};
 
 use crate::{ObservationIdentity, ObservationOutcome};
@@ -48,7 +48,7 @@ impl ObservationEnvelope {
         outcome: ObservationOutcome,
     ) -> Result<Self> {
         outcome.validate()?;
-        if !matches!(outcome, ObservationOutcome::Available(_)) {
+        if !matches!(&outcome, ObservationOutcome::Available(_)) {
             bail!("content observations require an available outcome");
         }
         ensure!(
@@ -101,11 +101,16 @@ impl ObservationEnvelope {
         self.outcome.as_ref()
     }
 
-    pub(crate) fn validate_available(&self) -> Result<()> {
-        let outcome = self
-            .outcome
-            .as_ref()
-            .context("content observation is missing an available outcome")?;
+    /// Validates a typed outcome when a migrated source attaches one.
+    ///
+    /// `None` is intentionally accepted during the adapter migration: the
+    /// production screen, clipboard, and audio sources predate typed outcomes.
+    /// Their policy-before-access boundary remains in the channel startup
+    /// code, and rejecting their envelopes here would disable persistence.
+    pub(crate) fn validate_available_if_present(&self) -> Result<()> {
+        let Some(outcome) = self.outcome.as_ref() else {
+            return Ok(());
+        };
         outcome.validate()?;
         if !matches!(outcome, ObservationOutcome::Available(_)) {
             bail!("content observation has a non-available outcome");

@@ -238,8 +238,21 @@ impl SampleSource for UnboundSampleSource {
     }
 }
 
+struct LegacySink;
+
+#[async_trait]
+impl EventSink for LegacySink {
+    async fn start(&self, _: &screenpipe_memory::OpenEvent, _: SplitReason) -> Result<EventId> {
+        EventId::try_from("legacy-event".to_owned())
+    }
+
+    async fn merge(&self, _: &str, _: &screenpipe_memory::OpenEvent) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[tokio::test]
-async fn runner_rejects_identity_free_content_before_calling_the_sink() {
+async fn runner_keeps_legacy_content_operational_during_outcome_migration() {
     let mut source = UnboundSampleSource {
         sample: Some(ObservationSample {
             captured_at: identity().observed_at,
@@ -257,7 +270,27 @@ async fn runner_rejects_identity_free_content_before_calling_the_sink() {
         scroll_overlap: 0.35,
     });
 
+    let result = runner.run_once(&mut source, &LegacySink).await.unwrap();
+
+    assert!(matches!(result, RunOutcome::Started { .. }));
+}
+
+#[tokio::test]
+async fn runner_rejects_content_free_available_outcome() {
+    let mut source = OutcomeSource {
+        outcome: Some(available_outcome()),
+    };
+    let mut runner = Runner::new(MergeConfig {
+        kind: EventKind::Screen,
+        idle_gap: Duration::seconds(30),
+        scroll_overlap: 0.35,
+    });
+
     let error = runner.run_once(&mut source, &NoopSink).await.unwrap_err();
 
-    assert!(error.to_string().contains("available outcome"));
+    assert!(
+        error
+            .to_string()
+            .contains("available outcome requires content")
+    );
 }

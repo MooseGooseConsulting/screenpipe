@@ -2,9 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` task-by-task. Steps use checkbox syntax for tracking.
 
-**Goal:** Deliver consent-safe independent screen, browser, clipboard, and audio observations, then turn them into replayable context, gap, boundary, and checkpoint facts.
+> **Scope correction (2026-08-10):** This is a supporting edge-capture plan, not the primary parity roadmap. The active user-visible target is the ten-step screen-memory core status in `MooseGooseConsulting/pieces-memory-observations/docs/build/screen-memory-core-status.md`: continuous capture, local OCR and free context, central ingestion, a chronological timeline, and cited recall. Work below may proceed only when it directly advances that slice. Screenpipe does not own canonical activity events, timeline construction, graph relationships, retention, or retrieval.
 
-**Architecture:** Node B at Screenpipe `bf307fa10` is the reviewed base. Source adapters emit one typed, policy-epoch-bound observation contract without writing policy rows directly. Node D owns the durable domain mapping, boundary/gap/checkpoint persistence, and PostgreSQL transactions; source adapters only call those APIs after their own pre-access and pre-attachment checks.
+**Goal:** Deliver consent-safe screen capture, OCR, and free edge context as the first complete path; add browser, clipboard, and audio observations only after that path reaches central ingestion, timeline retrieval, and cited recall.
+
+**Architecture:** Node B at Screenpipe `bf307fa10` is the reviewed base. Screenpipe is the Windows edge collector: source adapters enforce centrally supplied policy before local access and emit minimal observations. The central service owns durable domain mapping, canonical boundaries/gaps/checkpoints, PostgreSQL transactions, timeline construction, retention, and retrieval. Screenpipe's existing direct PostgreSQL writer is a compatibility transport for the current vertical slice, not authority for moving central domain logic to the edge.
 
 **Tech Stack:** Rust, SQLx/PostgreSQL 18, Windows capture/UIA/WASAPI, Tokio, GitHub Actions, Pester.
 
@@ -30,7 +32,7 @@
 **Interfaces:**
 - Produces `ObservationOutcome::{Available,Absent,Denied,Failed,TimedOut,Cancelled,Stale}`, `ObservationIdentity`, and `WindowKey::None|Window { hwnd, window_generation }`.
 - `ObservationIdentity::validate()` rejects empty source/modality/producer/version, a missing epoch, and an absent window encoded as a fake value.
-- The shared CLI composition root renders `RunOutcome::Outcome` as a fixed category/status line and never logs outcome content or timing values. Existing adapters use an explicit `LegacySample` compatibility variant until their C1/C3/C4 migrations; only the typed `Sample` variant may reach the policy-bound runner path and it requires a validated `Available` outcome.
+- The shared CLI composition root renders `RunOutcome::Outcome` as a fixed category/status line and never logs outcome content or timing values. Existing adapters continue through their legacy envelope constructors until their C1/C3/C4 migrations. The runner validates a typed `Available` outcome whenever one is attached, rejects content-free `Available`, and keeps legacy screen/clipboard/audio persistence operational during the staged migration.
 
 - [ ] Write a failing test that parses `none` and `window(hwnd=42,window_generation=7)`, rejects `window(hwnd=0,window_generation=7)`, and rejects an `Available` outcome lacking producer/version.
 - [ ] Run `cargo test -p screenpipe-memory --test observation_outcomes -- --test-threads=1`; confirm the target fails because the module/API is absent.
@@ -102,12 +104,9 @@
 - [ ] Run the focused test, `cargo test -p screenpipe-audio`, and require the pinned Windows audio workflow to pass.
 - [ ] Commit `feat(audio): gate distinct channels by durable policy`.
 
-### Task 6: Node D boundaries, gaps, checkpoints, and PostgreSQL durability
+### Task 6: Central boundaries, gaps, checkpoints, and PostgreSQL durability
 
-**Files:**
-- Create: `crates/screenpipe-memory/src/gaps.rs`, `crates/screenpipe-memory/src/checkpoint.rs`
-- Modify: `crates/screenpipe-memory/src/context.rs`, `crates/screenpipe-memory/src/postgres.rs`, `crates/screenpipe-memory/src/runner.rs`, `crates/screenpipe-memory/src/sample.rs`, `crates/screenpipe-memory/src/lib.rs`
-- Test: `crates/screenpipe-memory/tests/gap_ledger.rs`, `crates/screenpipe-memory/tests/checkpoints.rs`, `crates/screenpipe-memory/tests/context_graph.rs`
+**Repository ownership:** Resolve and implement this in the central ingestion owner in `MooseGooseConsulting/pieces-memory-observations`. Do not add canonical timeline/domain ownership to Screenpipe merely because the compatibility writer currently reaches PostgreSQL.
 
 **Interfaces:**
 - `GapFact` reuses its durable observation timestamp on retry; policy-close uses `(source_id, modality, committed_policy_epoch, close_kind)`.
@@ -115,10 +114,11 @@
 
 - [ ] Write failing PostgreSQL tests for duplicate replay not creating a second gap, recovery producing one stable close, a late fact preserving ordered projection, and a crash losing no more than the configured checkpoint interval.
 - [ ] Run each named integration target with `doppler run -p homelab -c dev_personal -- cargo test -p screenpipe-memory --test <target> -- --test-threads=1`; confirm RED reflects missing behavior rather than missing credentials.
-- [ ] Implement append-only insert-on-conflict behavior, replay-safe projections, persisted active-boundary state, direct-outage status, and checkpoint recovery.
-- [ ] Remove the `LegacySample` compatibility path after C1, C3, and C4 emit validated `Available` observations; add a regression test proving no content-bearing observation bypasses typed identity/outcome validation.
-- [ ] Re-run all three integration targets plus `cargo test -p screenpipe-memory`.
-- [ ] Commit `feat(memory): persist replay-safe boundaries gaps and checkpoints`.
+- [ ] Identify the central ingestion service/repository owner before changing schemas or persistence.
+- [ ] Implement append-only insert-on-conflict behavior, replay-safe projections, persisted active-boundary state, direct-outage status, and checkpoint recovery centrally.
+- [ ] Remove Screenpipe's legacy envelope compatibility only after C1, C3, and C4 emit validated `Available` observations and the end-to-end screen path is proven; add a regression test proving no migrated content-bearing observation bypasses typed identity/outcome validation.
+- [ ] Re-run the central integration targets plus Screenpipe reader/transport compatibility tests.
+- [ ] Commit in the owning central repository; keep the edge transport change independently reviewable.
 
 ### Task 7: Cross-repository evidence and promotion gate
 
