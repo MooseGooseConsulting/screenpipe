@@ -24,17 +24,18 @@
 
 **Files:**
 - Create: `crates/screenpipe-memory/src/observation.rs`
-- Modify: `crates/screenpipe-memory/src/lib.rs`, `crates/screenpipe-memory/src/sample.rs`, `crates/screenpipe-memory/src/runner.rs`
+- Modify: `crates/screenpipe-memory/src/lib.rs`, `crates/screenpipe-memory/src/sample.rs`, `crates/screenpipe-memory/src/runner.rs`, `crates/screenpipe-cli/src/main.rs`
 - Test: `crates/screenpipe-memory/tests/observation_outcomes.rs`
 
 **Interfaces:**
 - Produces `ObservationOutcome::{Available,Absent,Denied,Failed,TimedOut,Cancelled,Stale}`, `ObservationIdentity`, and `WindowKey::None|Window { hwnd, window_generation }`.
 - `ObservationIdentity::validate()` rejects empty source/modality/producer/version, a missing epoch, and an absent window encoded as a fake value.
+- The shared CLI composition root renders `RunOutcome::Outcome` as a fixed category/status line and never logs outcome content or timing values. Existing adapters use an explicit `LegacySample` compatibility variant until their C1/C3/C4 migrations; only the typed `Sample` variant may reach the policy-bound runner path and it requires a validated `Available` outcome.
 
 - [ ] Write a failing test that parses `none` and `window(hwnd=42,window_generation=7)`, rejects `window(hwnd=0,window_generation=7)`, and rejects an `Available` outcome lacking producer/version.
 - [ ] Run `cargo test -p screenpipe-memory --test observation_outcomes -- --test-threads=1`; confirm the target fails because the module/API is absent.
 - [ ] Implement the public types, canonical formatter/parser, validation, and library exports with no persistence side effects.
-- [ ] Re-run the target and `cargo test -p screenpipe-memory --lib`; confirm both pass.
+- [ ] Re-run the target, `cargo test -p screenpipe-memory --lib`, and `cargo check -p screenpipe-cli`; confirm all pass.
 - [ ] Commit `feat(memory): add typed observation outcomes`.
 
 ### Task 2: C1 policy-first screen request and stale deduplication
@@ -115,6 +116,7 @@
 - [ ] Write failing PostgreSQL tests for duplicate replay not creating a second gap, recovery producing one stable close, a late fact preserving ordered projection, and a crash losing no more than the configured checkpoint interval.
 - [ ] Run each named integration target with `doppler run -p homelab -c dev_personal -- cargo test -p screenpipe-memory --test <target> -- --test-threads=1`; confirm RED reflects missing behavior rather than missing credentials.
 - [ ] Implement append-only insert-on-conflict behavior, replay-safe projections, persisted active-boundary state, direct-outage status, and checkpoint recovery.
+- [ ] Remove the `LegacySample` compatibility path after C1, C3, and C4 emit validated `Available` observations; add a regression test proving no content-bearing observation bypasses typed identity/outcome validation.
 - [ ] Re-run all three integration targets plus `cargo test -p screenpipe-memory`.
 - [ ] Commit `feat(memory): persist replay-safe boundaries gaps and checkpoints`.
 
