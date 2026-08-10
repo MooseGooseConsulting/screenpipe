@@ -154,8 +154,9 @@ impl ServiceKind {
     /// to loopback only, and turning the microphone on is a second decision
     /// that has to be made by editing this wrapper - not something an install
     /// can do on the operator's behalf.
-    const fn agent_subcommand(self) -> &'static str {
+    const fn agent_subcommand(self, no_clipboard: bool) -> &'static str {
         match self {
+            Self::Screen if no_clipboard => "run --no-clipboard",
             Self::Screen => "run",
             Self::Audio => "audio run",
         }
@@ -165,6 +166,14 @@ impl ServiceKind {
 #[cfg_attr(not(test), allow(dead_code))]
 impl ServiceSpec {
     pub(crate) fn for_current_user(root: &ServiceRoot, kind: ServiceKind) -> Self {
+        Self::for_current_user_with_clipboard(root, kind, false)
+    }
+
+    pub(crate) fn for_current_user_with_clipboard(
+        root: &ServiceRoot,
+        kind: ServiceKind,
+        no_clipboard: bool,
+    ) -> Self {
         let root_path = root.local_app_data.join("screen-memory");
         let binary_path = root_path.join("bin").join(kind.binary_name());
         let wrapper_path = root_path.join(kind.wrapper_name());
@@ -184,7 +193,7 @@ impl ServiceSpec {
         let escaped_agent = binary_path.to_string_lossy().replace('\'', "''");
         let escaped_log_directory = root_path.join("logs").to_string_lossy().replace('\'', "''");
         let log_stem = kind.log_stem();
-        let agent_subcommand = kind.agent_subcommand();
+        let agent_subcommand = kind.agent_subcommand(no_clipboard);
         // Task Scheduler runs this wrapper hidden, so without redirection every
         // `screen_started`, `capture_gap`, and `capture_error` line the agent
         // prints goes to a console nobody can read and dies with the process -
@@ -354,7 +363,17 @@ impl<S: TaskScheduler> ServiceManager<S> {
         kind: ServiceKind,
         current_exe: &Path,
     ) -> Result<ServiceStatus> {
-        let spec = ServiceSpec::for_current_user(root, kind);
+        self.install_with_clipboard(root, kind, current_exe, false)
+    }
+
+    pub(crate) fn install_with_clipboard(
+        &mut self,
+        root: &ServiceRoot,
+        kind: ServiceKind,
+        current_exe: &Path,
+        no_clipboard: bool,
+    ) -> Result<ServiceStatus> {
+        let spec = ServiceSpec::for_current_user_with_clipboard(root, kind, no_clipboard);
         assert_owned_artifact(&spec, &spec.binary_path)?;
         assert_owned_artifact(&spec, &spec.wrapper_path)?;
         if !current_exe.is_file() {
@@ -1029,6 +1048,27 @@ $parseErrors = $null
     }
 
     #[test]
+    fn screen_wrapper_carries_the_clipboard_choice_without_leaking_it_to_audio() {
+        let root = ServiceRoot::for_test(Path::new(r"C:\Users\pmacl\AppData\Local").to_owned());
+        let default_screen =
+            ServiceSpec::for_current_user_with_clipboard(&root, ServiceKind::Screen, false);
+        let opted_out_screen =
+            ServiceSpec::for_current_user_with_clipboard(&root, ServiceKind::Screen, true);
+        let audio = ServiceSpec::for_current_user_with_clipboard(&root, ServiceKind::Audio, true);
+
+        assert!(
+            default_screen
+                .wrapper_contents
+                .contains("$agent run --machine-slug icarus --display-name Icarus-Laptop")
+        );
+        assert!(!default_screen.wrapper_contents.contains("--no-clipboard"));
+        assert!(opted_out_screen.wrapper_contents.contains(
+            "$agent run --no-clipboard --machine-slug icarus --display-name Icarus-Laptop"
+        ));
+        assert!(!audio.wrapper_contents.contains("--no-clipboard"));
+    }
+
+    #[test]
     #[cfg(windows)]
     fn generated_wrapper_has_no_powershell_parse_errors() {
         // The second root is the case the escaper exists for: an apostrophe in
@@ -1147,6 +1187,41 @@ $parseErrors = $null
         assert_eq!(
             fs::read_to_string(sibling).unwrap(),
             "owned by another checkpoint"
+        );
+    }
+
+    #[test]
+    fn reinstall_deterministically_replaces_the_screen_wrapper_in_both_clipboard_modes() {
+        let (_temp, local_app_data, source) = service_fixture();
+        let wrapper =
+            ServiceSpec::for_current_user(&local_app_data, ServiceKind::Screen).wrapper_path;
+        let mut manager = ServiceManager::new(FakeTaskScheduler::default());
+
+        manager
+            .install_with_clipboard(&local_app_data, ServiceKind::Screen, &source, false)
+            .unwrap();
+        assert!(
+            !fs::read_to_string(&wrapper)
+                .unwrap()
+                .contains("--no-clipboard")
+        );
+
+        manager
+            .install_with_clipboard(&local_app_data, ServiceKind::Screen, &source, true)
+            .unwrap();
+        assert!(
+            fs::read_to_string(&wrapper)
+                .unwrap()
+                .contains("--no-clipboard")
+        );
+
+        manager
+            .install_with_clipboard(&local_app_data, ServiceKind::Screen, &source, false)
+            .unwrap();
+        assert!(
+            !fs::read_to_string(&wrapper)
+                .unwrap()
+                .contains("--no-clipboard")
         );
     }
 
