@@ -727,11 +727,14 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use serde_json::json;
 
-    use super::{MINIMUM_SERVER_VERSION_NUM, ensure_supported_server_version, merge_meta};
+    use super::{
+        MINIMUM_SERVER_VERSION_NUM, ensure_observation_policy_current,
+        ensure_supported_server_version, merge_meta,
+    };
     use crate::{
         AudioMeta, CadenceInput, CadenceRecord, CaptureGapSummary, EventEnvelope, EventKind,
-        HashLedger, MERGE_CONTRACT_VERSION, MergeDecisionKind, ObservationSample, OpenEvent,
-        SplitReason,
+        HashLedger, MERGE_CONTRACT_VERSION, MergeDecisionKind, ObservationIdentity,
+        ObservationSample, OpenEvent, SplitReason, WindowKey,
     };
 
     #[test]
@@ -753,6 +756,40 @@ mod tests {
             ensure_supported_server_version(accepted)
                 .unwrap_or_else(|error| panic!("{accepted} must be accepted: {error:#}"));
         }
+    }
+
+    #[test]
+    fn durable_policy_gate_rejects_revoked_or_stale_typed_observations() {
+        let identity = ObservationIdentity {
+            source_id: "screen:primary".to_owned(),
+            modality: "screen".to_owned(),
+            machine_id: "icarus".to_owned(),
+            observed_at: Utc.with_ymd_and_hms(2026, 8, 10, 0, 0, 0).unwrap(),
+            producer: "screenpipe-cli".to_owned(),
+            version: "0.2.0".to_owned(),
+            policy_epoch: Some(7),
+            window_key: WindowKey::None,
+        };
+
+        ensure_observation_policy_current(&identity, "icarus", 7, true, false).unwrap();
+        assert!(
+            ensure_observation_policy_current(&identity, "icarus", 8, true, false)
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+        assert!(
+            ensure_observation_policy_current(&identity, "icarus", 7, false, false)
+                .unwrap_err()
+                .to_string()
+                .contains("does not permit")
+        );
+        assert!(
+            ensure_observation_policy_current(&identity, "other-machine", 7, true, false)
+                .unwrap_err()
+                .to_string()
+                .contains("machine")
+        );
     }
 
     #[test]

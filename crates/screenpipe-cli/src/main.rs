@@ -686,12 +686,32 @@ async fn run_clipboard_channel(writer: std::sync::Arc<PgEventWriter>) {
     let mut runner = clipboard_runner();
     let mut source = ClipboardSampleSource::new();
     let mut consecutive_failures: u32 = 0;
+    let mut consecutive_gaps: u32 = 0;
 
     loop {
         match run_iteration(&mut runner, &mut source, writer.as_ref()).await {
             Ok(outcome) => {
                 print_run_outcome("clipboard", &outcome);
-                consecutive_failures = 0;
+                match clipboard_next_step(
+                    &outcome,
+                    &mut consecutive_failures,
+                    &mut consecutive_gaps,
+                ) {
+                    LoopStep::Continue => {}
+                    LoopStep::Retry(delay) => tokio::time::sleep(delay).await,
+                    // Clipboard is a secondary channel and must never take
+                    // down screen capture. At a ceiling it starts a fresh
+                    // bounded streak after the maximum backoff instead.
+                    LoopStep::AbortGaps => {
+                        consecutive_gaps = 0;
+                        tokio::time::sleep(failure_backoff(MAX_BACKOFF_STEP)).await;
+                    }
+                    LoopStep::AbortFailures(category) => {
+                        println!("event=clipboard_error category={category} consecutive={consecutive_failures}");
+                        consecutive_failures = 0;
+                        tokio::time::sleep(failure_backoff(MAX_BACKOFF_STEP)).await;
+                    }
+                }
             }
             Err(error) => {
                 let category = failure_category(&error);
@@ -703,6 +723,18 @@ async fn run_clipboard_channel(writer: std::sync::Arc<PgEventWriter>) {
             }
         }
     }
+}
+
+fn clipboard_next_step(
+    outcome: &RunOutcome,
+    consecutive_failures: &mut u32,
+    consecutive_gaps: &mut u32,
+) -> LoopStep {
+    next_step(
+        iteration_kind_for_run_outcome(outcome),
+        consecutive_failures,
+        consecutive_gaps,
+    )
 }
 
 /// One turn of the run loop: take an observation, log it, and decide what the
@@ -2798,6 +2830,23 @@ mod tests {
                 super::IterationKind::Persisted
             );
         }
+    }
+
+    #[test]
+    fn clipboard_typed_failures_use_backoff_instead_of_resetting_success() {
+        let mut failures = 0;
+        let mut gaps = 0;
+        let step = super::clipboard_next_step(
+            &RunOutcome::Outcome {
+                outcome: typed_outcome(ObservationReason::TimedOut),
+            },
+            &mut failures,
+            &mut gaps,
+        );
+
+        assert!(matches!(step, super::LoopStep::Retry(_)));
+        assert_eq!(failures, 1);
+        assert_eq!(gaps, 0);
     }
 
     struct QueuedSamples(std::collections::VecDeque<SampleRead>);

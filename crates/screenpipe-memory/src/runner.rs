@@ -93,6 +93,30 @@ pub trait EventSink: Send + Sync {
     async fn merge_envelope(&self, event_id: &str, event: &EventEnvelope) -> Result<()> {
         self.merge(event_id, event.event()).await
     }
+
+    /// Revalidates a typed observation and starts its event in one sink-owned
+    /// durable attempt. PostgreSQL overrides this seam so a policy row remains
+    /// locked from epoch validation through commit. Legacy sinks retain their
+    /// existing behavior through the default implementation.
+    async fn start_observation(
+        &self,
+        _observation: &ObservationEnvelope,
+        event: &EventEnvelope,
+        reason: SplitReason,
+    ) -> Result<EventId> {
+        self.start_envelope(event, reason).await
+    }
+
+    /// Revalidates a typed observation and merges it in one sink-owned durable
+    /// attempt. This is called again for every retry of a pending sample.
+    async fn merge_observation(
+        &self,
+        _observation: &ObservationEnvelope,
+        event_id: &str,
+        event: &EventEnvelope,
+    ) -> Result<()> {
+        self.merge_envelope(event_id, event).await
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,11 +213,14 @@ impl Runner {
         };
 
         let mut staged_merger = self.merger.clone();
-        let decision =
-            staged_merger.ingest_envelope_with_metadata(sample, cadence, self.pending_gaps);
+        let decision = staged_merger.ingest_envelope_with_metadata(
+            sample.clone(),
+            cadence,
+            self.pending_gaps,
+        );
         match decision {
             EnvelopeMergeDecision::Start { reason, event } => {
-                let event_id = sink.start_envelope(&event, reason).await?;
+                let event_id = sink.start_observation(&sample, &event, reason).await?;
                 self.merger = staged_merger;
                 self.current_event_id = Some(event_id.clone());
                 self.pending_gaps = CaptureGapSummary::default();
@@ -208,7 +235,8 @@ impl Runner {
                     .current_event_id
                     .clone()
                     .context("merger produced merge without a durable event id")?;
-                sink.merge_envelope(event_id.as_str(), &event).await?;
+                sink.merge_observation(&sample, event_id.as_str(), &event)
+                    .await?;
                 self.merger = staged_merger;
                 self.pending_gaps = CaptureGapSummary::default();
                 self.pending_sample = None;
@@ -414,6 +442,64 @@ mod tests {
                 .pop_front()
                 .expect("test sink should have a merge result")
         }
+    }
+
+    struct RetryPolicySink {
+        attempts: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl EventSink for RetryPolicySink {
+        async fn start(&self, _: &OpenEvent, _: SplitReason) -> Result<EventId> {
+            panic!("typed observations must use the policy-aware sink seam")
+        }
+
+        async fn merge(&self, _: &str, _: &OpenEvent) -> Result<()> {
+            panic!("the first observation cannot merge")
+        }
+
+        async fn start_observation(
+            &self,
+            _: &ObservationEnvelope,
+            _: &crate::EventEnvelope,
+            _: SplitReason,
+        ) -> Result<EventId> {
+            let mut attempts = self.attempts.lock().unwrap();
+            *attempts += 1;
+            if *attempts == 1 {
+                anyhow::bail!("synthetic transient write failure");
+            }
+            anyhow::bail!("observation policy epoch is stale");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_retry_reenters_the_policy_aware_sink_boundary() {
+        let mut source = MemorySource::new([Ok(sample_read(
+            0,
+            "notepad.exe",
+            "notes",
+            "policy retry fixture",
+        ))]);
+        let sink = RetryPolicySink {
+            attempts: Mutex::new(0),
+        };
+        let mut runner = runner();
+
+        assert!(
+            runner
+                .run_once(&mut source, &sink)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("transient write")
+        );
+        assert_eq!(source.read_count(), 1);
+
+        let retry_error = runner.run_once(&mut source, &sink).await.unwrap_err();
+        assert!(retry_error.to_string().contains("policy epoch is stale"));
+        assert_eq!(source.read_count(), 1, "retry must not read past the sample");
+        assert_eq!(*sink.attempts.lock().unwrap(), 2);
     }
 
     fn started_event(call: &SinkCall) -> &OpenEvent {
