@@ -2,10 +2,10 @@ use std::ffi::OsString;
 
 use anyhow::{Context, Result, ensure};
 use chrono::Duration;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use screenpipe_memory::{
     EventKind, EventSink, MAX_CADENCE_INTERVAL_SECONDS, MergeConfig, PgEventReader, PgEventWriter,
-    RunOutcome, Runner, SampleSource,
+    PolicyMutationRequest, PolicyRepository, RunOutcome, Runner, SampleSource,
 };
 use screenpipe_screen::{WindowsCapture, WindowsOcr};
 
@@ -52,9 +52,8 @@ enum Command {
         machine_slug: String,
         #[arg(long, default_value = DEFAULT_DISPLAY_NAME)]
         display_name: String,
-        /// Turn the clipboard channel off. It is ON by default: copied text is
-        /// recorded as events of kind `clipboard`, except from applications
-        /// that mark their clipboard content as excluded, which are never read.
+        /// Do not request the clipboard channel. Clipboard remains off until an
+        /// operator grants policy consent with `screenpipe policy set`.
         #[arg(long)]
         no_clipboard: bool,
     },
@@ -87,6 +86,11 @@ enum Command {
     Service {
         #[command(subcommand)]
         action: ScreenServiceAction,
+    },
+    /// Commit a modality-qualified capture policy through the PostgreSQL authority.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
     },
     /// Record and transcribe audio. OFF unless you run or install it.
     ///
@@ -172,6 +176,51 @@ enum AudioAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PolicyModality {
+    Screen,
+    Browser,
+    Clipboard,
+    Audio,
+}
+
+impl PolicyModality {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Screen => "screen",
+            Self::Browser => "browser",
+            Self::Clipboard => "clipboard",
+            Self::Audio => "audio",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyAction {
+    /// Commit one complete policy snapshot and print its committed epoch.
+    Set {
+        #[arg(long, default_value = DEFAULT_MACHINE_SLUG)]
+        machine_slug: String,
+        #[arg(long, default_value = DEFAULT_DISPLAY_NAME)]
+        display_name: String,
+        #[arg(long, value_enum)]
+        modality: PolicyModality,
+        /// Grant capture consent. Omit to revoke consent.
+        #[arg(long)]
+        consent: bool,
+        /// Exclude the source even if consent is granted.
+        #[arg(long)]
+        excluded: bool,
+        #[arg(long)]
+        retention_class: Option<String>,
+        #[arg(long)]
+        expected_epoch: Option<u64>,
+        /// Content-free reason recorded with this policy transition.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
@@ -207,7 +256,44 @@ async fn main() -> anyhow::Result<()> {
             run_search(&database_url, &machine_slug, &request).await
         }
         Command::Service { action } => run_screen_service_action(action),
+        Command::Policy { action } => run_policy_action(action).await,
         Command::Audio { action } => run_audio_action(action).await,
+    }
+}
+
+async fn run_policy_action(action: PolicyAction) -> Result<()> {
+    match action {
+        PolicyAction::Set {
+            machine_slug,
+            display_name,
+            modality,
+            consent,
+            excluded,
+            retention_class,
+            expected_epoch,
+            reason,
+        } => {
+            let database_url = required_database_url(std::env::var_os(DATABASE_URL_ENV))?;
+            let writer =
+                PgEventWriter::connect(&database_url, &machine_slug, &display_name).await?;
+            let snapshot = writer
+                .policy_repository()
+                .mutate_policy(PolicyMutationRequest {
+                    source_id: machine_slug,
+                    modality: modality.as_str().to_owned(),
+                    expected_epoch,
+                    consent,
+                    excluded,
+                    retention_class,
+                    reason,
+                })
+                .await?;
+            println!(
+                "event=policy_committed modality={} epoch={} consent={} excluded={}",
+                snapshot.modality, snapshot.policy_epoch, snapshot.consent, snapshot.excluded
+            );
+            Ok(())
+        }
     }
 }
 
@@ -481,8 +567,6 @@ async fn run_capture(
     let writer = std::sync::Arc::new(
         PgEventWriter::connect(database_url, machine_slug, display_name).await?,
     );
-    let mut source = WindowsSampleSource::new();
-    let mut runner = default_runner();
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut consecutive_failures: u32 = 0;
@@ -491,16 +575,39 @@ async fn run_capture(
     // losing branches are dropped, so a clipboard arm would cancel a capture
     // that was mid-flight - throwing away the frame, the OCR pass, and the
     // observation - every time a copy happened to land first.
-    let _clipboard = clipboard.then(|| {
+    let policy_repo = writer.policy_repository();
+    let screen_policy = policy_repo.get_policy(machine_slug, "screen").await?;
+    let clipboard_policy = policy_repo.get_policy(machine_slug, "clipboard").await?;
+
+    println!(
+        "event=policy_authority state=active source={machine_slug} screen_epoch={} screen_consent={} screen_excluded={} clipboard_epoch={} clipboard_consent={} clipboard_excluded={}",
+        screen_policy.policy_epoch,
+        screen_policy.consent,
+        screen_policy.excluded,
+        clipboard_policy.policy_epoch,
+        clipboard_policy.consent,
+        clipboard_policy.excluded
+    );
+
+    if !screen_policy.permits_capture() {
+        println!("event=screen_channel state=off reason=policy");
+        return Ok(());
+    }
+
+    // Enforce consent & exclusion policy: clipboard channel runs only when enabled via CLI AND consented AND NOT excluded by policy.
+    let clipboard_allowed = clipboard && clipboard_policy.permits_capture();
+    let _clipboard = clipboard_allowed.then(|| {
         println!("event=clipboard_channel state=on");
         TaskGuard(tokio::spawn(run_clipboard_channel(std::sync::Arc::clone(
             &writer,
         ))))
     });
-    if !clipboard {
-        println!("event=clipboard_channel state=off");
+    if !clipboard_allowed {
+        println!("event=clipboard_channel state=off reason=policy_or_cli");
     }
     println!("event=runtime_ready machine_slug={machine_slug}");
+    let mut source = WindowsSampleSource::new();
+    let mut runner = default_runner();
 
     loop {
         tokio::select! {
@@ -895,7 +1002,8 @@ mod audio {
         AudioCapture, CaptureError, Channel, DeviceCategory, ModelPath, VadAggressiveness,
     };
     use screenpipe_memory::{
-        EventKind, MergeConfig, ObservationRead, PgEventWriter, Runner, SampleRead, SampleSource,
+        EventKind, MergeConfig, ObservationRead, PgEventWriter, PolicyRepository, Runner,
+        SampleRead, SampleSource,
     };
 
     use crate::audio_source::{AudioConfig, AudioSampleSource, CaptureStopped};
@@ -1367,6 +1475,16 @@ mod audio {
         let model = resolve_model(options.model)?;
         let threads = resolve_threads(options.threads);
 
+        let writer = PgEventWriter::connect(database_url, machine_slug, display_name).await?;
+        let audio_policy = writer
+            .policy_repository()
+            .get_policy(machine_slug, "audio")
+            .await?;
+        if !audio_policy.permits_capture() {
+            println!("event=audio_channel state=off reason=policy");
+            return Ok(());
+        }
+
         if options.microphone {
             // Said out loud, every time, at the top of the log. This channel
             // records the room and anyone in it, and that must never be a thing
@@ -1374,7 +1492,6 @@ mod audio {
             println!("event=audio_microphone state=on note=records_the_room_and_anyone_in_it");
         }
 
-        let writer = PgEventWriter::connect(database_url, machine_slug, display_name).await?;
         let mut source = AudioSampleSource::start(AudioConfig {
             channel,
             model,
@@ -2506,7 +2623,7 @@ mod tests {
         OpenEvent, RunOutcome, Runner, SampleRead, SampleSource, SplitReason,
     };
 
-    use super::{Cli, Command, IDLE_GAP_SECONDS, run_iteration};
+    use super::{Cli, Command, IDLE_GAP_SECONDS, PolicyAction, PolicyModality, run_iteration};
 
     #[test]
     fn idle_gap_keeps_a_full_cadence_of_margin_above_the_slowest_cadence() {
@@ -2529,6 +2646,36 @@ mod tests {
                 "idle gap leaves no room above the slowest cadence"
             );
         }
+    }
+
+    #[test]
+    fn policy_set_exposes_an_explicit_clipboard_grant_path() {
+        let cli = Cli::try_parse_from([
+            "screenpipe",
+            "policy",
+            "set",
+            "--modality",
+            "clipboard",
+            "--consent",
+            "--reason",
+            "initial grant",
+        ])
+        .expect("policy set arguments should parse");
+
+        let Command::Policy { action } = cli.command else {
+            panic!("expected policy subcommand");
+        };
+        let PolicyAction::Set {
+            modality,
+            consent,
+            excluded,
+            reason,
+            ..
+        } = action;
+        assert_eq!(modality, PolicyModality::Clipboard);
+        assert!(consent);
+        assert!(!excluded);
+        assert_eq!(reason, "initial grant");
     }
 
     struct QueuedSamples(std::collections::VecDeque<SampleRead>);

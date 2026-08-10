@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Transaction};
 
+use crate::policy::PgPolicyRepository;
 use crate::{AudioMeta, EventEnvelope, EventId, EventSink, OpenEvent, SplitReason};
 
 const REQUIRED_COLUMNS_SQL: &str = r#"
@@ -286,6 +287,7 @@ impl PgEventWriter {
         ensure_supported_server_version(server_version_num)?;
         validate_authoritative_schema(&pool).await?;
         backfill_event_titles(&pool).await?;
+        ensure_v3_schema(&pool).await?;
         let machine_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO machines (slug, display_name) VALUES ($1, $2) \
              ON CONFLICT (slug) DO UPDATE SET display_name = EXCLUDED.display_name \
@@ -338,6 +340,11 @@ impl PgEventWriter {
             machine_slug,
             display_name,
         })
+    }
+
+    /// Returns the policy authority bound to this writer's committed machine.
+    pub fn policy_repository(&self) -> PgPolicyRepository {
+        PgPolicyRepository::for_machine(self.pool.clone(), self.machine_id)
     }
 
     pub async fn write_start(&self, event: &OpenEvent, reason: SplitReason) -> Result<String> {
@@ -545,6 +552,16 @@ async fn validate_authoritative_schema(pool: &PgPool) -> Result<()> {
             "authoritative PostgreSQL schema is incompatible: {component}"
         );
     }
+    Ok(())
+}
+
+pub const V3_CONTEXT_PIPELINE_SCHEMA: &str = include_str!("v3_context_pipeline.sql");
+
+pub async fn ensure_v3_schema(pool: &PgPool) -> Result<()> {
+    sqlx::raw_sql(V3_CONTEXT_PIPELINE_SCHEMA)
+        .execute(pool)
+        .await
+        .context("ensure v3 context pipeline schema")?;
     Ok(())
 }
 
