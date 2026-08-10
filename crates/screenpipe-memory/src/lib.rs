@@ -3,6 +3,7 @@
 mod cadence;
 mod context;
 mod merge;
+mod observation;
 pub mod policy;
 mod postgres;
 mod runner;
@@ -16,6 +17,7 @@ pub use merge::{
     MAX_EVENT_DURATION_SECONDS, MAX_EVENT_SAMPLES, MAX_TRACKED_HASHES, MERGE_CONTRACT_VERSION,
     MergeConfig, MergeDecision, MergeDecisionKind, Merger, OpenEvent, SplitReason,
 };
+pub use observation::{ObservationIdentity, ObservationOutcome, WindowKey};
 pub use policy::{
     MemoryPolicyRepository, PgPolicyRepository, PolicyMutationRequest, PolicyRepository,
     PolicySnapshot,

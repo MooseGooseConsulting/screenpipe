@@ -3,7 +3,8 @@ use async_trait::async_trait;
 
 use crate::{
     CadenceRecord, CaptureGap, CaptureGapSummary, EnvelopeMergeDecision, EventEnvelope, Merger,
-    ObservationEnvelope, ObservationSample, OpenEvent, SplitReason, TextIdentity,
+    ObservationEnvelope, ObservationOutcome, ObservationSample, OpenEvent, SplitReason,
+    TextIdentity,
 };
 
 // The `Sample` variant is ~216 bytes against `Gap`'s 1. Boxing to even that
@@ -29,6 +30,8 @@ pub enum ObservationRead {
         cadence: CadenceRecord,
     },
     Gap(CaptureGap),
+    /// A source outcome with no content to merge or write as an event.
+    Outcome(ObservationOutcome),
 }
 
 impl From<SampleRead> for ObservationRead {
@@ -104,6 +107,10 @@ pub enum RunOutcome {
     Merged {
         event_id: String,
     },
+    /// A validated, content-free source outcome that did not call the sink.
+    Outcome {
+        outcome: ObservationOutcome,
+    },
 }
 
 pub struct Runner {
@@ -154,6 +161,10 @@ impl Runner {
             let read = source.next_observation().await?;
             let pending = match read {
                 ObservationRead::Gap(gap) => return Ok(self.record_gap(gap)),
+                ObservationRead::Outcome(outcome) => {
+                    outcome.validate()?;
+                    return Ok(RunOutcome::Outcome { outcome });
+                }
                 ObservationRead::Sample {
                     observation,
                     cadence,

@@ -1,6 +1,9 @@
 use std::fmt;
 
+use anyhow::{Result, ensure};
 use chrono::{DateTime, Utc};
+
+use crate::ObservationIdentity;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ObservationSample {
@@ -23,6 +26,7 @@ pub struct ObservationEnvelope {
     sample: ObservationSample,
     observed_until: DateTime<Utc>,
     audio: Option<AudioMeta>,
+    identity: Option<ObservationIdentity>,
 }
 
 impl ObservationEnvelope {
@@ -32,7 +36,29 @@ impl ObservationEnvelope {
             sample,
             observed_until,
             audio: None,
+            identity: None,
         }
+    }
+
+    /// Creates a policy-bound instant observation after validating its
+    /// content-free identity. The source timestamp and capture timestamp must
+    /// name the same observation.
+    pub fn identified_instant(
+        sample: ObservationSample,
+        identity: ObservationIdentity,
+    ) -> Result<Self> {
+        identity.validate()?;
+        ensure!(
+            identity.observed_at == sample.captured_at,
+            "observation identity timestamp must match the sample capture timestamp"
+        );
+        let observed_until = sample.captured_at;
+        Ok(Self {
+            sample,
+            observed_until,
+            audio: None,
+            identity: Some(identity),
+        })
     }
 
     pub fn spanning(
@@ -44,6 +70,7 @@ impl ObservationEnvelope {
             sample,
             observed_until,
             audio: Some(audio),
+            identity: None,
         }
     }
 
@@ -61,6 +88,10 @@ impl ObservationEnvelope {
 
     pub fn audio(&self) -> Option<&AudioMeta> {
         self.audio.as_ref()
+    }
+
+    pub fn identity(&self) -> Option<&ObservationIdentity> {
+        self.identity.as_ref()
     }
 }
 
