@@ -907,6 +907,18 @@ fn failure_category(error: &anyhow::Error) -> &'static str {
 /// exactly what it meant - the service wrapper's log and the seam runbook both
 /// read that line - and clipboard events are distinguishable from it at a
 /// glance rather than by inspecting the id.
+fn content_free_outcome_status(outcome: &screenpipe_memory::ObservationOutcome) -> &'static str {
+    match outcome {
+        screenpipe_memory::ObservationOutcome::Available(_) => "available",
+        screenpipe_memory::ObservationOutcome::Absent(_) => "absent",
+        screenpipe_memory::ObservationOutcome::Denied(_) => "denied",
+        screenpipe_memory::ObservationOutcome::Failed(_) => "failed",
+        screenpipe_memory::ObservationOutcome::TimedOut(_) => "timed_out",
+        screenpipe_memory::ObservationOutcome::Cancelled(_) => "cancelled",
+        screenpipe_memory::ObservationOutcome::Stale(_) => "stale",
+    }
+}
+
 fn print_run_outcome(channel: &str, outcome: &RunOutcome) {
     match outcome {
         RunOutcome::GapRecorded { gap } => {
@@ -920,6 +932,12 @@ fn print_run_outcome(channel: &str, outcome: &RunOutcome) {
         }
         RunOutcome::Merged { event_id } => {
             println!("event={channel}_merged event_id={event_id}");
+        }
+        RunOutcome::Outcome { outcome } => {
+            println!(
+                "event={channel}_outcome status={}",
+                content_free_outcome_status(outcome)
+            );
         }
     }
 }
@@ -2619,11 +2637,16 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
     use clap::Parser;
     use screenpipe_memory::{
-        CadenceInput, CadenceRecord, EventId, EventKind, EventSink, MergeConfig, ObservationSample,
-        OpenEvent, RunOutcome, Runner, SampleRead, SampleSource, SplitReason,
+        CadenceInput, CadenceRecord, EventId, EventKind, EventSink, MergeConfig,
+        ObservationIdentity, ObservationOutcome, ObservationOutcomeDetails, ObservationReason,
+        ObservationSample, ObservationTiming, OpenEvent, RunOutcome, Runner, SampleRead,
+        SampleSource, SplitReason, WindowKey,
     };
 
-    use super::{Cli, Command, IDLE_GAP_SECONDS, PolicyAction, PolicyModality, run_iteration};
+    use super::{
+        Cli, Command, IDLE_GAP_SECONDS, PolicyAction, PolicyModality, content_free_outcome_status,
+        run_iteration,
+    };
 
     #[test]
     fn idle_gap_keeps_a_full_cadence_of_margin_above_the_slowest_cadence() {
@@ -2676,6 +2699,30 @@ mod tests {
         assert!(consent);
         assert!(!excluded);
         assert_eq!(reason, "initial grant");
+    }
+
+    #[test]
+    fn content_free_outcome_status_omits_identity_and_timing_values() {
+        let at = Utc.with_ymd_and_hms(2026, 8, 9, 12, 0, 0).unwrap();
+        let outcome = ObservationOutcome::Denied(ObservationOutcomeDetails {
+            identity: ObservationIdentity {
+                source_id: "screen:primary".to_owned(),
+                modality: "screen".to_owned(),
+                machine_id: "icarus".to_owned(),
+                observed_at: at,
+                producer: "screenpipe-cli".to_owned(),
+                version: "0.2.0".to_owned(),
+                policy_epoch: Some(7),
+                window_key: WindowKey::None,
+            },
+            reason: ObservationReason::Denied,
+            timing: ObservationTiming {
+                started_at: at - Duration::seconds(1),
+                finished_at: at,
+            },
+        });
+
+        assert_eq!(content_free_outcome_status(&outcome), "denied");
     }
 
     struct QueuedSamples(std::collections::VecDeque<SampleRead>);

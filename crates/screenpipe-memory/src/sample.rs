@@ -1,9 +1,9 @@
 use std::fmt;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 
-use crate::ObservationIdentity;
+use crate::{ObservationIdentity, ObservationOutcome};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ObservationSample {
@@ -26,7 +26,7 @@ pub struct ObservationEnvelope {
     sample: ObservationSample,
     observed_until: DateTime<Utc>,
     audio: Option<AudioMeta>,
-    identity: Option<ObservationIdentity>,
+    outcome: Option<ObservationOutcome>,
 }
 
 impl ObservationEnvelope {
@@ -36,20 +36,23 @@ impl ObservationEnvelope {
             sample,
             observed_until,
             audio: None,
-            identity: None,
+            outcome: None,
         }
     }
 
-    /// Creates a policy-bound instant observation after validating its
-    /// content-free identity. The source timestamp and capture timestamp must
-    /// name the same observation.
-    pub fn identified_instant(
+    /// Creates an available instant observation after validating its complete,
+    /// content-free outcome contract. The source timestamp and capture
+    /// timestamp must name the same observation.
+    pub fn available_instant(
         sample: ObservationSample,
-        identity: ObservationIdentity,
+        outcome: ObservationOutcome,
     ) -> Result<Self> {
-        identity.validate()?;
+        outcome.validate()?;
+        if !matches!(outcome, ObservationOutcome::Available(_)) {
+            bail!("content observations require an available outcome");
+        }
         ensure!(
-            identity.observed_at == sample.captured_at,
+            outcome.identity().observed_at == sample.captured_at,
             "observation identity timestamp must match the sample capture timestamp"
         );
         let observed_until = sample.captured_at;
@@ -57,7 +60,7 @@ impl ObservationEnvelope {
             sample,
             observed_until,
             audio: None,
-            identity: Some(identity),
+            outcome: Some(outcome),
         })
     }
 
@@ -70,7 +73,7 @@ impl ObservationEnvelope {
             sample,
             observed_until,
             audio: Some(audio),
-            identity: None,
+            outcome: None,
         }
     }
 
@@ -91,7 +94,27 @@ impl ObservationEnvelope {
     }
 
     pub fn identity(&self) -> Option<&ObservationIdentity> {
-        self.identity.as_ref()
+        self.outcome.as_ref().map(ObservationOutcome::identity)
+    }
+
+    pub fn outcome(&self) -> Option<&ObservationOutcome> {
+        self.outcome.as_ref()
+    }
+
+    pub(crate) fn validate_available(&self) -> Result<()> {
+        let outcome = self
+            .outcome
+            .as_ref()
+            .context("content observation is missing an available outcome")?;
+        outcome.validate()?;
+        if !matches!(outcome, ObservationOutcome::Available(_)) {
+            bail!("content observation has a non-available outcome");
+        }
+        ensure!(
+            outcome.identity().observed_at == self.sample.captured_at,
+            "observation identity timestamp must match the sample capture timestamp"
+        );
+        Ok(())
     }
 }
 

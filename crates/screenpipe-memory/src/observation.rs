@@ -100,32 +100,98 @@ impl ObservationIdentity {
     }
 }
 
+/// Typed, content-free reasons for a completed observation attempt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObservationReason {
+    Available,
+    Absent,
+    Denied,
+    Failed,
+    TimedOut,
+    Cancelled,
+    Stale,
+}
+
+/// Content-free timing facts for one observation attempt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationTiming {
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+}
+
+impl ObservationTiming {
+    fn validate(&self) -> Result<()> {
+        if self.started_at > self.finished_at {
+            bail!("observation timing finishes before it starts");
+        }
+        Ok(())
+    }
+}
+
+/// The shared, content-free details required for every outcome state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationOutcomeDetails {
+    pub identity: ObservationIdentity,
+    pub reason: ObservationReason,
+    pub timing: ObservationTiming,
+}
+
+impl ObservationOutcomeDetails {
+    fn validate(&self) -> Result<()> {
+        self.identity.validate()?;
+        self.timing.validate()?;
+        if self.identity.observed_at < self.timing.started_at
+            || self.identity.observed_at > self.timing.finished_at
+        {
+            bail!("observation timestamp must fall within its timing interval");
+        }
+        Ok(())
+    }
+}
+
 /// A content-free result for one policy-bound observation attempt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ObservationOutcome {
-    Available(ObservationIdentity),
-    Absent(ObservationIdentity),
-    Denied(ObservationIdentity),
-    Failed(ObservationIdentity),
-    TimedOut(ObservationIdentity),
-    Cancelled(ObservationIdentity),
-    Stale(ObservationIdentity),
+    Available(ObservationOutcomeDetails),
+    Absent(ObservationOutcomeDetails),
+    Denied(ObservationOutcomeDetails),
+    Failed(ObservationOutcomeDetails),
+    TimedOut(ObservationOutcomeDetails),
+    Cancelled(ObservationOutcomeDetails),
+    Stale(ObservationOutcomeDetails),
 }
 
 impl ObservationOutcome {
-    pub fn identity(&self) -> &ObservationIdentity {
+    pub fn details(&self) -> &ObservationOutcomeDetails {
         match self {
-            Self::Available(identity)
-            | Self::Absent(identity)
-            | Self::Denied(identity)
-            | Self::Failed(identity)
-            | Self::TimedOut(identity)
-            | Self::Cancelled(identity)
-            | Self::Stale(identity) => identity,
+            Self::Available(details)
+            | Self::Absent(details)
+            | Self::Denied(details)
+            | Self::Failed(details)
+            | Self::TimedOut(details)
+            | Self::Cancelled(details)
+            | Self::Stale(details) => details,
         }
     }
 
+    pub fn identity(&self) -> &ObservationIdentity {
+        &self.details().identity
+    }
+
     pub fn validate(&self) -> Result<()> {
-        self.identity().validate()
+        self.details().validate()?;
+        let expected_reason = match self {
+            Self::Available(_) => ObservationReason::Available,
+            Self::Absent(_) => ObservationReason::Absent,
+            Self::Denied(_) => ObservationReason::Denied,
+            Self::Failed(_) => ObservationReason::Failed,
+            Self::TimedOut(_) => ObservationReason::TimedOut,
+            Self::Cancelled(_) => ObservationReason::Cancelled,
+            Self::Stale(_) => ObservationReason::Stale,
+        };
+        if self.details().reason != expected_reason {
+            bail!("observation outcome reason does not match its state");
+        }
+        Ok(())
     }
 }

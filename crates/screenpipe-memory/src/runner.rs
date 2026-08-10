@@ -168,7 +168,10 @@ impl Runner {
                 ObservationRead::Sample {
                     observation,
                     cadence,
-                } => (observation, cadence),
+                } => {
+                    observation.validate_available()?;
+                    (observation, cadence)
+                }
             };
 
             if TextIdentity::from_ocr(&pending.0.sample().ocr_text)
@@ -230,8 +233,10 @@ mod tests {
 
     use crate::{
         CadenceInput, CadenceRecord, CaptureGap, CaptureGapSummary, EventId, EventKind, EventSink,
-        MERGE_CONTRACT_VERSION, MergeConfig, MergeDecisionKind, ObservationSample, OpenEvent,
-        RunOutcome, Runner, SampleRead, SampleSource, SplitReason, TextIdentity,
+        MERGE_CONTRACT_VERSION, MergeConfig, MergeDecisionKind, ObservationEnvelope,
+        ObservationIdentity, ObservationOutcome, ObservationOutcomeDetails, ObservationRead,
+        ObservationReason, ObservationSample, ObservationTiming, OpenEvent, RunOutcome, Runner,
+        SampleRead, SampleSource, SplitReason, TextIdentity, WindowKey,
     };
 
     fn at(second: i64) -> chrono::DateTime<Utc> {
@@ -271,6 +276,26 @@ mod tests {
         }
     }
 
+    fn available_outcome(sample: &ObservationSample) -> ObservationOutcome {
+        ObservationOutcome::Available(ObservationOutcomeDetails {
+            identity: ObservationIdentity {
+                source_id: "screen:runner-test".to_owned(),
+                modality: "screen".to_owned(),
+                machine_id: "runner-test".to_owned(),
+                observed_at: sample.captured_at,
+                producer: "screenpipe-memory-test".to_owned(),
+                version: "0.2.0".to_owned(),
+                policy_epoch: Some(1),
+                window_key: WindowKey::None,
+            },
+            reason: ObservationReason::Available,
+            timing: ObservationTiming {
+                started_at: sample.captured_at,
+                finished_at: sample.captured_at,
+            },
+        })
+    }
+
     fn runner() -> Runner {
         Runner::new(MergeConfig {
             kind: EventKind::Screen,
@@ -308,6 +333,19 @@ mod tests {
             self.reads
                 .pop_front()
                 .expect("test source should have another read")
+        }
+
+        async fn next_observation(&mut self) -> Result<ObservationRead> {
+            match self.next_sample().await? {
+                SampleRead::Sample { sample, cadence } => Ok(ObservationRead::Sample {
+                    observation: ObservationEnvelope::available_instant(
+                        sample.clone(),
+                        available_outcome(&sample),
+                    )?,
+                    cadence,
+                }),
+                SampleRead::Gap(gap) => Ok(ObservationRead::Gap(gap)),
+            }
         }
     }
 
