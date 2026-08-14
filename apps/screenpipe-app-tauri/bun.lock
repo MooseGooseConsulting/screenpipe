@@ -94,7 +94,7 @@
         "@types/jsdom": "^27.0.0",
         "@types/lodash": "^4.17.24",
         "@types/node": "^20.19.37",
-        "@types/react": "^18.3.28",
+        "@types/react": "18.3.31",
         "@types/react-syntax-highlighter": "^15.5.13",
         "@typescript-eslint/parser": "7.2.0",
         "@vitejs/plugin-react": "^4.7.0",
@@ -911,7 +911,7 @@
 
     "@types/prop-types": ["@types/prop-types@15.7.12", "", {}, ""],
 
-    "@types/react": ["@types/react@18.3.28", "", { "dependencies": { "@types/prop-types": "*", "csstype": "^3.2.2" } }, "sha512-z9VXpC7MWrhfWipitjNdgCauoMLRdIILQsAEV+ZesIzBq/oUlxk0m3ApZuMFCXdnS4U7KrI+l3WRUEGQ8K1QKw=="],
+    "@types/react": ["@types/react@18.3.31", "", { "dependencies": { "@types/prop-types": "*", "csstype": "^3.2.2" } }, "sha512-vfEqpXTvwT91yhmwdfouStN2hSKwTvyRs8qpLfADyrq/kxDw0hZM7Wk9Ug1FELj8hIby+S/+kQCSRFF32nv2Qw=="],
 
     "@types/react-dom": ["@types/react-dom@18.3.0", "", { "dependencies": { "@types/react": "*" } }, ""],
 
