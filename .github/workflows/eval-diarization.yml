@@ -72,7 +72,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
 
@@ -90,7 +90,7 @@ jobs:
           git lfs pull --include="crates/screenpipe-audio/models/pyannote/*"
           ls -lh crates/screenpipe-audio/models/pyannote/
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: stable
           # The eval is a runtime metric collector, not a lint gate. Don't
@@ -130,7 +130,7 @@ jobs:
       # download alone.
       - name: Cache VoxConverse fixtures
         id: voxconverse-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: crates/screenpipe-audio-eval/evals/fixtures/voxconverse
           key: voxconverse-dev-v1-${{ hashFiles('crates/screenpipe-audio-eval/evals/download_voxconverse.sh') }}
@@ -141,7 +141,7 @@ jobs:
 
       - name: Cache LibriSpeech fixtures
         id: librispeech-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: crates/screenpipe-audio-eval/evals/fixtures/librispeech
           key: librispeech-test-clean-v1-${{ hashFiles('crates/screenpipe-audio-eval/evals/download_librispeech.sh') }}
@@ -437,7 +437,7 @@ jobs:
 
       - name: Upload report artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: eval-results
           path: |

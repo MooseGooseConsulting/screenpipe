@@ -80,7 +80,7 @@ runs:
       # checks this step's outcome and skips instead. Also covers platforms
       # without a prebuilt sccache asset (the binary download just fails).
       continue-on-error: true
-      uses: mozilla-actions/sccache-action@v0.0.9
+      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
       with:
         # Pin the binary so every runner hashes into the same cache namespace
         # (a floating "latest" can change hashing mid-stream across jobs) and

@@ -320,15 +320,15 @@ jemalloc = ["tikv-jemallocator"]
 [dev-dependencies]
 # Used by apps/screenpipe-app-tauri/src-tauri/src/enterprise/sync.rs tests (compiled in only when the
 # enterprise-build feature is on).
-tempfile = "3"
-wiremock = "0.6"
-serial_test = "3"
-tower = { version = "0.4", features = ["util"] }
+tempfile = "=3.27.0"
+wiremock = "=0.6.5"
+serial_test = "=3.4.0"
+tower = { version = "=0.4.13", features = ["util"] }
 # MockRuntime for store.rs recovery tests that must exercise the real
 # tauri-plugin-store registry (state + resources table).
 tauri = { version = "=2.11.2", features = ["test"] }
 # staged_update tests: sign fake update archives with a throwaway key
-minisign = "0.7"
+minisign = "=0.7.9"
 
 
 [package.metadata.cargo-machete]

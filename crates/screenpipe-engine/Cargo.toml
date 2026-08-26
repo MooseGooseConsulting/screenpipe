@@ -146,8 +146,8 @@ tikv-jemallocator = { version = "0.6", optional = true }
 env_logger = { workspace = true }
 tempfile = { workspace = true }
 tokio-tungstenite = { workspace = true }
-tower = { version = "0.4", features = ["util"] }
-tiktoken-rs = "0.11.0"
+tower = { version = "=0.4.13", features = ["util"] }
+tiktoken-rs = "=0.11.0"
 
 # Lock-free queue used by tests/consumer_sleep_test.rs to reproduce the
 # OCR frame-drop bug (see the test's docstring). Not needed by the crate

@@ -16,12 +16,12 @@
     "cf-typegen": "wrangler types"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260307.1",
-    "@huggingface/transformers": "^4.2.0",
-    "@sentry/cli": "^2.50.2",
-    "@types/node": "^22.19.15",
+    "@cloudflare/workers-types": "4.20260702.1",
+    "@huggingface/transformers": "4.2.0",
+    "@sentry/cli": "2.58.6",
+    "@types/node": "22.20.1",
     "miniflare": "3.20250718.3",
-    "typescript": "^5.9.3",
+    "typescript": "5.9.3",
     "wrangler": "4.118.0"
   },
   "dependencies": {

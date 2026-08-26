@@ -117,4 +117,4 @@ sha2 = { workspace = true }
 wiremock = { workspace = true }
 # test-util (virtual clock) lets agents::pi's rate-limit retry loop tests
 # drive real minutes of retry/backoff timing without real wall-clock waits.
-tokio = { version = "1.15", features = ["test-util"] }
+tokio = { version = "=1.52.3", features = ["test-util"] }

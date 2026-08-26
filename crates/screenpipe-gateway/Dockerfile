@@ -15,13 +15,13 @@
 # refinement, not a functional need; debian:bookworm-slim is ~75MB and
 # gives us ca-certificates (TLS to S3) + curl (compose healthchecks).
 
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN cargo build --locked --release -p screenpipe-gateway --bins
 
-FROM debian:bookworm-slim AS base
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS base
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \

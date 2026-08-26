@@ -37,10 +37,10 @@
     "@sentry/node": "^10.64.0"
   },
   "devDependencies": {
-    "@types/node": "^25.3.5",
-    "typescript": "^5.9.3",
-    "ts-node": "^10.9.2",
-    "vitest": "^4.0.18"
+    "@types/node": "25.9.5",
+    "typescript": "5.9.3",
+    "ts-node": "10.9.2",
+    "vitest": "4.1.11"
   },
   "engines": {
     "node": ">=18.0.0"

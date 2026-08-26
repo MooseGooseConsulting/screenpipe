@@ -25,14 +25,14 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # Need full history so TruffleHog can scan the diff between
           # base and head (PRs) or the whole repo (push).
           fetch-depth: 0
 
       - name: TruffleHog
-        uses: trufflesecurity/trufflehog@main
+        uses: trufflesecurity/trufflehog@8c3e7bad3f4e708b080b9b19974007c06ac1ef16 # main
         with:
           # On push to main: scan the just-pushed commits (HEAD~1..HEAD).
           # On PR: scan the PR diff (base..head). The action infers

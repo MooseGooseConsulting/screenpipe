@@ -19,5 +19,5 @@ reqwest = { workspace = true }
 serde_json = { workspace = true }
 screenpipe-core = { path = "../screenpipe-core" }
 tempfile = { workspace = true }
-tiktoken-rs = "0.11.0"
+tiktoken-rs = "=0.11.0"
 tokio = { workspace = true }

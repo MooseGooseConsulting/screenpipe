@@ -50,7 +50,7 @@ url = { workspace = true }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 strsim = { workspace = true }
-memory-stats = "1.2.0"
+memory-stats = "=1.2.0"
 
 serde = { workspace = true }
 

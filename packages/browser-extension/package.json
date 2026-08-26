@@ -9,6 +9,6 @@
     "publish:store": "bun run zip && bunx chrome-webstore-upload-cli@3 upload --source \"screenpipe-browser-extension-v$(node -p 'require(\\\"./package.json\\\").version').zip\" --auto-publish"
   },
   "devDependencies": {
-    "@types/chrome": "^0.0.287"
+    "@types/chrome": "0.0.287"
   }
 }

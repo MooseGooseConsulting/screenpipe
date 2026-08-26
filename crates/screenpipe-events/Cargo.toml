@@ -22,7 +22,7 @@ chrono = { workspace = true }
 [dev-dependencies]
 serde = { workspace = true }
 criterion = { workspace = true }
-serial_test = "3.2.0"
+serial_test = "=3.4.0"
 
 [[bench]]
 name = "events"

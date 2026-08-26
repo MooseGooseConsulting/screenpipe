@@ -171,7 +171,7 @@ ort = { workspace = true, default-features = false, features = ["load-dynamic", 
 
 [dev-dependencies]
 tempfile = { workspace = true }
-infer = "0.15"
+infer = "=0.15.0"
 criterion = { workspace = true }
 strsim = { workspace = true }
 futures = { workspace = true }
